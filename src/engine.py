@@ -126,9 +126,10 @@ class Decoding(ABC):
         self.color_print(f"Loading tokenizer of {self.args.draft_model}...", 3)
         self.tokenizer = AutoTokenizer.from_pretrained(self.args.draft_model, trust_remote_code=True)
         self.tokenizer.padding_side = "right"
-        
-        # for llama models
-        self.tokenizer.pad_token_id = 2
+        if self.tokenizer.pad_token_id is None:
+            if self.tokenizer.eos_token_id is None:
+                raise ValueError("Tokenizer must define either pad_token_id or eos_token_id")
+            self.tokenizer.pad_token = self.tokenizer.eos_token
 
     def _energy_api_url(self, action: str) -> str:
         return f"http://{self.args.energy_api_host}:{self.args.energy_api_port}/measure/{action}"
@@ -314,7 +315,7 @@ class Decoding(ABC):
         task_type_flag = 0
         for idx, sample in enumerate(samples):
             approx_model_cache = KVCacheModel(draft_model, self.args.temp, self.args.top_k, self.args.top_p)
-            approx_model_cache.vocab_size = tokenizer.vocab_size
+            approx_model_cache.vocab_size = self.vocab_size
 
             if self.args.dataset == "gsm8k":
                 input_text = sample["question"].strip() # for gsm8k dataset
@@ -447,7 +448,7 @@ class Decoding(ABC):
             # if proc_id not in target_model_caches or request["task_type"] == "prefill":
             if request["task_type"] == "prefill":
                 cache = KVCacheModel(target_model, self.args.temp, self.args.top_k, self.args.top_p)
-                cache.vocab_size = tokenizer.vocab_size
+                cache.vocab_size = self.vocab_size
                 target_model_caches[proc_id] = cache
             else:
                 cache = target_model_caches[proc_id]
@@ -618,7 +619,7 @@ class Decoding(ABC):
                                         temperature=self.args.temp,
                                         top_k=self.args.top_k,
                                         top_p=self.args.top_p)
-        kv_cache_manager.vocab_size = tokenizer.vocab_size
+        kv_cache_manager.vocab_size = self.vocab_size
 
         # --------------------------- 队列与统计 ---------------------------
         task_queues = {

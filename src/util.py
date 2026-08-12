@@ -116,7 +116,26 @@ def parse_arguments():
         "--max_tasks_per_draft",
         type=int,
         default=10,
-        help="max number of tasks each draft process will execute",
+        help="max number of tasks each draft process will execute; <= 0 runs its full shard",
+    )
+    parser.add_argument(
+        "--arrival_distribution",
+        type=str,
+        default="immediate",
+        choices=["immediate", "poisson"],
+        help="dataset request arrival process at the edge",
+    )
+    parser.add_argument(
+        "--arrival_rate",
+        type=float,
+        default=1.0,
+        help="aggregate Poisson arrival rate in requests/second across all draft GPUs",
+    )
+    parser.add_argument(
+        "--arrival_seed",
+        type=int,
+        default=1234,
+        help="seed for the global Poisson arrival timeline",
     )
     parser.add_argument(
         "--measure_energy",
@@ -215,6 +234,8 @@ def parse_arguments():
         help="max token comparison steps to print per verify request",
     )
     args = parser.parse_args()
+    if args.arrival_distribution == "poisson" and args.arrival_rate <= 0:
+        parser.error("--arrival_rate must be positive for Poisson arrivals")
     if args.profile != "custom":
         # Baseline profiles must not be mixed with FastSD scheduler.
         if args.server_sched_mode == "fastsd":

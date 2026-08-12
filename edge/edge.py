@@ -2,12 +2,12 @@ import argparse
 import concurrent.futures
 import glob
 import json
+import multiprocessing as mp
 import os
 import re
 import statistics
 import sys
 import time
-from multiprocessing import Process
 from typing import Any, Dict, List
 
 import requests
@@ -17,6 +17,7 @@ from transformers import AutoModelForCausalLM
 
 sys.path.append(os.path.join(sys.path[0], "../"))
 
+from src.arrival import poisson_arrival_offsets, shard_samples
 from src.engine import Decoding
 from src.kvcache import KVCacheModel
 from src.util import parse_arguments, seed_everything
@@ -346,20 +347,62 @@ class EdgeRunner(Decoding):
                     records.append(json.loads(line))
 
         task_e2e = [float(r.get("task_e2e_ms", 0.0)) for r in records]
+        request_e2e = [float(r.get("request_e2e_ms", 0.0)) for r in records]
+        arrival_lag = [float(r.get("arrival_lag_ms", 0.0)) for r in records]
         total_tokens = sum(int(r.get("generated_tokens", 0)) for r in records)
+        total_accepted = sum(int(r.get("accepted_total", 0)) for r in records)
+        total_drafted = sum(int(r.get("drafted_total", 0)) for r in records)
+        actual_arrivals = [float(r["actual_arrival_s"]) for r in records if "actual_arrival_s" in r]
+        scheduled_arrivals = [
+            float(r["scheduled_arrival_s"]) for r in records if "scheduled_arrival_s" in r
+        ]
+        completions = [float(r["completion_s"]) for r in records if "completion_s" in r]
+        active_window_s = 0.0
+        actual_arrival_span_s = 0.0
+        scheduled_arrival_span_s = 0.0
+        if actual_arrivals and completions:
+            active_window_s = max(0.0, max(completions) - min(actual_arrivals))
+        if len(actual_arrivals) > 1:
+            actual_arrival_span_s = max(actual_arrivals) - min(actual_arrivals)
+        if len(scheduled_arrivals) > 1:
+            scheduled_arrival_span_s = max(scheduled_arrivals) - min(scheduled_arrivals)
         summary = {
             "profile": self.args.profile,
             "enable_pipeline": bool(getattr(self.args, "enable_pipeline", True)),
             "enable_proactive_draft": bool(getattr(self.args, "enable_proactive_draft", True)),
             "num_drafts": int(self.args.num_drafts),
+            "arrival_distribution": self.args.arrival_distribution,
+            "arrival_rate_rps": float(self.args.arrival_rate),
+            "arrival_seed": int(self.args.arrival_seed),
+            "scheduled_arrival_span_s": float(scheduled_arrival_span_s),
+            "realized_scheduled_arrival_rate_rps": (
+                float((len(scheduled_arrivals) - 1) / scheduled_arrival_span_s)
+                if scheduled_arrival_span_s > 0
+                else 0.0
+            ),
+            "actual_arrival_span_s": float(actual_arrival_span_s),
+            "actual_model_start_rate_rps": (
+                float((len(actual_arrivals) - 1) / actual_arrival_span_s)
+                if actual_arrival_span_s > 0
+                else 0.0
+            ),
             "num_tasks": len(records),
             "wallclock_s": float(wallclock_s),
             "total_generated_tokens": int(total_tokens),
             "system_tok_per_s": float(total_tokens / wallclock_s) if wallclock_s > 0 else 0.0,
+            "active_window_s": float(active_window_s),
+            "active_window_tok_per_s": float(total_tokens / active_window_s) if active_window_s > 0 else 0.0,
+            "accept_rate": float(total_accepted / total_drafted) if total_drafted > 0 else 0.0,
             "task_e2e_ms_avg": float(statistics.mean(task_e2e)) if task_e2e else 0.0,
             "task_e2e_ms_p50": self._percentile(task_e2e, 0.50),
             "task_e2e_ms_p90": self._percentile(task_e2e, 0.90),
             "task_e2e_ms_p95": self._percentile(task_e2e, 0.95),
+            "request_e2e_ms_avg": float(statistics.mean(request_e2e)) if request_e2e else 0.0,
+            "request_e2e_ms_p50": self._percentile(request_e2e, 0.50),
+            "request_e2e_ms_p90": self._percentile(request_e2e, 0.90),
+            "request_e2e_ms_p95": self._percentile(request_e2e, 0.95),
+            "arrival_lag_ms_avg": float(statistics.mean(arrival_lag)) if arrival_lag else 0.0,
+            "arrival_lag_ms_p95": self._percentile(arrival_lag, 0.95),
         }
         summary_path = os.path.join(self.args.exp_name, "edge_metrics_summary.json")
         with open(summary_path, "w") as f:
@@ -378,8 +421,17 @@ class EdgeRunner(Decoding):
         # 启动多个边缘 draft 进程，每个进程独立 session_id
         wallclock_start = time.time()
         processes = []
+        arrival_barrier = None
+        arrival_start_time = None
+        ctx = mp.get_context("spawn")
+        if self.args.arrival_distribution == "poisson" and self.args.num_drafts > 1:
+            arrival_barrier = ctx.Barrier(self.args.num_drafts)
+            arrival_start_time = ctx.Value("d", 0.0)
         for proc_id in range(self.args.num_drafts):
-            proc = Process(target=self.run_draft_process_http, args=(self.tokenizer, proc_id))
+            proc = ctx.Process(
+                target=self.run_draft_process_http,
+                args=(self.tokenizer, proc_id, arrival_barrier, arrival_start_time),
+            )
             proc.start()
             processes.append(proc)
 
@@ -387,6 +439,9 @@ class EdgeRunner(Decoding):
             proc.join()
 
         self._write_summary(max(0.0, time.time() - wallclock_start))
+        failed = [proc.exitcode for proc in processes if proc.exitcode != 0]
+        if failed:
+            raise RuntimeError(f"{len(failed)} draft process(es) failed with exit codes {failed}")
 
     def _resolve_data_file(self) -> str:
         if self.args.dataset == "humaneval":
@@ -403,7 +458,13 @@ class EdgeRunner(Decoding):
         return self.args.data_path
 
     @torch.no_grad()
-    def run_draft_process_http(self, tokenizer, proc_id: int):
+    def run_draft_process_http(
+        self,
+        tokenizer,
+        proc_id: int,
+        arrival_barrier=None,
+        arrival_start_time=None,
+    ):
         gpu_id = (proc_id % max(1, self.args.edge_gpus)) + self.args.edge_gpu_start
         device = f"cuda:{gpu_id}"
         self.color_print(f"[Edge {proc_id}] loading draft model on {device}", 3)
@@ -419,16 +480,45 @@ class EdgeRunner(Decoding):
         with open(data_file, "r") as f:
             samples = [json.loads(line) for line in f.readlines()]
 
-        # 按进程序号切分任务，并限制每个 proc 只跑 1 个任务（用于快速并行测试）。
-        samples = [s for idx, s in enumerate(samples) if idx % self.args.num_drafts == proc_id][:1]
+        indexed_samples = shard_samples(
+            samples,
+            num_shards=self.args.num_drafts,
+            shard_id=proc_id,
+            max_items=self.args.max_tasks_per_draft,
+        )
+        arrival_offsets = None
+        arrival_origin = None
+        if self.args.arrival_distribution == "poisson":
+            arrival_offsets = poisson_arrival_offsets(
+                len(samples), self.args.arrival_rate, self.args.arrival_seed
+            )
+            if arrival_barrier is not None:
+                arrival_barrier.wait()
+                if proc_id == 0:
+                    arrival_start_time.value = time.monotonic()
+                arrival_barrier.wait()
+                arrival_origin = float(arrival_start_time.value)
+            else:
+                arrival_origin = time.monotonic()
         seed_everything(42 + proc_id)
 
-        for idx, sample in enumerate(samples):
+        for idx, (global_idx, sample) in enumerate(indexed_samples):
+            scheduled_arrival_s = 0.0
+            if arrival_offsets is not None:
+                scheduled_arrival_s = float(arrival_offsets[global_idx])
+                remaining_s = scheduled_arrival_s - (time.monotonic() - arrival_origin)
+                if remaining_s > 0:
+                    time.sleep(remaining_s)
+                actual_arrival_s = max(0.0, time.monotonic() - arrival_origin)
+            else:
+                actual_arrival_s = 0.0
+            arrival_lag_ms = max(0.0, (actual_arrival_s - scheduled_arrival_s) * 1000.0)
+            request_start = time.monotonic()
             session_id = client.init_session()
             approx_model_cache = KVCacheModel(
                 draft_model, self.args.temp, self.args.top_k, self.args.top_p
             )
-            approx_model_cache.vocab_size = tokenizer.vocab_size
+            approx_model_cache.vocab_size = self.args.vocab_size
 
             if self.args.dataset == "gsm8k":
                 input_text = self._preprocess_gsm8k(sample["question"].strip())
@@ -445,6 +535,7 @@ class EdgeRunner(Decoding):
             prefix = input_ids.clone()
             max_len = input_ids.shape[1] + self.args.max_tokens
 
+            prefill_start = time.monotonic()
             prefill_resp = client.prefill(
                 session_id=session_id,
                 task_id=task_id,
@@ -455,6 +546,7 @@ class EdgeRunner(Decoding):
             )
             if prefill_resp.get("status") != "prefill_ok":
                 raise RuntimeError(f"prefill failed: {prefill_resp}")
+            prefill_ms = max(0.0, (time.monotonic() - prefill_start) * 1000.0)
 
             task_start = time.time()
             pipeline_enabled = bool(getattr(self.args, "enable_pipeline", True))
@@ -732,6 +824,12 @@ class EdgeRunner(Decoding):
 
             generated_tokens = int(prefix.shape[1] - input_ids.shape[1])
             task_e2e_ms = max(0.0, (time.time() - task_start) * 1000.0)
+            request_e2e_ms = max(0.0, (time.monotonic() - request_start) * 1000.0)
+            completion_s = (
+                max(0.0, time.monotonic() - arrival_origin)
+                if arrival_origin is not None
+                else request_e2e_ms / 1000.0
+            )
             per_task = {
                 "task_id": task_id,
                 "proc_id": int(proc_id),
@@ -739,6 +837,13 @@ class EdgeRunner(Decoding):
                 "enable_pipeline": pipeline_enabled,
                 "enable_proactive_draft": proactive_enabled,
                 "generated_tokens": generated_tokens,
+                "global_sample_index": int(global_idx),
+                "scheduled_arrival_s": scheduled_arrival_s,
+                "actual_arrival_s": actual_arrival_s,
+                "arrival_lag_ms": arrival_lag_ms,
+                "prefill_ms": prefill_ms,
+                "request_e2e_ms": request_e2e_ms,
+                "completion_s": completion_s,
                 "task_e2e_ms": task_e2e_ms,
                 "tok_per_s_task": float(generated_tokens / (task_e2e_ms / 1000.0)) if task_e2e_ms > 0 else 0.0,
                 "rounds": int(rounds),
