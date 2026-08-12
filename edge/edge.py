@@ -13,6 +13,7 @@ from typing import Any, Dict, List
 import requests
 import torch
 from auto_gptq import AutoGPTQForCausalLM
+from transformers import AutoModelForCausalLM
 
 sys.path.append(os.path.join(sys.path[0], "../"))
 
@@ -109,6 +110,26 @@ class EdgeRunner(Decoding):
             cot_flag=True,
             answer_trigger=self.answer_trigger,
         )
+
+    @staticmethod
+    def _load_draft_model(model_path: str, device: str):
+        """Load either a GPTQ draft or a regular Transformers checkpoint."""
+        quant_config = os.path.join(model_path, "quantize_config.json")
+        if os.path.exists(quant_config):
+            return AutoGPTQForCausalLM.from_quantized(
+                model_path,
+                device=device,
+                use_safetensors=True,
+                trust_remote_code=True,
+                use_triton=False,
+            )
+
+        return AutoModelForCausalLM.from_pretrained(
+            model_path,
+            device_map={"": device},
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+        ).eval()
 
     def load_data(self):
         return
@@ -387,13 +408,7 @@ class EdgeRunner(Decoding):
         device = f"cuda:{gpu_id}"
         self.color_print(f"[Edge {proc_id}] loading draft model on {device}", 3)
 
-        draft_model = AutoGPTQForCausalLM.from_quantized(
-            self.args.draft_model,
-            device=device,
-            use_safetensors=True,
-            trust_remote_code=True,
-            use_triton=False,
-        )
+        draft_model = self._load_draft_model(self.args.draft_model, device)
 
         client = EdgeClient(self.args.server_url, timeout=self.args.request_timeout)
         health = client.health()
