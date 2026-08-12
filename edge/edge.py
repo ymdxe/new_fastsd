@@ -350,6 +350,10 @@ class EdgeRunner(Decoding):
         request_e2e = [float(r.get("request_e2e_ms", 0.0)) for r in records]
         arrival_lag = [float(r.get("arrival_lag_ms", 0.0)) for r in records]
         total_tokens = sum(int(r.get("generated_tokens", 0)) for r in records)
+        max_generated_tokens_observed = max(
+            (int(r.get("generated_tokens", 0)) for r in records),
+            default=0,
+        )
         total_accepted = sum(int(r.get("accepted_total", 0)) for r in records)
         total_drafted = sum(int(r.get("drafted_total", 0)) for r in records)
         actual_arrivals = [float(r["actual_arrival_s"]) for r in records if "actual_arrival_s" in r]
@@ -389,6 +393,7 @@ class EdgeRunner(Decoding):
             "num_tasks": len(records),
             "wallclock_s": float(wallclock_s),
             "total_generated_tokens": int(total_tokens),
+            "max_generated_tokens_observed": int(max_generated_tokens_observed),
             "system_tok_per_s": float(total_tokens / wallclock_s) if wallclock_s > 0 else 0.0,
             "active_window_s": float(active_window_s),
             "active_window_tok_per_s": float(total_tokens / active_window_s) if active_window_s > 0 else 0.0,
@@ -718,6 +723,7 @@ class EdgeRunner(Decoding):
 
                 prefix = torch.cat((x[:, :accepted], final_token_tensor), dim=1)
                 prefix, hit_eos = self._truncate_at_eos(prefix, tokenizer.eos_token_id, prefix_len)
+                prefix = prefix[:, :max_len]
                 approx_model_cache.rollback(accepted)
                 reused_pending_tokens = []
 
