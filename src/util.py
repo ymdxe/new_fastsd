@@ -1,6 +1,8 @@
 import os
 import random
 import argparse
+import json
+import os
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -64,6 +66,19 @@ def model_zoo(args):
         args.draft_model = zoo[args.draft_model]
     if args.target_model in zoo:
         args.target_model = zoo[args.target_model]
+
+    # Absolute/local model paths are common in cloud-edge deployments.  Infer
+    # the vocabulary size from the checkpoint config instead of falling back to
+    # the historical Llama default of 32000.
+    config_path = os.path.join(args.draft_model, "config.json")
+    if os.path.isfile(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                config_vocab_size = json.load(f).get("vocab_size")
+            if config_vocab_size is not None:
+                args.vocab_size = int(config_vocab_size)
+        except (OSError, ValueError, TypeError):
+            pass
 
 def parse_arguments():
     """Specified arguments for running scripts."""
