@@ -738,13 +738,14 @@ class EdgeRunner(Decoding):
                                 f"reused_count={len(reused_pending_tokens)}",
                                 2,
                             )
-                    elif getattr(self.args, "debug_verify_tokens", False):
+                    else:
                         reuse_miss_rounds += 1
-                        self.color_print(
-                            f"[VERIFY-EDGE-DROP][pid={proc_id}][session={session_id}] "
-                            f"final_token={final_token} overlap_first={overlap_tokens[0]}",
-                            3,
-                        )
+                        if getattr(self.args, "debug_verify_tokens", False):
+                            self.color_print(
+                                f"[VERIFY-EDGE-DROP][pid={proc_id}][session={session_id}] "
+                                f"final_token={final_token} overlap_first={overlap_tokens[0]}",
+                                3,
+                            )
                 elif proactive_enabled and accepted_cnt == req_gamma:
                     reuse_miss_rounds += 1
                     if getattr(self.args, "debug_verify_tokens", False):
