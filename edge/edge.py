@@ -20,6 +20,7 @@ sys.path.append(os.path.join(sys.path[0], "../"))
 from src.arrival import poisson_arrival_offsets, shard_samples
 from src.engine import Decoding
 from src.kvcache import KVCacheModel
+from src.metrics import elapsed_ms, tpot_ms
 from src.util import parse_arguments, seed_everything
 
 
@@ -348,6 +349,17 @@ class EdgeRunner(Decoding):
 
         task_e2e = [float(r.get("task_e2e_ms", 0.0)) for r in records]
         request_e2e = [float(r.get("request_e2e_ms", 0.0)) for r in records]
+        ttft = [float(r["ttft_ms"]) for r in records if r.get("ttft_ms") is not None]
+        decode_ttft = [
+            float(r["decode_ttft_ms"])
+            for r in records
+            if r.get("decode_ttft_ms") is not None
+        ]
+        tpot = [
+            float(r["tpot_ms"])
+            for r in records
+            if int(r.get("generated_tokens", 0)) > 1 and r.get("tpot_ms") is not None
+        ]
         arrival_lag = [float(r.get("arrival_lag_ms", 0.0)) for r in records]
         total_tokens = sum(int(r.get("generated_tokens", 0)) for r in records)
         max_generated_tokens_observed = max(
@@ -372,12 +384,16 @@ class EdgeRunner(Decoding):
             scheduled_arrival_span_s = max(scheduled_arrivals) - min(scheduled_arrivals)
         summary = {
             "profile": self.args.profile,
+            "server_sched_mode": self.args.server_sched_mode,
             "enable_pipeline": bool(getattr(self.args, "enable_pipeline", True)),
             "enable_proactive_draft": bool(getattr(self.args, "enable_proactive_draft", True)),
             "num_drafts": int(self.args.num_drafts),
             "arrival_distribution": self.args.arrival_distribution,
             "arrival_rate_rps": float(self.args.arrival_rate),
             "arrival_seed": int(self.args.arrival_seed),
+            "ttft_definition": "request_start_to_first_output_token_visible",
+            "decode_ttft_definition": "prefill_complete_to_first_output_token_visible",
+            "tpot_definition": "(request_completion-first_token_time)/(output_tokens-1)",
             "scheduled_arrival_span_s": float(scheduled_arrival_span_s),
             "realized_scheduled_arrival_rate_rps": (
                 float((len(scheduled_arrivals) - 1) / scheduled_arrival_span_s)
@@ -406,6 +422,22 @@ class EdgeRunner(Decoding):
             "request_e2e_ms_p50": self._percentile(request_e2e, 0.50),
             "request_e2e_ms_p90": self._percentile(request_e2e, 0.90),
             "request_e2e_ms_p95": self._percentile(request_e2e, 0.95),
+            "request_e2e_ms_p99": self._percentile(request_e2e, 0.99),
+            "ttft_ms_avg": float(statistics.mean(ttft)) if ttft else 0.0,
+            "ttft_ms_p50": self._percentile(ttft, 0.50),
+            "ttft_ms_p90": self._percentile(ttft, 0.90),
+            "ttft_ms_p95": self._percentile(ttft, 0.95),
+            "ttft_ms_p99": self._percentile(ttft, 0.99),
+            "decode_ttft_ms_avg": float(statistics.mean(decode_ttft)) if decode_ttft else 0.0,
+            "decode_ttft_ms_p50": self._percentile(decode_ttft, 0.50),
+            "decode_ttft_ms_p90": self._percentile(decode_ttft, 0.90),
+            "decode_ttft_ms_p95": self._percentile(decode_ttft, 0.95),
+            "decode_ttft_ms_p99": self._percentile(decode_ttft, 0.99),
+            "tpot_ms_avg": float(statistics.mean(tpot)) if tpot else 0.0,
+            "tpot_ms_p50": self._percentile(tpot, 0.50),
+            "tpot_ms_p90": self._percentile(tpot, 0.90),
+            "tpot_ms_p95": self._percentile(tpot, 0.95),
+            "tpot_ms_p99": self._percentile(tpot, 0.99),
             "arrival_lag_ms_avg": float(statistics.mean(arrival_lag)) if arrival_lag else 0.0,
             "arrival_lag_ms_p95": self._percentile(arrival_lag, 0.95),
         }
@@ -553,7 +585,8 @@ class EdgeRunner(Decoding):
                 raise RuntimeError(f"prefill failed: {prefill_resp}")
             prefill_ms = max(0.0, (time.monotonic() - prefill_start) * 1000.0)
 
-            task_start = time.time()
+            task_start = time.monotonic()
+            first_token_time = None
             pipeline_enabled = bool(getattr(self.args, "enable_pipeline", True))
             proactive_enabled = bool(getattr(self.args, "enable_proactive_draft", True))
             final_token = None
@@ -724,6 +757,8 @@ class EdgeRunner(Decoding):
                 prefix = torch.cat((x[:, :accepted], final_token_tensor), dim=1)
                 prefix, hit_eos = self._truncate_at_eos(prefix, tokenizer.eos_token_id, prefix_len)
                 prefix = prefix[:, :max_len]
+                if first_token_time is None and prefix.shape[1] > input_ids.shape[1]:
+                    first_token_time = time.monotonic()
                 approx_model_cache.rollback(accepted)
                 reused_pending_tokens = []
 
@@ -810,6 +845,7 @@ class EdgeRunner(Decoding):
                         break
 
             verify_executor.shutdown(wait=True)
+            completion_time = time.monotonic()
 
             generated_text = tokenizer.decode(
                 prefix[0, input_ids.shape[1]:], skip_special_tokens=True
@@ -830,10 +866,25 @@ class EdgeRunner(Decoding):
             self.color_print(f"[Edge {proc_id}] task {task_id} output:\n{generated_text}", 2)
 
             generated_tokens = int(prefix.shape[1] - input_ids.shape[1])
-            task_e2e_ms = max(0.0, (time.time() - task_start) * 1000.0)
-            request_e2e_ms = max(0.0, (time.monotonic() - request_start) * 1000.0)
+            task_e2e_ms = elapsed_ms(task_start, completion_time)
+            request_e2e_ms = elapsed_ms(request_start, completion_time)
+            ttft_value = (
+                elapsed_ms(request_start, first_token_time)
+                if first_token_time is not None
+                else None
+            )
+            decode_ttft_value = (
+                elapsed_ms(task_start, first_token_time)
+                if first_token_time is not None
+                else None
+            )
+            tpot_value = (
+                tpot_ms(first_token_time, completion_time, generated_tokens)
+                if first_token_time is not None
+                else None
+            )
             completion_s = (
-                max(0.0, time.monotonic() - arrival_origin)
+                max(0.0, completion_time - arrival_origin)
                 if arrival_origin is not None
                 else request_e2e_ms / 1000.0
             )
@@ -841,6 +892,7 @@ class EdgeRunner(Decoding):
                 "task_id": task_id,
                 "proc_id": int(proc_id),
                 "profile": self.args.profile,
+                "server_sched_mode": self.args.server_sched_mode,
                 "enable_pipeline": pipeline_enabled,
                 "enable_proactive_draft": proactive_enabled,
                 "generated_tokens": generated_tokens,
@@ -850,6 +902,9 @@ class EdgeRunner(Decoding):
                 "arrival_lag_ms": arrival_lag_ms,
                 "prefill_ms": prefill_ms,
                 "request_e2e_ms": request_e2e_ms,
+                "ttft_ms": ttft_value,
+                "decode_ttft_ms": decode_ttft_value,
+                "tpot_ms": tpot_value,
                 "completion_s": completion_s,
                 "task_e2e_ms": task_e2e_ms,
                 "tok_per_s_task": float(generated_tokens / (task_e2e_ms / 1000.0)) if task_e2e_ms > 0 else 0.0,
