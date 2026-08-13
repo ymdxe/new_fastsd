@@ -60,7 +60,7 @@ token id：
 
 ```bash
 cd /home/hdd/zhangh/workspace/new_fastsd
-/home/hdd/zhangh/envs/fastsd/bin/python scripts/eval_suite.py validate-models \
+/home/hdd/zhangh/envs/new_fastsd/bin/python scripts/eval_suite.py validate-models \
   --config configs/evaluation/qwen3_8b_0.6b_humaneval.json
 ```
 
@@ -70,14 +70,14 @@ cd /home/hdd/zhangh/workspace/new_fastsd
 
 ```bash
 cd /home/hdd/zhangh/workspace/new_fastsd
-/home/hdd/zhangh/envs/fastsd/bin/python scripts/eval_suite.py prepare \
+/home/hdd/zhangh/envs/new_fastsd/bin/python scripts/eval_suite.py prepare \
   --config configs/evaluation/qwen3_8b_0.6b_humaneval.json
 ```
 
 然后生成按窗口和服务器区分的可复制命令：
 
 ```bash
-/home/hdd/zhangh/envs/fastsd/bin/python scripts/eval_suite.py plan \
+/home/hdd/zhangh/envs/new_fastsd/bin/python scripts/eval_suite.py plan \
   --config configs/evaluation/qwen3_8b_0.6b_humaneval.json
 ```
 
@@ -105,16 +105,16 @@ cd /home/hdd/zhangh/workspace/new_fastsd
 RUN=/home/hdd/zhangh/workspace/new_fastsd/exp/comparison/qwen3_8b_0.6b_humaneval
 CFG=configs/evaluation/qwen3_8b_0.6b_humaneval.json
 
-/home/hdd/zhangh/envs/fastsd/bin/python scripts/eval_suite.py normalize --config "$CFG" --method fastsd --input "$RUN/fastsd"
-/home/hdd/zhangh/envs/fastsd/bin/python scripts/eval_suite.py normalize --config "$CFG" --method specedge --input "$RUN/specedge/raw/qwen3_8b_0.6b_humaneval"
-/home/hdd/zhangh/envs/fastsd/bin/python scripts/eval_suite.py normalize --config "$CFG" --method standard_sd --input "$RUN/standard_sd"
-/home/hdd/zhangh/envs/fastsd/bin/python scripts/eval_suite.py normalize --config "$CFG" --method draft_only --input "$RUN/draft_only"
+/home/hdd/zhangh/envs/new_fastsd/bin/python scripts/eval_suite.py normalize --config "$CFG" --method fastsd --input "$RUN/fastsd"
+/home/hdd/zhangh/envs/new_fastsd/bin/python scripts/eval_suite.py normalize --config "$CFG" --method specedge --input "$RUN/specedge/raw/qwen3_8b_0.6b_humaneval"
+/home/hdd/zhangh/envs/new_fastsd/bin/python scripts/eval_suite.py normalize --config "$CFG" --method standard_sd --input "$RUN/standard_sd"
+/home/hdd/zhangh/envs/new_fastsd/bin/python scripts/eval_suite.py normalize --config "$CFG" --method draft_only --input "$RUN/draft_only"
 ```
 
 生成最终 CSV：
 
 ```bash
-/home/hdd/zhangh/envs/fastsd/bin/python scripts/eval_suite.py compare \
+/home/hdd/zhangh/envs/new_fastsd/bin/python scripts/eval_suite.py compare \
   "$RUN/normalized/fastsd/summary.json" \
   "$RUN/normalized/specedge/summary.json" \
   "$RUN/normalized/standard_sd/summary.json" \
