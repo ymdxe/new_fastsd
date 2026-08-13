@@ -143,6 +143,11 @@ class Decoding(ABC):
         ).eval()
 
     def _service_target_device(self) -> str:
+        # Priority: explicit --target_device argument (non-default) >
+        # FASTSD_TARGET_DEVICE environment variable > cuda:0.
+        target_device = getattr(self.args, "target_device", None)
+        if target_device and str(target_device) != "cuda:0":
+            return str(target_device)
         return os.environ.get("FASTSD_TARGET_DEVICE", "cuda:0")
 
     def load_tokenizer(self):
