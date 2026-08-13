@@ -144,6 +144,8 @@ class SpecEdgeAdapterTests(unittest.TestCase):
         self.assertIn("tokenizer.apply_chat_template", source)
         self.assertIn("enable_thinking=False", source)
         self.assertIn("actual_arrival = 0.0", source)
+        self.assertIn("target.dtype == torch.bfloat16", source)
+        self.assertIn("view(torch.uint16)", source)
         server_source = (
             Path(__file__).parents[1]
             / "baselines"

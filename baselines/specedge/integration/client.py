@@ -21,6 +21,28 @@ import grpc
 import log
 import util
 from config import SpecEdgeClientConfig as config
+
+
+_official_encode = util.encode
+
+
+def _encode_bfloat16_compatible(target: torch.Tensor) -> bytes:
+    if target.dtype == torch.bfloat16:
+        return (
+            target.contiguous()
+            .cpu()
+            .view(torch.uint16)
+            .numpy()
+            .tobytes()
+        )
+    return _official_encode(target)
+
+
+# Official SpecEdge serializes tensors through NumPy, which cannot expose a
+# bfloat16 dtype. Preserve the exact 16-bit payload while leaving its wire
+# format and the server-side torch.frombuffer(..., dtype=bfloat16) unchanged.
+util.encode = _encode_bfloat16_compatible
+
 from specedge.client.specexec import SpecExecClient
 from specedge.engine.graph import GraphEngine
 from specedge_grpc import specedge_pb2, specedge_pb2_grpc
