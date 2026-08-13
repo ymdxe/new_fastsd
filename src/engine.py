@@ -44,6 +44,7 @@ from .fastsd_scheduler import (
     reserve_admission_plan,
     should_switch_to_prefill as _should_switch_to_prefill,
     update_length_thresholds as _update_length_thresholds,
+    verify_logit_position,
 )
 
 
@@ -942,12 +943,10 @@ class Decoding(ABC):
                         j = x[:, tail_offset + i]
                     else:
                         j = x[:, prefix_len + i]
-                    # With a bridge token the first draft token is predicted
-                    # after that bridge, so its target position is shifted by
-                    # one physical token.  ``accepted`` remains an absolute
-                    # logical prefix length and therefore does not include
-                    # the bridge itself.
-                    target_pos = prefix_len + i - 1 + (1 if has_bridge_token else 0)
+                    # The bridge is the final logical prefix token.  Its
+                    # logits at prefix_len-1 predict draft token zero, so a
+                    # physical bridge append never shifts the logical index.
+                    target_pos = verify_logit_position(prefix_len, i)
                     target_logits = probs[:, target_pos, :self.vocab_size]
                     greedy_token = torch.argmax(target_logits, dim=-1)  # (1,)
                     draft_token_id = int(j.item())
@@ -971,7 +970,7 @@ class Decoding(ABC):
                 accepted_cnt = accepted_len - prefix_len
                 if accepted_cnt < req_gamma:
                     # 存在拒绝：在位置 n 上使用 target 贪心 token 作为 new_token
-                    correction_pos = n + (1 if has_bridge_token else 0)
+                    correction_pos = n
                     target_logits_next = probs[:, correction_pos, :self.vocab_size]
                     new_token = torch.argmax(target_logits_next, dim=-1).unsqueeze(-1)
                 else:

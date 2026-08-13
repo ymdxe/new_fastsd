@@ -41,6 +41,19 @@ def full_prefix_bridge_tokens(prefix_len: int, cached_len: int) -> int:
     return missing
 
 
+def verify_logit_position(prefix_len: int, draft_index: int) -> int:
+    """Logical causal-logit position that predicts one draft token.
+
+    A bridge/correction token may be physically appended in the same forward,
+    but it already occupies logical position ``prefix_len - 1``.  Its logits
+    therefore predict draft token zero; physical bridge presence must never
+    shift this logical index.
+    """
+    if int(prefix_len) <= 0 or int(draft_index) < 0:
+        raise ValueError("prefix_len must be positive and draft_index non-negative")
+    return int(prefix_len) + int(draft_index) - 1
+
+
 def build_fixed_wrr_order():
     return list(FASTSD_VERIFY_WRR_ORDER)
 

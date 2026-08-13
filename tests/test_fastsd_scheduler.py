@@ -5,6 +5,7 @@ from src.fastsd_scheduler import (
     AdmissionPlan,
     WorkItem,
     full_prefix_bridge_tokens,
+    verify_logit_position,
     build_fixed_wrr_order,
     commit_admission_plan,
     compute_priority_score,
@@ -23,6 +24,13 @@ class FastSDSchedulerTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "trail logical prefix"):
             full_prefix_bridge_tokens(108, 106)
+
+    def test_bridge_does_not_shift_logical_verify_logits(self):
+        self.assertEqual(verify_logit_position(38, 0), 37)
+        self.assertEqual(verify_logit_position(38, 3), 40)
+
+        with self.assertRaises(ValueError):
+            verify_logit_position(0, 0)
 
     def test_build_fixed_wrr_order_uses_631_ratio(self):
         order = build_fixed_wrr_order()
