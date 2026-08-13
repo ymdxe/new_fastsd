@@ -127,6 +127,11 @@ class SpecEdgeAdapterTests(unittest.TestCase):
         self.assertEqual(rendered["node"]["local"], [{"device": "cuda:0"}, {"device": "cuda:1"}])
         self.assertEqual(rendered["base"]["dtype"], "bf16")
         self.assertEqual(rendered["integration"]["arrival_distribution"], "immediate")
+        self.assertEqual(rendered["integration"]["server_port"], 18000)
+        self.assertEqual(
+            rendered["integration"]["python"],
+            "/home/hdd/zhangh/envs/specedge/bin/python",
+        )
 
     def test_specedge_mt_bench_adapter_uses_chat_template_and_immediate_arrivals(self):
         source = (
@@ -139,6 +144,15 @@ class SpecEdgeAdapterTests(unittest.TestCase):
         self.assertIn("tokenizer.apply_chat_template", source)
         self.assertIn("enable_thinking=False", source)
         self.assertIn("actual_arrival = 0.0", source)
+        server_source = (
+            Path(__file__).parents[1]
+            / "baselines"
+            / "specedge"
+            / "integration"
+            / "server.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("official_server.SpecExecBatchServer", server_source)
+        self.assertIn("server.add_insecure_port", server_source)
 
     def test_specedge_normalizer_uses_precise_client_measurements(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -108,6 +108,9 @@ def render_specedge_config(config: dict[str, Any], workload_hash: str, layout: d
     lines.extend(
         [
             "integration:",
+            "  python: /home/hdd/zhangh/envs/specedge/bin/python",
+            "  server_host: 127.0.0.1",
+            "  server_port: 18000",
             f"  dataset_file: {_yaml_scalar(layout['linux_canonical'])}",
             f"  completion_dir: {_yaml_scalar(linux_root / 'specedge' / 'requests')}",
             f"  workload_hash: {_yaml_scalar(workload_hash)}",
@@ -206,14 +209,15 @@ def print_plan(config_path: str) -> int:
     )
     print("\n[node2：官方 SpecEdge server，使用 canonical dataset hook]")
     print(
-        f"cd {official} && FASTSD_EVAL_ROLE=server "
+        f"cd {repo} && FASTSD_EVAL_ROLE=server "
         f"FASTSD_EVAL_DATASET_FILE={layout['linux_canonical']} "
-        f"PYTHONPATH={integration}:{official}/src ./.venv/bin/python -O src/script/batch_server.py "
-        f"--config {layout['linux_specedge_config']}"
+        f"PYTHONPATH={integration}:{official}/src "
+        f"/home/hdd/zhangh/envs/specedge/bin/python -O {integration}/server.py "
+        f"--config {layout['linux_specedge_config']} --host 127.0.0.1 --port 18000"
     )
     print("\n[node1：适配后的 SpecEdge clients]")
     print(
-        f"cd {repo} && {official}/.venv/bin/python {integration}/client_host.py "
+        f"cd {repo} && /home/hdd/zhangh/envs/specedge/bin/python {integration}/client_host.py "
         f"--config {layout['linux_specedge_config']}"
     )
     print("\n[node2：停止 FastSD target 后，以 vanilla 调度重启 target]")

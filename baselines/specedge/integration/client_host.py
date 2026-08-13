@@ -66,7 +66,11 @@ def main(config_file: str) -> int:
         config = yaml.safe_load(handle)
 
     start_epoch = time.time() + float(config["integration"].get("startup_delay_s", 15.0))
-    python = SPECEDGE_ROOT / ".venv" / "bin" / "python"
+    python = Path(
+        config["integration"].get(
+            "python", SPECEDGE_ROOT / ".venv" / "bin" / "python"
+        )
+    )
     client_script = INTEGRATION_ROOT / "client.py"
     processes: list[subprocess.Popen] = []
     client_idx = 0
