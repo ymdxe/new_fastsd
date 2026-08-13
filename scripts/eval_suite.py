@@ -264,12 +264,21 @@ def normalize_fastsd(input_dir: Path, manifest: dict[str, Any]) -> tuple[list[di
             "completion_s": item.get("completion_s"),
             "accepted_tokens": item.get("accepted_total", 0),
             "drafted_tokens": item.get("drafted_total", 0),
+            "mean_accepted_tokens_per_verify": item.get(
+                "mean_accepted_tokens_per_verify"
+            ),
             "output_text": item.get("output_text"),
             "reference": item.get("reference"),
         }
         for item in raw
     ]
-    return records, None
+    edge_summary = input_dir / "edge_metrics_summary.json"
+    wallclock = None
+    if edge_summary.is_file():
+        summary_payload = json.loads(edge_summary.read_text(encoding="utf-8"))
+        if summary_payload.get("wallclock_s") is not None:
+            wallclock = float(summary_payload["wallclock_s"])
+    return records, wallclock
 
 
 def normalize_specedge(input_dir: Path, manifest: dict[str, Any]) -> tuple[list[dict], float | None]:

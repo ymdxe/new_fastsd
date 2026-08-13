@@ -3,7 +3,12 @@ import tempfile
 import unittest
 from pathlib import Path, PurePosixPath
 
-from scripts.eval_suite import normalize_specedge, output_layout, render_specedge_config
+from scripts.eval_suite import (
+    normalize_fastsd,
+    normalize_specedge,
+    output_layout,
+    render_specedge_config,
+)
 from src.common_metrics import summarize_requests
 from src.evaluation import (
     load_canonical_jsonl,
@@ -135,6 +140,32 @@ class SpecEdgeAdapterTests(unittest.TestCase):
             self.assertEqual(normalized[0]["ttft_ms"], 13)
             self.assertEqual(normalized[0]["tpot_ms"], 5)
             self.assertEqual(normalized[0]["mean_accepted_tokens_per_verify"], 3)
+
+    def test_fastsd_normalizer_uses_run_wallclock_for_closed_loop_workers(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            raw = Path(temp_dir)
+            request = {
+                "task_id": "81",
+                "generated_tokens": 8,
+                "ttft_ms": 10,
+                "tpot_ms": 2,
+                "request_e2e_ms": 24,
+                "completion_s": 0.024,
+                "actual_arrival_s": 0.0,
+                "accepted_total": 3,
+                "drafted_total": 8,
+                "mean_accepted_tokens_per_verify": 1.5,
+            }
+            (raw / "edge_metrics_proc0.jsonl").write_text(
+                json.dumps(request) + "\n", encoding="utf-8"
+            )
+            (raw / "edge_metrics_summary.json").write_text(
+                json.dumps({"wallclock_s": 30.0}), encoding="utf-8"
+            )
+
+            normalized, wallclock = normalize_fastsd(raw, {"workload_hash": "hash"})
+            self.assertEqual(wallclock, 30.0)
+            self.assertEqual(normalized[0]["mean_accepted_tokens_per_verify"], 1.5)
 
 
 if __name__ == "__main__":

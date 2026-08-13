@@ -8,6 +8,13 @@ class EdgeEntrypointTests(unittest.TestCase):
         repo = Path(__file__).resolve().parents[1]
         py_compile.compile(str(repo / "edge" / "edge.py"), doraise=True)
 
+    def test_mt_bench_uses_chat_template(self):
+        repo = Path(__file__).resolve().parents[1]
+        source = (repo / "edge" / "edge.py").read_text(encoding="utf-8")
+        self.assertIn('self.args.dataset != "mt_bench"', source)
+        self.assertIn("tokenizer.apply_chat_template", source)
+        self.assertIn("enable_thinking=False", source)
+
 
 if __name__ == "__main__":
     unittest.main()

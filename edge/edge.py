@@ -139,6 +139,32 @@ class EdgeRunner(Decoding):
     def preprocess(self, input_text):
         return input_text.strip()
 
+    def _encode_input_ids(self, tokenizer, input_text: str):
+        if self.args.dataset != "mt_bench":
+            return tokenizer.encode(input_text, return_tensors="pt")
+
+        messages = [{"role": "user", "content": input_text}]
+        template_args = {
+            "tokenize": True,
+            "add_generation_prompt": True,
+            "return_tensors": "pt",
+        }
+        try:
+            input_ids = tokenizer.apply_chat_template(
+                messages,
+                enable_thinking=False,
+                **template_args,
+            )
+        except TypeError:
+            # Older compatible tokenizers may not expose Qwen3's
+            # enable_thinking switch, but still require the chat template.
+            input_ids = tokenizer.apply_chat_template(messages, **template_args)
+        if not torch.is_tensor(input_ids):
+            input_ids = torch.tensor(input_ids, dtype=torch.long)
+        if input_ids.dim() == 1:
+            input_ids = input_ids.unsqueeze(0)
+        return input_ids
+
     def postprocess(self, input_text, output_text):
         return output_text
 
@@ -581,7 +607,7 @@ class EdgeRunner(Decoding):
                 task_id = str(sample.get("task_id", f"mtbench-{proc_id}-{idx}"))
 
             # input_text = 'def fib(n'  # for debug
-            input_ids = tokenizer.encode(input_text, return_tensors="pt").to(draft_model.device)
+            input_ids = self._encode_input_ids(tokenizer, input_text).to(draft_model.device)
             prefix = input_ids.clone()
             max_len = input_ids.shape[1] + self.args.max_tokens
 
