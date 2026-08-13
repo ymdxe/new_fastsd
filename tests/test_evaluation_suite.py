@@ -101,6 +101,7 @@ class SpecEdgeAdapterTests(unittest.TestCase):
         return {
             "run_id": "run",
             "repo_path_linux": "/srv/new_fastsd",
+            "dataset": {"arrival_distribution": "immediate"},
             "models": {"draft": "/models/Qwen3-0.6B", "target": "/models/Qwen3-8B"},
             "generation": {"seed": 42, "temperature": 0, "gamma": 4, "max_new_tokens": 8},
             "topology": {
@@ -124,6 +125,20 @@ class SpecEdgeAdapterTests(unittest.TestCase):
         rendered = yaml.safe_load(render_specedge_config(self._config(), "hash", layout))
         self.assertEqual(rendered["server"]["max_batch_size"], 2)
         self.assertEqual(rendered["node"]["local"], [{"device": "cuda:0"}, {"device": "cuda:1"}])
+        self.assertEqual(rendered["base"]["dtype"], "bf16")
+        self.assertEqual(rendered["integration"]["arrival_distribution"], "immediate")
+
+    def test_specedge_mt_bench_adapter_uses_chat_template_and_immediate_arrivals(self):
+        source = (
+            Path(__file__).parents[1]
+            / "baselines"
+            / "specedge"
+            / "integration"
+            / "client.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("tokenizer.apply_chat_template", source)
+        self.assertIn("enable_thinking=False", source)
+        self.assertIn("actual_arrival = 0.0", source)
 
     def test_specedge_normalizer_uses_precise_client_measurements(self):
         with tempfile.TemporaryDirectory() as temp_dir:

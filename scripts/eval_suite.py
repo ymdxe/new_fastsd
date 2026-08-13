@@ -68,7 +68,7 @@ def render_specedge_config(config: dict[str, Any], workload_hash: str, layout: d
         "base:",
         f"  result_path: {_yaml_scalar(linux_root / 'specedge' / 'raw')}",
         f"  exp_name: {_yaml_scalar(config['run_id'])}",
-        "  dtype: fp16",
+        "  dtype: bf16",
         f"  seed: {int(generation['seed'])}",
         "  ssh_key: ~/.ssh/id_ed25519",
         "  max_len: 4096",
@@ -111,6 +111,7 @@ def render_specedge_config(config: dict[str, Any], workload_hash: str, layout: d
             f"  dataset_file: {_yaml_scalar(layout['linux_canonical'])}",
             f"  completion_dir: {_yaml_scalar(linux_root / 'specedge' / 'requests')}",
             f"  workload_hash: {_yaml_scalar(workload_hash)}",
+            f"  arrival_distribution: {_yaml_scalar(config['dataset'].get('arrival_distribution', 'immediate'))}",
             "  startup_delay_s: 15",
         ]
     )

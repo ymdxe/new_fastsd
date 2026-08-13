@@ -67,6 +67,24 @@ class IntegratedSpecExecClient(SpecExecClient):
             step_idx += 1
 
 
+def format_prompt(tokenizer, record: dict) -> str:
+    if record["dataset"] != "mt_bench":
+        return record["prompt"]
+    messages = [{"role": "user", "content": record["prompt"]}]
+    template_args = {
+        "tokenize": False,
+        "add_generation_prompt": True,
+    }
+    try:
+        return tokenizer.apply_chat_template(
+            messages,
+            enable_thinking=False,
+            **template_args,
+        )
+    except TypeError:
+        return tokenizer.apply_chat_template(messages, **template_args)
+
+
 def load_shard() -> list[dict]:
     dataset_file = Path(os.environ["FASTSD_EVAL_DATASET_FILE"])
     with dataset_file.open("r", encoding="utf-8") as handle:
@@ -105,16 +123,19 @@ async def main():
     with output_path.open("w", encoding="utf-8") as output:
         for record in records:
             scheduled = float(record.get("scheduled_arrival_s", 0.0))
-            remaining = start_epoch + scheduled - time.time()
-            if remaining > 0:
-                await asyncio.sleep(remaining)
-            actual_arrival = max(0.0, time.time() - start_epoch)
+            if os.environ.get("FASTSD_EVAL_ARRIVAL_DISTRIBUTION") == "poisson":
+                remaining = start_epoch + scheduled - time.time()
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
+                actual_arrival = max(0.0, time.time() - start_epoch)
+            else:
+                actual_arrival = 0.0
 
             request_start = time.perf_counter()
             client = IntegratedSpecExecClient(
                 engine=engine,
                 tokenizer=tokenizer,
-                prompt=record["prompt"],
+                prompt=format_prompt(tokenizer, record),
                 max_len=config.max_len,
             )
             client.measurement_start = request_start

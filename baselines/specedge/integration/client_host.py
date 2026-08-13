@@ -54,6 +54,9 @@ def _client_environment(config: dict, client_idx: int, device: str, start_epoch:
         "FASTSD_EVAL_NUM_CLIENTS": config["server"]["num_clients"],
         "FASTSD_EVAL_START_EPOCH": start_epoch,
         "FASTSD_EVAL_WORKLOAD_HASH": integration["workload_hash"],
+        "FASTSD_EVAL_ARRIVAL_DISTRIBUTION": integration.get(
+            "arrival_distribution", "immediate"
+        ),
     }
     return {key: str(value) for key, value in values.items()}
 

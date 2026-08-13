@@ -18,6 +18,23 @@ if dataset_file and os.environ.get("FASTSD_EVAL_ROLE") == "server":
             return _original_load_dataset(name, model_name=model_name, reasoning=reasoning)
         path = Path(dataset_file)
         with path.open("r", encoding="utf-8") as handle:
-            return [json.loads(line)["prompt"] for line in handle if line.strip()]
+            records = [json.loads(line) for line in handle if line.strip()]
+        if not records or records[0].get("dataset") != "mt_bench":
+            return [record["prompt"] for record in records]
+        tokenizer = _official_util.load_tokenizer(model_name)
+        prompts = []
+        for record in records:
+            messages = [{"role": "user", "content": record["prompt"]}]
+            template_args = {"tokenize": False, "add_generation_prompt": True}
+            try:
+                prompt = tokenizer.apply_chat_template(
+                    messages,
+                    enable_thinking=False,
+                    **template_args,
+                )
+            except TypeError:
+                prompt = tokenizer.apply_chat_template(messages, **template_args)
+            prompts.append(prompt)
+        return prompts
 
     _official_util.load_dataset = _load_dataset
