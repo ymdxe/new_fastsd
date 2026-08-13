@@ -28,6 +28,31 @@ from src.evaluation import load_canonical_jsonl
 from src.util import norm_logits, sample, seed_everything
 
 
+def _encode_prompt(tokenizer, prompt: str, dataset: str) -> torch.Tensor:
+    if dataset != "mt_bench":
+        return tokenizer.encode(prompt, return_tensors="pt")
+
+    messages = [{"role": "user", "content": prompt}]
+    template_args = {
+        "tokenize": True,
+        "add_generation_prompt": True,
+        "return_tensors": "pt",
+    }
+    try:
+        input_ids = tokenizer.apply_chat_template(
+            messages,
+            enable_thinking=False,
+            **template_args,
+        )
+    except TypeError:
+        input_ids = tokenizer.apply_chat_template(messages, **template_args)
+    if not torch.is_tensor(input_ids):
+        input_ids = torch.tensor(input_ids, dtype=torch.long)
+    if input_ids.dim() == 1:
+        input_ids = input_ids.unsqueeze(0)
+    return input_ids
+
+
 def _load_model(model_path: str, device: str):
     if (Path(model_path) / "quantize_config.json").is_file():
         if AutoGPTQForCausalLM is None:
@@ -119,7 +144,7 @@ def _worker(
                 time.sleep(remaining)
             actual_arrival = max(0.0, time.time() - float(start_epoch.value))
             request_start = time.perf_counter()
-            input_ids = tokenizer.encode(record["prompt"], return_tensors="pt")
+            input_ids = _encode_prompt(tokenizer, record["prompt"], record["dataset"])
             seed_everything(int(generation["seed"]) + int(record["global_index"]))
             generated, model_metrics = _generate(
                 model, input_ids, tokenizer, generation

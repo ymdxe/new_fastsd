@@ -85,6 +85,15 @@ class CommonMetricTests(unittest.TestCase):
         self.assertEqual(summary["quality_exact_match"], 1.0)
 
 
+class DraftOnlyPromptTests(unittest.TestCase):
+    def test_mt_bench_uses_qwen_chat_template_without_thinking(self):
+        source = (Path(__file__).parents[1] / "benchmark" / "eval_draft_pool.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("tokenizer.apply_chat_template", source)
+        self.assertIn("enable_thinking=False", source)
+
+
 class SpecEdgeAdapterTests(unittest.TestCase):
     def _config(self):
         return {
