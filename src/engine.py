@@ -487,7 +487,6 @@ class Decoding(ABC):
             "prefill": {"short": queue.Queue(), "mid": queue.Queue(), "long": queue.Queue()},
             "verify": {"short": queue.Queue(), "mid": queue.Queue(), "long": queue.Queue()},
         }
-        work_items = {}
 
         def get_length_category(seq_len):
             if seq_len <= 128:
@@ -686,6 +685,7 @@ class Decoding(ABC):
             "prefill": {"short": queue.Queue(), "mid": queue.Queue(), "long": queue.Queue()},
             "verify": {"short": queue.Queue(), "mid": queue.Queue(), "long": queue.Queue()},
         }
+        work_items = {}
         accept_stats = defaultdict(lambda: [0, 1])  # {proc_id: [accepted_sum, total_sum]}
         committed_prefix_tokens = {}  # {proc_id: List[int]} for debug context display
         verify_time_ema = {}
