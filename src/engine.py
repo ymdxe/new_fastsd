@@ -1151,7 +1151,15 @@ class Decoding(ABC):
             # even when the external request used full-prefix mode.
             original_bridge = bool(req.get("has_bridge_token", False))
             draft_start = 1 if original_bridge else 0
-            draft_base = draft_start if original_bridge else item.base_prefix_len
+            if original_bridge:
+                draft_base = 1
+            elif req.get("tail_only", False):
+                # Pipeline Edge sends only gamma drafts on the first round;
+                # the logical prefix lives in the target KV cache, not in
+                # this HTTP payload.
+                draft_base = 0
+            else:
+                draft_base = item.base_prefix_len
             draft_tokens = source[:, draft_base + sl.offset:draft_base + sl.offset + req_gamma]
             if bridge_token is None and original_bridge and sl.offset == 0:
                 # The first internal slice must carry the bridge supplied by
