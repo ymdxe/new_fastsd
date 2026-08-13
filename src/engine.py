@@ -1301,6 +1301,19 @@ class Decoding(ABC):
         sched_mode = getattr(self.args, "server_sched_mode", "fastsd")
         use_strict_fcfs = sched_mode in {"pipeline", "vanilla"}
 
+        def tensorize_draft_output(req: dict) -> dict:
+            draft_output = req.get("draft_output")
+            if not torch.is_tensor(draft_output):
+                draft_output = torch.tensor(draft_output, dtype=torch.long)
+                if draft_output.dim() == 1:
+                    draft_output = draft_output.unsqueeze(0)
+                if draft_output.dim() != 2:
+                    raise ValueError(
+                        "draft_output must be a flat token list or a 2-D tensor"
+                    )
+                req["draft_output"] = draft_output
+            return req
+
         # Pipeline baseline: strict FCFS, single-request handling only.
         # No queue categorization, no batching, no preload, no priority scheduling.
         try:
@@ -1310,6 +1323,7 @@ class Decoding(ABC):
                         req = request_queue.get(timeout=0.01)
                         if req is None:
                             return
+                        req = tensorize_draft_output(req)
                         if energy_service is not None:
                             energy_service.enter_active()
                         try:
@@ -1329,16 +1343,7 @@ class Decoding(ABC):
                         req = request_queue.get(timeout=0.01)
                         if req is None:  # 终止信号
                             return
-                        draft_output = req.get("draft_output")
-                        if not torch.is_tensor(draft_output):
-                            draft_output = torch.tensor(draft_output, dtype=torch.long)
-                            if draft_output.dim() == 1:
-                                draft_output = draft_output.unsqueeze(0)
-                            if draft_output.dim() != 2:
-                                raise ValueError(
-                                    "draft_output must be a flat token list or a 2-D tensor"
-                                )
-                            req["draft_output"] = draft_output
+                        req = tensorize_draft_output(req)
                         recent_prefix_lens.append(int(req["prefix_len"]))
                         len_r1, len_r2 = _update_length_thresholds(recent_prefix_lens)
                         cat = _length_category(req["prefix_len"], len_r1, len_r2)
