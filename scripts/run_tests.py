@@ -60,6 +60,12 @@ def main(argv: list[str] | None = None) -> int:
                 "compileall",
                 "-q",
                 "baselines/specedge/repro.py",
+                "baselines/specedge/integration",
+                "benchmark/eval_draft_pool.py",
+                "benchmark/eval_unified.py",
+                "scripts/eval_suite.py",
+                "src/evaluation.py",
+                "src/common_metrics.py",
             ],
         ),
     ]

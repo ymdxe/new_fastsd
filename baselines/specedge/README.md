@@ -14,6 +14,11 @@ https://github.com/kaist-ina/specedge.git
 - `official/` 是论文作者发布的实现，不在 FastSD 中复制或改写其核心算法。
 - 本目录其余文件只提供版本检查、论文参数配置和复现说明，不把 FastSD 内部推理路径称为 SpecEdge 官方结果。
 
+面向当前 FastSD 数据集和四方法对比的运行时适配器位于 `integration/`。它负责读取
+统一 canonical JSONL、按多个边缘 client 分片、复现泊松到达、精确记录 TTFT/TPOT 和
+导出生成文本；官方 `official/` 子模块保持不变。完整流程见
+[`docs/FOUR_METHOD_EVALUATION.md`](../../docs/FOUR_METHOD_EVALUATION.md)。
+
 ## 当前 Windows 本地状态
 
 Windows 本地可以完成源码获取、版本固定、配置检查和 Python 语法编译；不能据此声称
