@@ -323,7 +323,135 @@ prefill_chunk_quantum    = 128
 
 当前前五项已在 2026-08-13 预实验中通过；正式配置和 manifest 仍需在完整实验启动前冻结。
 
-## 7. 结果目录约定
+## 7. MT-Bench 两 A5000 完整实验（2026-08-13）
+
+### 7.1 最终有效配置
+
+本轮使用 MT-Bench 80 条第一轮问题，node1 两张 A5000 各运行一个 Qwen3-0.6B
+Draft worker，node2 GPU0 的一张 A6000 运行 Qwen3-8B Target。最终有效代码为：
+
+```text
+03bd03d50a9a99ba17610606999790a0ca64f49e
+agent/token-budget-continuous-batching
+workload_hash=f100fe17c5b30626e80da573c307f0340d5005eb12c5fbd00d15f921f6a04455
+```
+
+固定参数：
+
+```text
+num_requests             = 80（每个 Draft worker 40）
+max_new_tokens           = 256
+temperature              = 0
+gamma                    = 4
+batch_size               = 2
+token_budget             = 512
+min_prefill_chunk_tokens = 16
+prefill_chunk_quantum    = 128
+arrival_distribution     = immediate（两 worker 闭环）
+pipeline                 = off
+proactive draft          = on
+```
+
+MT-Bench 使用 Qwen3 chat template、`add_generation_prompt=True` 和
+`enable_thinking=False`。本实验只执行每条样本的第一轮问题；第二轮改写/自评问题保存在
+reference 中但未生成回答。
+
+### 7.2 正式运行前发现并修复的问题
+
+完整 80 请求运行暴露了短 smoke 未覆盖的四个边界：
+
+1. 非 pipeline 的 full-prefix verify 需要追加上一轮 correction token；此前 planner 未将其作为
+   bridge forward token 计费，曾触发 logits 越界。修复提交 `a02c4ed`。
+2. Cloud HTTP 父进程曾把 `torch.Tensor` 通过 `multiprocessing.Queue` 传给 Target worker，
+   长运行后出现 `received 0 items of ancdata`。现在 IPC 只传 Python list/int，worker 内部再
+   tensorize。修复提交 `2219c06`。
+3. generic Edge 原来直接编码 MT-Bench raw question，未应用 Qwen3 chat template；同时统一
+   normalizer 错把闭环 worker 的相对 completion time 当作全局 wallclock。修复提交
+   `977a8bc`。
+4. bridge token 已物理追加时，verify 又把逻辑 target logit 位置额外右移一位，导致错误接受
+   Draft token并形成退化重复。修复后所有 draft token i 均由逻辑位置
+   `prefix_len + i - 1` 的 logits 验证。修复提交 `03bd03d`。
+
+所有失败目录和日志均保留，没有覆盖为成功结果。本地最终 50 个单元/静态测试通过，其中
+1 个真实 Torch KV 测试因 Windows 本地缺 Torch 跳过；node1/node2 的 scheduler 与真实 KV
+门禁均通过。
+
+### 7.3 最终公共指标
+
+结果：80/80 请求完成，两个 Draft worker 各 40 条；Edge/Cloud 错误均为 0，退化重复终止
+为 0。共生成 16,643 tokens，80 条输出均非空，其中 46 条达到 256-token 上限。
+
+| 指标 | 最终结果 |
+|---|---:|
+| 真实运行 wallclock | 1143.409 s |
+| system output throughput | 14.5556 tok/s |
+| TTFT avg / P50 / P90 / P95 / P99 | 940.92 / 905.16 / 1190.54 / 1273.78 / 1464.31 ms |
+| decode TTFT avg | 458.19 ms |
+| TPOT avg / P50 / P90 / P95 / P99 | 128.82 / 126.45 / 179.49 / 183.56 / 209.14 ms |
+| request E2E avg / P50 / P90 / P95 / P99 | 28058.61 / 29237.39 / 43315.88 / 45877.29 / 47555.05 ms |
+| weighted acceptance rate | 0.48848 |
+| mean accepted tokens / verify | 2.13555 |
+| 平均生成长度 | 208.04 tokens |
+| 非空输出 | 80 / 80 |
+| 达到 256-token 上限 | 46 / 80 |
+| HTTP/worker errors | 0 |
+| degenerate-repeat early stops | 0 |
+
+这里不报告 MT-Bench judge 分数：尚未运行统一的 GPT-4/LLM judge。上述数据是系统性能、
+协议稳定性和输出完整性证据，不等于 MT-Bench 质量胜率。
+
+### 7.4 分类别指标
+
+| 类别 | 请求数 | 平均 tokens | TTFT avg (ms) | TPOT avg (ms) | E2E avg (ms) | acceptance |
+|---|---:|---:|---:|---:|---:|---:|
+| coding | 10 | 255.0 | 943.22 | 108.86 | 28577.85 | 0.6066 |
+| extraction | 10 | 80.0 | 1190.49 | 96.39 | 8579.67 | 0.7246 |
+| humanities | 10 | 256.0 | 926.88 | 159.66 | 41641.46 | 0.4060 |
+| math | 10 | 225.2 | 888.03 | 82.04 | 19326.84 | 0.7872 |
+| reasoning | 10 | 195.0 | 861.18 | 123.19 | 24912.81 | 0.5124 |
+| roleplay | 10 | 208.3 | 833.68 | 171.66 | 35310.51 | 0.3248 |
+| stem | 10 | 253.8 | 929.19 | 136.64 | 35426.01 | 0.4956 |
+| writing | 10 | 191.0 | 954.69 | 152.12 | 30693.72 | 0.3700 |
+
+### 7.5 Scheduler 指标与解释
+
+```text
+iterations       = 23456
+plans            = 5511
+used_tokens      = 34633
+verify_slices    = 5663
+prefill_slices   = 97
+partial_verify   = 0
+partial_prefill  = 17
+prefetch_plans   = 5511
+prefetch hit/miss/eviction = 0/0/0
+```
+
+平均每个 plan 使用 6.284 tokens；按 `plans * token_budget` 计算的预算利用率为 1.2274%。
+本轮只有两个闭环会话，Verify 每轮通常只消费约 `gamma` 个 token，因此 `token_budget=512`
+远高于可形成的实际工作量。这个结果说明 512 不是两 worker MT-Bench 的有效调优点；正式
+消融应补 `token_budget=16/32/64/128`，或使用开放环更多并发请求后再讨论预算利用率。
+
+### 7.6 最终证据路径
+
+本地：
+
+```text
+exp/comparison/qwen3_8b_0.6b_mt_bench_2gpu_seed42/fastsd_03bd03d/
+exp/comparison/qwen3_8b_0.6b_mt_bench_2gpu_seed42/fastsd_03bd03d_cloud/
+exp/comparison/qwen3_8b_0.6b_mt_bench_2gpu_seed42/normalized/fastsd/
+```
+
+服务器：
+
+```text
+node1: exp/comparison/qwen3_8b_0.6b_mt_bench_2gpu_seed42/fastsd_03bd03d/
+node1: /tmp/new_fastsd_mtbench_2gpu_03bd03d_edge.log
+node2: exp/comparison/qwen3_8b_0.6b_mt_bench_2gpu_seed42/fastsd_03bd03d_cloud/
+node2: /tmp/new_fastsd_mtbench_2gpu_03bd03d_cloud.log
+```
+
+## 8. 结果目录约定
 
 正式结果统一放在：
 
