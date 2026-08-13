@@ -17,12 +17,13 @@ If you are new to the repo, read the detailed guide first:
 
 - [docs/REPOSITORY_GUIDE.md](docs/REPOSITORY_GUIDE.md)
 - [docs/CAMPUS_SERVER_EXTERNAL_ACCESS.md](docs/CAMPUS_SERVER_EXTERNAL_ACCESS.md)
+- [baselines/specedge/README.md](baselines/specedge/README.md) — pinned official SpecEdge baseline and paper-aligned reproduction configs
 
 Quick pointers:
 
 - Install dependencies: `bash install.sh`
 - Start cloud target service: `python cloud/cloud_service.py --exp_name <name>`
 - Start edge runner with a preset profile: `bash scripts/run_fastsd_profile.sh <exp_name>`
-- Run tests: `python -m unittest tests.test_energy_meter tests.test_fastsd_scheduler -v`
+- Run the complete local test suite (including the pinned SpecEdge baseline checks): `python scripts/run_tests.py`
 
 The repository currently has local uncommitted changes copied from the remote development server. Check `git status --short` before assuming a clean baseline.
