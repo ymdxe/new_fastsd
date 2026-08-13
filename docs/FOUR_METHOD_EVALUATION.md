@@ -129,5 +129,11 @@ evaluate_functional_correctness \
 ## 当前验证边界
 
 Windows 本地已经验证数据适配、泊松清单、YAML 生成、日志归一化、公共指标和静态编译。
-这不等同于真实 A5000/A6000 端到端成功；正式指标只能在两台服务器的 GPU、隧道、模型
-和官方 Python 3.14 环境均验证后报告。
+2026-08-13 还完成了真实跨服务器预实验：node1 的 1/4 张 A5000 运行 Qwen3-0.6B
+Draft，node2 的一张 A6000 运行 Qwen3-8B Target；单卡和同步四卡 smoke 均通过，且 Cloud
+日志确认形成了多 session Prefill batch。完整拓扑、命令、指标和正式实验矩阵见
+`docs/plans/2026-08-13-qwen3-cross-server-full-experiment.md`。
+
+这些短 smoke 只证明端到端可运行，不等同于四方法正式结果。SpecEdge 的正式运行仍要求
+其独立 Python 3.14 环境通过门禁；论文级指标必须使用冻结的 canonical manifest、多 seed
+重复和统一归一化流程。
