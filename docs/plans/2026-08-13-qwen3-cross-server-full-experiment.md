@@ -451,11 +451,11 @@ node2: exp/comparison/qwen3_8b_0.6b_mt_bench_2gpu_seed42/fastsd_03bd03d_cloud/
 node2: /tmp/new_fastsd_mtbench_2gpu_03bd03d_cloud.log
 ```
 
-## 8. 普通投机解码与 Draft-only 对照（2026-08-13）
+## 8. SpecEdge、普通投机解码与 Draft-only 对照（2026-08-13）
 
 ### 8.1 公平性约束与有效版本
 
-两个新对照继续使用第 7 节完全相同的 canonical manifest：
+三个对照继续使用第 7 节完全相同的 canonical manifest：
 
 ```text
 dataset       = MT-Bench 80 条第一轮问题
@@ -472,6 +472,11 @@ Draft-only 只使用 node1 GPU0/1，每卡一个 Qwen3-0.6B 自回归 worker；�
 也不执行 Target verify。最终有效实现提交为 `c234a605ac26`。两个入口均使用 Qwen3 chat
 template、`add_generation_prompt=True` 和 `enable_thinking=False`。
 
+SpecEdge 使用固定官方子模块 `1edcaf02ffc41a7b57726450c5357ed216a3b9bc` 的核心
+`SpecExecBatchServer`、`SpecExecClient`、tree drafting 和 proactive drafting；本仓库
+`baselines/specedge/integration/` 只负责 canonical dataset、Qwen3 chat template、精确请求指标、
+BF16 位保真 gRPC 序列化和可配置回环端口。最终有效适配提交为 `ebf85d210eb3`。
+
 ### 8.2 对照运行暴露并修复的问题
 
 1. Draft-only 原入口直接编码 MT-Bench 裸问题，与 FastSD 的 Qwen3 chat template 不一致；
@@ -483,14 +488,22 @@ template、`add_generation_prompt=True` 和 `enable_thinking=False`。
    immediate 模式固定为 0，导致不可比的 scheduled TTFT。提交 `c234a60` 对齐了辅助指标。
 4. wrapper 初次由系统 Python 启动，缺少 `auto_gptq`；正式运行显式使用
    `/home/hdd/zhangh/envs/new_fastsd/bin/python`。所有失败日志均保留，未计入结果。
+5. 两台服务器最初均无官方 `.venv`，node2 已有 `/home/hdd/zhangh/envs/specedge`；node1
+   使用官方 `uv.lock` 和 `uv 0.12.3` 安装相同 Python 3.14.7、Torch 2.9.0+cu128 环境。
+6. node2 的公网 8000 已由 root Docker proxy 使用，不能终止；提交 `203a6b0` 增加只绑定
+   `127.0.0.1:18000` 的 server launcher，仍直接实例化官方 `SpecExecBatchServer`。
+7. 官方 `util.encode()` 经 NumPy 序列化 BF16 会报 `unsupported ScalarType BFloat16`；
+   提交 `ebf85d2` 在适配层把 BF16 view 为 `uint16` 后发送，服务端仍用官方
+   `torch.frombuffer(..., dtype=bfloat16)` 还原，传输位模式不变。
 
-最终本地回归为 51 项：50 通过，1 个真实 Torch KV 测试因 Windows 本地无 Torch 跳过。
+最终本地回归为 52 项：51 通过，1 个真实 Torch KV 测试因 Windows 本地无 Torch 跳过。
 
-### 8.3 三方法公共指标
+### 8.3 四方法公共指标
 
 | 方法 | 请求 | 生成 tokens | wallclock (s) | throughput (tok/s) | TTFT avg / P95 / P99 (ms) | TPOT avg / P95 / P99 (ms) | E2E avg / P95 / P99 (ms) | acceptance | accepted / verify |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | FastSD | 80 | 16,643 | 1143.409 | 14.5556 | 940.92 / 1273.78 / 1464.31 | 128.82 / 183.56 / 209.14 | 28058.61 / 45877.29 / 47555.05 | 0.48848 | 2.13555 |
+| SpecEdge | 80 | 16,805 | 605.461 | 27.7557 | 533.59 / 642.10 / 1230.80 | 67.49 / 83.56 / 92.04 | 14762.80 / 20487.51 / 21880.43 | N/A | 3.72163 |
 | standard_sd | 80 | 16,699 | 1532.675 | 10.8953 | 1255.34 / 1983.03 / 2125.40 | 176.47 / 288.79 / 308.96 | 37855.40 / 58732.78 / 66527.31 | 0.49503 | 2.17240 |
 | draft_only | 80 | 14,410 | 162.370 | 88.7480 | 39.40 / 32.76 / 598.65 | 21.84 / 25.01 / 27.56 | 3976.98 / 6365.65 / 7052.08 | N/A | N/A |
 
@@ -503,6 +516,14 @@ wallclock throughput，不使用各 worker active-window 吞吐替代。
 平均值降低 25.88%。这组结果只说明当前两 closed-loop session、两 A5000 Draft 的系统性能；
 `token_budget=512` 仍然严重过配，不能据此外推高并发收益。
 
+相对 FastSD，SpecEdge 系统吞吐提高 90.69%，TTFT 平均值降低 43.29%，TPOT 平均值
+降低 47.61%，请求 E2E 平均值降低 47.39%；相对 standard_sd 吞吐提高 154.75%。SpecEdge
+使用 `max_budget=32` 的树形候选和 proactive drafting，FastSD/standard_sd 是线性 `gamma=4`，
+这是各方法算法配置而非相同 draft-token 工作量。SpecEdge cycle 日志包含 4,525 个非 Prefill
+verify cycle，按 cycle 加权平均接受 3.657 tokens；表中 3.72163 是先逐请求求均值再对 80 请求
+等权平均。树中验证的分支 token 没有与线性 draft 数相同定义的分母，因此不报告伪造的
+acceptance rate。
+
 Draft-only 的速度不能解释为与 8B Target 方法同质量：它生成的是 0.6B 模型输出，生成 token
 总数和停止位置也不同。本轮未运行统一 MT-Bench LLM judge，因此不报告质量胜率。
 
@@ -511,7 +532,9 @@ Draft-only 的速度不能解释为与 8B Target 方法同质量：它生成的�
 - standard_sd：80/80 非空，两个 worker 各 40 条，47 条达到 256-token 上限，Edge/Cloud
   错误为 0；
 - draft_only：80/80 非空，两个 worker 各 40 条，35 条达到 256-token 上限，worker 错误为 0；
-- 两者 workload hash 均与 FastSD 完全一致；
+- SpecEdge：80/80 非空，两个 client 各 40 条，50 条达到 256-token 上限，4,605 个 cycle，
+  client/server 错误均为 0；
+- 三者 workload hash 均与 FastSD 完全一致；
 - 运行结束后 node1 GPU0/1 和 node2 GPU0 均回到约 15 MiB，8001 服务和两段 SSH 隧道已释放。
 
 必须保留一个尚未关闭的正确性风险：逐样本比较 FastSD 与 standard_sd，只有 26/80 输出文本
@@ -519,6 +542,10 @@ Draft-only 的速度不能解释为与 8B Target 方法同质量：它生成的�
 接近的 logits 上选择不同 token，但现有证据也不能排除 FastSD KV/bridge 状态语义仍有问题。
 所以当前数据可作为性能和稳定性结果，不能作为 target-output parity 已通过的证据。正式论文实验
 前必须补同一 Target 的 monolithic greedy oracle，并比较 token-level 首个分叉位置和最终 KV/logits。
+
+SpecEdge 与 standard_sd、FastSD 都只有 14/80 输出文本逐字一致，生成长度分别有 59/80
+一致。因此 SpecEdge 性能数据同样不能作为 target-output parity 已通过的证据。当前四方法均未
+运行统一 MT-Bench LLM judge，不能从系统时延推导回答质量。
 
 ### 8.5 MT-Bench 分类别指标
 
@@ -548,6 +575,19 @@ draft_only：
 | stem | 10 | 246.2 | 25.52 | 22.90 | 5639.38 |
 | writing | 10 | 147.9 | 142.13 | 21.83 | 3357.13 |
 
+SpecEdge：
+
+| 类别 | 请求 | 平均 tokens | TTFT avg (ms) | TPOT avg (ms) | E2E avg (ms) |
+|---|---:|---:|---:|---:|---:|
+| coding | 10 | 256.0 | 498.80 | 62.40 | 16410.95 |
+| extraction | 10 | 81.2 | 558.87 | 61.72 | 5781.59 |
+| humanities | 10 | 256.0 | 480.95 | 70.69 | 18507.41 |
+| math | 10 | 225.4 | 479.83 | 59.74 | 13864.47 |
+| reasoning | 10 | 194.5 | 497.62 | 64.29 | 13170.25 |
+| roleplay | 10 | 212.2 | 521.43 | 78.65 | 16828.28 |
+| stem | 10 | 256.0 | 532.10 | 67.66 | 17784.44 |
+| writing | 10 | 199.2 | 699.12 | 74.74 | 15754.98 |
+
 ### 8.6 证据路径
 
 ```text
@@ -556,11 +596,59 @@ exp/comparison/qwen3_8b_0.6b_mt_bench_2gpu_seed42/standard_sd_23db00d_cloud/
 exp/comparison/qwen3_8b_0.6b_mt_bench_2gpu_seed42/draft_only/
 exp/comparison/qwen3_8b_0.6b_mt_bench_2gpu_seed42/normalized/standard_sd/
 exp/comparison/qwen3_8b_0.6b_mt_bench_2gpu_seed42/normalized/draft_only/
-exp/comparison/qwen3_8b_0.6b_mt_bench_2gpu_seed42/normalized/comparison_fastsd_standard_draft.csv
+exp/comparison/qwen3_8b_0.6b_mt_bench_2gpu_seed42/specedge/raw/qwen3_8b_0.6b_mt_bench_2gpu_seed42/
+exp/comparison/qwen3_8b_0.6b_mt_bench_2gpu_seed42/specedge/requests/
+exp/comparison/qwen3_8b_0.6b_mt_bench_2gpu_seed42/normalized/specedge/
+exp/comparison/qwen3_8b_0.6b_mt_bench_2gpu_seed42/normalized/comparison_all_four.csv
 ```
 
-本节没有包含 SpecEdge 数值；SpecEdge 必须在同一 manifest、同一两 A5000 Draft 和一 A6000
-Target 拓扑上独立跑完后再加入四方法表。
+### 8.7 SpecEdge 可复现运行命令
+
+首次在每台服务器准备环境：
+
+```bash
+cd /home/hdd/zhangh/workspace/new_fastsd/baselines/specedge/official
+UV_PROJECT_ENVIRONMENT=/home/hdd/zhangh/envs/specedge \
+UV_CACHE_DIR=/home/hdd/zhangh/cache/uv \
+/home/hdd/zhangh/tools/uv/bin/uv sync --python 3.14 --frozen
+```
+
+node2 启动 Target server：
+
+```bash
+cd /home/hdd/zhangh/workspace/new_fastsd
+FASTSD_EVAL_ROLE=server \
+FASTSD_EVAL_DATASET_FILE=exp/comparison/qwen3_8b_0.6b_mt_bench_2gpu_seed42/inputs/canonical.jsonl \
+PYTHONPATH=baselines/specedge/integration:baselines/specedge/official/src \
+/home/hdd/zhangh/envs/specedge/bin/python -O baselines/specedge/integration/server.py \
+  --config exp/comparison/qwen3_8b_0.6b_mt_bench_2gpu_seed42/specedge/specedge.yaml \
+  --host 127.0.0.1 --port 18000
+```
+
+Windows 上用两个终端建立仅回环隧道：
+
+```powershell
+ssh -N -L 18000:127.0.0.1:18000 node2
+ssh -N -R 18000:127.0.0.1:18000 node1
+```
+
+node1 启动两个 A5000 client：
+
+```bash
+cd /home/hdd/zhangh/workspace/new_fastsd
+/home/hdd/zhangh/envs/specedge/bin/python \
+  baselines/specedge/integration/client_host.py \
+  --config exp/comparison/qwen3_8b_0.6b_mt_bench_2gpu_seed42/specedge/specedge.yaml
+```
+
+归一化：
+
+```bash
+/home/hdd/zhangh/envs/new_fastsd/bin/python scripts/eval_suite.py normalize \
+  --config configs/evaluation/qwen3_8b_0.6b_mt_bench_2gpu.json \
+  --method specedge \
+  --input exp/comparison/qwen3_8b_0.6b_mt_bench_2gpu_seed42/specedge/raw/qwen3_8b_0.6b_mt_bench_2gpu_seed42
+```
 
 ## 9. 结果目录约定
 

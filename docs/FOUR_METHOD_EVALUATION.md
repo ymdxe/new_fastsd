@@ -50,7 +50,9 @@ git submodule update --init --recursive
 python scripts/run_tests.py
 
 cd baselines/specedge/official
-uv sync
+UV_PROJECT_ENVIRONMENT=/home/hdd/zhangh/envs/specedge \
+UV_CACHE_DIR=/home/hdd/zhangh/cache/uv \
+/home/hdd/zhangh/tools/uv/bin/uv sync --python 3.14 --frozen
 ```
 
 模型必须先通过架构、词表和 tokenizer 指纹检查；“能下载”不等于 draft/target 可互换
@@ -80,8 +82,10 @@ cd /home/hdd/zhangh/workspace/new_fastsd
 ```
 
 四种方法应顺序运行，避免互相抢 GPU。FastSD 与 standard SD 共用 8001 端口，但需要
-分别以 `fastsd` 和 `vanilla` 调度模式启动 target。SpecEdge 使用 8000 端口。node1 到
-node2 的隧道把它们映射为 18001 和 18000。
+分别以 `fastsd` 和 `vanilla` 调度模式启动 target。若 node2 的 8000 已被占用，SpecEdge
+使用 `baselines/specedge/integration/server.py --host 127.0.0.1 --port 18000`；它只替换
+绑定端口，仍直接运行官方 `SpecExecBatchServer`。本次 MT-Bench 的完整命令见实验记录
+第 8.7 节。
 
 ## 统一指标
 
@@ -128,12 +132,12 @@ evaluate_functional_correctness \
 
 ## 当前验证边界
 
-Windows 本地已经验证数据适配、泊松清单、YAML 生成、日志归一化、公共指标和静态编译。
-2026-08-13 还完成了真实跨服务器预实验：node1 的 1/4 张 A5000 运行 Qwen3-0.6B
-Draft，node2 的一张 A6000 运行 Qwen3-8B Target；单卡和同步四卡 smoke 均通过，且 Cloud
-日志确认形成了多 session Prefill batch。完整拓扑、命令、指标和正式实验矩阵见
+2026-08-13 已在同一 MT-Bench 80 请求 manifest 上完成 FastSD、官方 SpecEdge 核心加评测
+适配层、standard SD 和 draft-only 四方法单次完整运行。SpecEdge 使用 node1 两张 A5000、
+node2 GPU0 一张 A6000、Python 3.14.7 和官方 lockfile 环境，80/80 请求完成且两端错误为 0。
+完整拓扑、命令、指标和证据边界见
 `docs/plans/2026-08-13-qwen3-cross-server-full-experiment.md`。
 
-这些短 smoke 只证明端到端可运行，不等同于四方法正式结果。SpecEdge 的正式运行仍要求
-其独立 Python 3.14 环境通过门禁；论文级指标必须使用冻结的 canonical manifest、多 seed
-重复和统一归一化流程。
+这些结果仍不是论文级最终结论：尚未运行多 seed 和统一 MT-Bench LLM judge，且三种 8B
+Target 路径的逐 token output parity 尚未通过。性能数据可用于当前硬件/配置比较，不能替代
+质量与正确性验证。
