@@ -72,6 +72,42 @@ class KVCacheModel_batching():
         self._past_key_values[proc_id].crop(end_pos)
         self._prob_history[proc_id] = self._prob_history[proc_id][:, :end_pos, :]
 
+    @torch.no_grad()
+    def forward_new_tokens(
+        self,
+        input_ids: torch.Tensor,
+        proc_ids: list[int],
+        pad_token_id,
+        input_lens=None,
+        reset_pids=None,
+    ):
+        """Append uncached suffixes for persistent WorkItems.
+
+        Fresh PIDs use the prefill path; existing PIDs use the continuation
+        path without resetting their DynamicCache.
+        """
+        reset = set(reset_pids or ())
+        fresh_indices = [i for i, pid in enumerate(proc_ids) if pid in reset]
+        if fresh_indices:
+            self.generate(
+                input_ids[fresh_indices],
+                1,
+                proc_ids=[proc_ids[i] for i in fresh_indices],
+                pad_token_id=pad_token_id,
+                is_prefill=True,
+                input_lens=[input_lens[i] for i in fresh_indices] if input_lens is not None else None,
+            )
+        cont_indices = [i for i, pid in enumerate(proc_ids) if pid not in reset]
+        if not cont_indices:
+            return []
+        return self._forward_with_kvcache(
+            input_ids[cont_indices],
+            [proc_ids[i] for i in cont_indices],
+            pad_token_id,
+            is_prefill=False,
+            input_lens=[input_lens[i] for i in cont_indices] if input_lens is not None else None,
+        )
+
     def _forward_with_kvcache(
         self,
         input_ids: torch.Tensor,
@@ -147,7 +183,9 @@ class KVCacheModel_batching():
             residuals = []
             residual_lens = []
             for i, pid in enumerate(proc_ids):
-                input_ids_i = input_ids[i]  # shape: (T,)
+                input_ids_i = input_ids[i:i + 1]  # shape: (1, T)
+                if input_lens is not None:
+                    input_ids_i = input_ids_i[:, :int(input_lens[i])]
                 past_kv = self._past_key_values[pid]
 
                 cached_len = past_kv.get_seq_length()
@@ -166,8 +204,10 @@ class KVCacheModel_batching():
             )  # shape: [B, T_pad]
 
             # Step 3: padding past_kv 到 max_cached_len
+            original_past_list = []
             for pid in proc_ids:
                 legacy = self._past_key_values[pid].to_legacy_cache()  # List[(key, value)]
+                original_past_list.append(legacy)
                 padded_layers = []
                 for key, value in legacy:
                     # key shape 可能是 4-D or 5-D；seq_len 在倒数第二维
@@ -216,9 +256,19 @@ class KVCacheModel_batching():
                 past_mask[i, :cached_len] = 1
             attention_mask = torch.cat([past_mask, current_mask], dim=1)
 
+            # Physical past KV is padded to max_cached_len, but logical
+            # positions remain per-row and must not include that padding gap.
+            position_ids = torch.zeros_like(padded_inputs, dtype=torch.long)
+            for i, res_len in enumerate(residual_lens):
+                position_ids[i, :res_len] = torch.arange(
+                    cached_lens[i], cached_lens[i] + res_len,
+                    device=position_ids.device,
+                )
+
             outputs = self._model(
                 padded_inputs,
                 attention_mask=attention_mask,
+                position_ids=position_ids,
                 past_key_values=batched_cache,
                 use_cache=True,
             )
@@ -256,11 +306,17 @@ class KVCacheModel_batching():
 
                 # ---- 3. 提取该样本对应的 past_key_values ----
                 pkv_i = []
-                total_len = cached_lens[i] + valid_len
-                for layer in past_key_values:  # each layer is a (key, value)
+                for layer_idx, layer in enumerate(past_key_values):  # each layer is a (key, value)
                     key, value = layer  # shape: (B, H, T, D)
-                    key_i = key[i:i + 1, :, :total_len, :].clone()  # (1, H, total_len, D)
-                    value_i = value[i:i + 1, :, :total_len, :].clone()  # (1, H, total_len, D)
+                    old_key, old_value = original_past_list[i][layer_idx]
+                    appended_key = key[i:i + 1, :, max_cached_len:max_cached_len + valid_len, :]
+                    appended_value = value[i:i + 1, :, max_cached_len:max_cached_len + valid_len, :]
+                    key_i = torch.cat(
+                        [old_key[:, :, :cached_lens[i], :], appended_key], dim=-2
+                    ).clone()
+                    value_i = torch.cat(
+                        [old_value[:, :, :cached_lens[i], :], appended_value], dim=-2
+                    ).clone()
                     pkv_i.append((key_i, value_i))
                 past_key_values_list.append(pkv_i)
 

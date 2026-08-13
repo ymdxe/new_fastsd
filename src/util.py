@@ -129,6 +129,18 @@ def parse_arguments():
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--token_budget", type=int, default=512)
     parser.add_argument(
+        "--min_prefill_chunk_tokens",
+        type=int,
+        default=16,
+        help="minimum normal Prefill slice; a smaller slice is allowed only for a final tail",
+    )
+    parser.add_argument(
+        "--prefill_chunk_quantum",
+        type=int,
+        default=128,
+        help="normal maximum Prefill slice before budget tail filling",
+    )
+    parser.add_argument(
         "--max_tasks_per_draft",
         type=int,
         default=10,
@@ -252,6 +264,16 @@ def parse_arguments():
     args = parser.parse_args()
     if args.arrival_distribution == "poisson" and args.arrival_rate <= 0:
         parser.error("--arrival_rate must be positive for Poisson arrivals")
+    if args.batch_size <= 0:
+        parser.error("--batch_size must be positive")
+    if args.token_budget <= 0:
+        parser.error("--token_budget must be positive")
+    if args.min_prefill_chunk_tokens <= 0:
+        parser.error("--min_prefill_chunk_tokens must be positive")
+    if args.prefill_chunk_quantum <= 0:
+        parser.error("--prefill_chunk_quantum must be positive")
+    if args.min_prefill_chunk_tokens > args.token_budget:
+        parser.error("--min_prefill_chunk_tokens must not exceed --token_budget")
     if args.profile != "custom":
         # Baseline profiles must not be mixed with FastSD scheduler.
         if args.server_sched_mode == "fastsd":

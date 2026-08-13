@@ -1,4 +1,5 @@
 import os
+import json
 import torch
 import transformers
 import warnings
@@ -27,6 +28,7 @@ import requests
 
 from .energy_meter import EnergyControlService, EnergyServiceConfig
 from .fastsd_scheduler import (
+    AdmissionPlan,
     FASTSD_DEFAULT_R1,
     FASTSD_DEFAULT_R2,
     FASTSD_DYNAMIC_WINDOW,
@@ -34,6 +36,11 @@ from .fastsd_scheduler import (
     compute_priority_score as _compute_priority_score,
     length_category as _length_category,
     predict_next_verify_proc_ids as _predict_next_verify_proc_ids,
+    WorkItem,
+    abort_admission_plan,
+    commit_admission_plan,
+    plan_iteration,
+    reserve_admission_plan,
     should_switch_to_prefill as _should_switch_to_prefill,
     update_length_thresholds as _update_length_thresholds,
 )
@@ -480,6 +487,7 @@ class Decoding(ABC):
             "prefill": {"short": queue.Queue(), "mid": queue.Queue(), "long": queue.Queue()},
             "verify": {"short": queue.Queue(), "mid": queue.Queue(), "long": queue.Queue()},
         }
+        work_items = {}
 
         def get_length_category(seq_len):
             if seq_len <= 128:
@@ -728,11 +736,22 @@ class Decoding(ABC):
             return DynamicCache.from_legacy_cache(new_cache)
 
         # --------------------- 批量处理（Prefill / Verify） ----------------
-        def handle_request_batch(batch: list[dict]):
+        def handle_request_batch(batch: list[dict], return_responses: bool = False):
             """
             batch : 同一种 task_type (全部 prefill or 全部 verify)
             """
             proc_ids = [req["proc_id"] for req in batch]
+            response_keys = {
+                req["proc_id"]: req.get("response_key", req["proc_id"])
+                for req in batch
+            }
+            collected_responses = {}
+
+            def deliver(pid, payload):
+                if return_responses:
+                    collected_responses[pid] = payload
+                else:
+                    response_queues[response_keys.get(pid, pid)].put(payload)
             prefix_len = [req["prefix_len"] for req in batch]
 
             if batch[0]["task_type"] == "prefill":
@@ -750,20 +769,42 @@ class Decoding(ABC):
                         padded.append(x)
                 x_batch = torch.cat(padded, dim=0)  # (B, max_T)
 
-                # 新 prompt，给每个 pid 刷新 cache
+                continuation = [bool(req.get("_prefill_continuation", False)) for req in batch]
+                # New prompts reset only the first chunk. Continuation chunks
+                # append to the persistent cache instead of rebuilding it.
                 with cache_lock:
                     for pid in proc_ids:
                         preloaded_gpu_pids.discard(pid)
-                        kv_cache_manager.reset(pid)  # 只清该 pid
+                        if pid not in [req["proc_id"] for req, cont in zip(batch, continuation) if cont]:
+                            kv_cache_manager.reset(pid)
 
-                _ = kv_cache_manager.generate(
-                    x_batch,
-                    1,
-                    proc_ids=proc_ids,
-                    pad_token_id=tokenizer.pad_token_id,
-                    is_prefill=True,
-                    input_lens=input_lens,
-                )
+                if any(continuation):
+                    # A continuation batch may contain fresh and existing
+                    # rows; forward_new_tokens routes them to the correct
+                    # primitive while preserving per-row lengths.
+                    with cache_lock:
+                        for pid, cont in zip(proc_ids, continuation):
+                            if cont:
+                                cache = kv_cache_manager._past_key_values[pid]
+                                kv_cache_manager._past_key_values[pid] = move_dynamic_cache_to(
+                                    cache, target_model.device
+                                )
+                    kv_cache_manager.forward_new_tokens(
+                        x_batch,
+                        proc_ids=proc_ids,
+                        pad_token_id=tokenizer.pad_token_id,
+                        input_lens=input_lens,
+                        reset_pids=[pid for pid, cont in zip(proc_ids, continuation) if not cont],
+                    )
+                else:
+                    kv_cache_manager.generate(
+                        x_batch,
+                        1,
+                        proc_ids=proc_ids,
+                        pad_token_id=tokenizer.pad_token_id,
+                        is_prefill=True,
+                        input_lens=input_lens,
+                    )
 
                 # prefill之后，将KV cache移到CPU节省显存
                 with cache_lock:
@@ -776,6 +817,7 @@ class Decoding(ABC):
             else:  # verify 批量
                 seqs = [req["draft_output"].to(target_model.device) for req in batch]
                 x_batch = []
+                verify_input_lens = []
                 for req, x in zip(batch, seqs):
                     # tail_only 模式下，edge 仅发送 [final_token + gamma_draft] 或 [gamma_draft]。
                     # 这里补一个虚拟前缀长度，让 kvcache 内部按 cached_len 正确截取 residual。
@@ -789,8 +831,28 @@ class Decoding(ABC):
                             device=x.device,
                         )
                         x_batch.append(torch.cat((pad, x), dim=1))
+                        verify_input_lens.append(cached_len + x.shape[1])
                     else:
                         x_batch.append(x)
+                        verify_input_lens.append(x.shape[1])
+                # The KV primitive accepts one dense tensor.  Padding is
+                # right-sided and excluded through ``verify_input_lens``;
+                # admission accounting still counts only real new tokens.
+                max_verify_T = max(x.shape[1] for x in x_batch)
+                padded_verify = []
+                for x in x_batch:
+                    pad_len = max_verify_T - x.shape[1]
+                    if pad_len:
+                        pad = torch.full(
+                            (1, pad_len),
+                            tokenizer.pad_token_id,
+                            dtype=x.dtype,
+                            device=x.device,
+                        )
+                        padded_verify.append(torch.cat((x, pad), dim=1))
+                    else:
+                        padded_verify.append(x)
+                x_batch = torch.cat(padded_verify, dim=0)
                 debug_enabled = getattr(self.args, "debug_verify_tokens", False)
                 debug_tail = 16
 
@@ -816,7 +878,14 @@ class Decoding(ABC):
                         kv_cache_manager._past_key_values[pid] = move_dynamic_cache_to(cache, target_model.device)
 
                 verify_compute_start = time.time()
-                _ = kv_cache_manager.generate(x_batch, 1, proc_ids=proc_ids, pad_token_id=tokenizer.pad_token_id, is_prefill=False)
+                _ = kv_cache_manager.generate(
+                    x_batch,
+                    1,
+                    proc_ids=proc_ids,
+                    pad_token_id=tokenizer.pad_token_id,
+                    is_prefill=False,
+                    input_lens=verify_input_lens,
+                )
                 verify_elapsed = time.time() - verify_compute_start
 
                 # verify之后，将KV cache移到CPU节省显存
@@ -836,7 +905,7 @@ class Decoding(ABC):
                 prefix_len = req["prefix_len"]
                 probs = probs_full[idx]  # (1, L, V)
                 x = req["draft_output"].to(target_model.device)
-                tail_only = req.get("tail_only", False)
+                tail_only = req.get("tail_only", False) or req.get("_chunked_internal", False)
                 has_bridge_token = req.get("has_bridge_token", False)
                 req_gamma = max(1, int(req.get("gamma", self.args.gamma) or self.args.gamma))
 
@@ -844,9 +913,8 @@ class Decoding(ABC):
                     # prefill 仅初始化 cache，回滚到 prefix 长度供下一轮 verify 使用
                     kv_cache_manager.rollback(pid, prefix_len)
                     committed_prefix_tokens[pid] = req["draft_output"][0, :prefix_len].tolist()
-                    response_queues[pid].put({
-                        "status": "prefill_ok",
-                    })
+                    if req.get("_prefill_final", True):
+                        deliver(pid, {"status": "prefill_ok"})
                     continue
 
                 # 验证 γ 个 token：target 贪心 token 与 draft token 不一致则在前一位置截断
@@ -873,7 +941,13 @@ class Decoding(ABC):
                         j = x[:, tail_offset + i]
                     else:
                         j = x[:, prefix_len + i]
-                    target_logits = probs[:, prefix_len + i - 1, :self.vocab_size]
+                    # With a bridge token the first draft token is predicted
+                    # after that bridge, so its target position is shifted by
+                    # one physical token.  ``accepted`` remains an absolute
+                    # logical prefix length and therefore does not include
+                    # the bridge itself.
+                    target_pos = prefix_len + i - 1 + (1 if has_bridge_token else 0)
+                    target_logits = probs[:, target_pos, :self.vocab_size]
                     greedy_token = torch.argmax(target_logits, dim=-1)  # (1,)
                     draft_token_id = int(j.item())
                     target_token_id = int(greedy_token.item())
@@ -896,7 +970,8 @@ class Decoding(ABC):
                 accepted_cnt = accepted_len - prefix_len
                 if accepted_cnt < req_gamma:
                     # 存在拒绝：在位置 n 上使用 target 贪心 token 作为 new_token
-                    target_logits_next = probs[:, n, :self.vocab_size]
+                    correction_pos = n + (1 if has_bridge_token else 0)
+                    target_logits_next = probs[:, correction_pos, :self.vocab_size]
                     new_token = torch.argmax(target_logits_next, dim=-1).unsqueeze(-1)
                 else:
                     # 所有 draft token 被接受：在最后一步位置上使用 target 贪心 token
@@ -971,7 +1046,9 @@ class Decoding(ABC):
                             3,
                         )
 
-                response_queues[pid].put(response_payload)
+                deliver(pid, response_payload)
+
+            return collected_responses if return_responses else None
 
         def sort_task_queues():
             now = time.time()
@@ -981,7 +1058,11 @@ class Decoding(ABC):
                     while not task_queues[ttype][cat].empty():
                         items.append(task_queues[ttype][cat].get())
                     items.sort(
-                        key=lambda r: _compute_priority_score(r, accept_stats, now=now),
+                        key=lambda item: _compute_priority_score(
+                            item.request if isinstance(item, WorkItem) else item,
+                            accept_stats,
+                            now=now,
+                        ),
                         reverse=True,
                     )
                     for item in items:
@@ -998,86 +1079,209 @@ class Decoding(ABC):
                     kv_cache_manager._past_key_values[pid] = move_dynamic_cache_to(cache, target_model.device)
                     preloaded_gpu_pids.add(pid)
 
-        def schedule_tasks(task_type: str):
-            token_budget = self.args.token_budget
-            batch_size = self.args.batch_size
-            order = _build_fixed_wrr_order()
-            verify_underutilized = []
+        scheduler_state = {"wrr_cursor": 0, "current_cycle": 0}
+        scheduler_metrics = {
+            "iterations": 0,
+            "used_tokens": 0,
+            "plans": 0,
+            "verify_slices": 0,
+            "prefill_slices": 0,
+            "partial_verify": 0,
+            "partial_prefill": 0,
+            "prefetch_plans": 0,
+            "prefetch_hits": 0,
+            "prefetch_misses": 0,
+            "prefetch_evictions": 0,
+        }
 
-            self.color_print(f"[FASTSD] task_type={task_type} order={order}", 3)
+        def _plan_queues():
+            return {
+                task_type: {
+                    cat: list(task_queues[task_type][cat].queue)
+                    for cat in ("short", "mid", "long")
+                }
+                for task_type in ("verify", "prefill")
+            }
 
-            for idx, cat in enumerate(order):
-                batch = []
-                total_tokens = 0
-                max_len_in_batch = 0
+        def prefetch_next_plan():
+            """Use the same pure planner for the next cache residency hint."""
+            next_plan = plan_iteration(
+                _plan_queues(),
+                token_budget=int(self.args.token_budget),
+                current_cycle=scheduler_state["current_cycle"],
+                wrr_cursor=scheduler_state["wrr_cursor"],
+                max_num_seqs=int(self.args.batch_size),
+                min_prefill_chunk_tokens=int(self.args.min_prefill_chunk_tokens),
+                prefill_chunk_quantum=int(self.args.prefill_chunk_quantum),
+                accept_stats=accept_stats,
+                now=time.monotonic(),
+            )
+            desired = set(next_plan.verify_proc_ids)
+            current = set(preloaded_gpu_pids)
+            stale = current - desired
+            with cache_lock:
+                for pid in stale:
+                    cache = kv_cache_manager._past_key_values.get(pid)
+                    if cache is not None:
+                        kv_cache_manager._past_key_values[pid] = move_dynamic_cache_to(cache, "cpu")
+                    preloaded_gpu_pids.discard(pid)
+            scheduler_metrics["prefetch_evictions"] += len(stale)
+            scheduler_metrics["prefetch_hits"] += len(current & desired)
+            scheduler_metrics["prefetch_misses"] += len(desired - current)
+            preload_kvcache(desired - current)
+            scheduler_metrics["prefetch_plans"] += 1
 
-                while not task_queues[task_type][cat].empty():
-                    item = task_queues[task_type][cat].queue[0]
-                    seq_len = item["draft_output"].shape[1]
+        def _slice_request(item: WorkItem, sl):
+            req = dict(item.request)
+            source = req["draft_output"]
+            if item.task_type == "prefill":
+                end = sl.offset + sl.draft_token_count
+                req["draft_output"] = source[:, :end]
+                req["prefix_len"] = end
+                req["_prefill_continuation"] = sl.offset > 0
+                req["_prefill_final"] = end >= item.total_tokens
+                return req
 
-                    if task_type == "prefill":
-                        if total_tokens + seq_len <= token_budget:
-                            task_queues[task_type][cat].get()
-                            batch.append(item)
-                            total_tokens += seq_len
-                            max_len_in_batch = max(max_len_in_batch, seq_len)
-                        elif not batch:
-                            task_queues[task_type][cat].get()
-                            batch.append(item)
-                            total_tokens += seq_len
-                            max_len_in_batch = max(max_len_in_batch, seq_len)
-                        else:
-                            break
-                    else:
-                        if len(batch) < batch_size:
-                            task_queues[task_type][cat].get()
-                            batch.append(item)
-                        else:
-                            break
+            req_gamma = sl.draft_token_count
+            base_prefix = item.base_prefix_len + item.accepted_so_far
+            tail_only = bool(req.get("tail_only", False))
+            bridge_token = getattr(item, "internal_bridge_token", None)
+            # Internally every chunk is represented as a tail-only residual:
+            # this gives the executor one unambiguous bridge-token convention
+            # even when the external request used full-prefix mode.
+            original_bridge = bool(req.get("has_bridge_token", False))
+            draft_start = 1 if original_bridge else 0
+            draft_base = draft_start if original_bridge else item.base_prefix_len
+            draft_tokens = source[:, draft_base + sl.offset:draft_base + sl.offset + req_gamma]
+            if bridge_token is None and original_bridge and sl.offset == 0:
+                # The first internal slice must carry the bridge supplied by
+                # Edge.  Subsequent slices use the correction token returned
+                # by the preceding target forward.
+                bridge_token = int(source[0, 0].item())
+            if bridge_token is not None:
+                bridge = torch.tensor([[int(bridge_token)]], dtype=source.dtype, device=source.device)
+                req["draft_output"] = torch.cat((bridge, draft_tokens), dim=1)
+                req["has_bridge_token"] = True
+            else:
+                req["draft_output"] = draft_tokens
+                req["has_bridge_token"] = False
+            req["prefix_len"] = base_prefix
+            req["gamma"] = req_gamma
+            req["tail_only"] = True
+            req["_chunked_internal"] = True
+            return req
 
-                if batch and task_type == "prefill" and total_tokens < token_budget:
-                    for alt_cat in ("short", "mid", "long"):
-                        if alt_cat == cat:
-                            continue
-                        while not task_queues[task_type][alt_cat].empty():
-                            item = task_queues[task_type][alt_cat].queue[0]
-                            seq_len = item["draft_output"].shape[1]
-                            if seq_len <= max_len_in_batch + 128 and total_tokens + seq_len <= token_budget:
-                                task_queues[task_type][alt_cat].get()
-                                batch.append(item)
-                                total_tokens += seq_len
-                            else:
-                                break
+        def schedule_iteration():
+            queues_for_plan = _plan_queues()
+            plan = plan_iteration(
+                queues_for_plan,
+                token_budget=int(self.args.token_budget),
+                current_cycle=scheduler_state["current_cycle"],
+                wrr_cursor=scheduler_state["wrr_cursor"],
+                max_num_seqs=int(self.args.batch_size),
+                min_prefill_chunk_tokens=int(self.args.min_prefill_chunk_tokens),
+                prefill_chunk_quantum=int(self.args.prefill_chunk_quantum),
+                accept_stats=accept_stats,
+                now=time.monotonic(),
+            )
+            if not plan.selected_work_ids:
+                return plan
+            reserve_admission_plan(plan)
+            item_by_id = {item.work_id: item for item in plan._selected_items}
+            verify_batch = [_slice_request(item_by_id[sl.work_id], sl) for sl in plan.verify_slices]
+            prefill_batch = [_slice_request(item_by_id[sl.work_id], sl) for sl in plan.prefill_slices]
+            completed = set()
+            progress = {}
 
-                if task_type == "verify":
-                    verify_underutilized.append(1 if len(batch) < batch_size else 0)
-
+            def run_batch(batch, is_verify):
                 if not batch:
-                    continue
-
-                next_verify_proc_ids = _predict_next_verify_proc_ids(
-                    {cat_name: list(q_obj.queue) for cat_name, q_obj in task_queues["verify"].items()},
-                    order,
-                    batch_size=self.args.batch_size,
-                    start_idx=(idx + 1) if task_type == "verify" else 0,
-                    pinned_gpu_pids=preloaded_gpu_pids,
-                )
-                preload_thread = None
-                if next_verify_proc_ids:
-                    preload_thread = threading.Thread(target=preload_kvcache, args=(next_verify_proc_ids,))
-                    preload_thread.start()
-
+                    return {}
                 if energy_service is not None:
                     energy_service.enter_active()
                 try:
-                    handle_request_batch(batch)
+                    return handle_request_batch(batch, return_responses=True)
                 finally:
                     if energy_service is not None:
                         energy_service.exit_active()
-                if preload_thread is not None:
-                    preload_thread.join()
 
-            return verify_underutilized
+            try:
+                # Verify always runs before Prefill, even when one plan admits
+                # both types.  Each WorkItem appears at most once per plan.
+                verify_responses = run_batch(verify_batch, True)
+                for sl, sliced_req in zip(plan.verify_slices, verify_batch):
+                    item = item_by_id[sl.work_id]
+                    response = verify_responses.get(item.proc_id)
+                    if response is None:
+                        raise RuntimeError(f"missing verify response for {item.work_id}")
+                    physical_prefix = int(sliced_req["prefix_len"])
+                    accepted = int(response["accepted"])
+                    accepted_chunk = max(0, accepted - physical_prefix)
+                    current_prefix = item.base_prefix_len + item.accepted_so_far
+                    item.cursor += accepted_chunk
+                    item.accepted_so_far += accepted_chunk
+                    progress[item.work_id] = accepted_chunk
+                    if accepted_chunk < sl.draft_token_count:
+                        item.finished = True
+                        completed.add(item.work_id)
+                        response = dict(response)
+                        response["accepted"] = item.base_prefix_len + item.accepted_so_far
+                        response_queues[item.response_key or item.proc_id].put(response)
+                    elif item.cursor >= item.total_tokens:
+                        item.finished = True
+                        completed.add(item.work_id)
+                        response = dict(response)
+                        response["accepted"] = item.base_prefix_len + item.accepted_so_far
+                        response_queues[item.response_key or item.proc_id].put(response)
+                    else:
+                        # An all-accepted internal chunk is still one logical
+                        # speculative round.  Do not insert the target's
+                        # provisional next token between d_k and d_{k+1};
+                        # the correction/final token is used only when the
+                        # complete round finishes or a mismatch occurs.
+                        item.internal_bridge_token = None
+                        item.bridge_pending = 0
+                        if item.proc_id in committed_prefix_tokens:
+                            committed_prefix_tokens[item.proc_id] = committed_prefix_tokens[item.proc_id][:current_prefix + accepted_chunk]
+                        scheduler_metrics["partial_verify"] += 1
+
+                prefill_responses = run_batch(prefill_batch, False)
+                for sl in plan.prefill_slices:
+                    item = item_by_id[sl.work_id]
+                    item.cursor = sl.offset + sl.draft_token_count
+                    if item.cursor >= item.total_tokens:
+                        item.finished = True
+                        completed.add(item.work_id)
+                        response = prefill_responses.get(item.proc_id)
+                        if response is None:
+                            raise RuntimeError(f"missing prefill response for {item.work_id}")
+                        response_queues[item.response_key or item.proc_id].put(response)
+                    else:
+                        scheduler_metrics["partial_prefill"] += 1
+
+                for sl in plan.prefill_slices:
+                    progress[sl.work_id] = sl.draft_token_count
+                commit_admission_plan(plan, completed_work_ids=completed, progress=progress)
+                cycle_delta = plan.next_cycle - scheduler_state["current_cycle"]
+                if cycle_delta > 0:
+                    selected_ids = set(plan.selected_work_ids)
+                    for queued_item in work_items.values():
+                        if (
+                            queued_item.task_type == "prefill"
+                            and queued_item.work_id not in selected_ids
+                            and not queued_item.finished
+                        ):
+                            queued_item.missed_cycles += cycle_delta
+                scheduler_state["wrr_cursor"] = plan.next_wrr_cursor
+                scheduler_state["current_cycle"] = plan.next_cycle
+                scheduler_metrics["plans"] += 1
+                scheduler_metrics["used_tokens"] += plan.used_tokens
+                scheduler_metrics["verify_slices"] += len(plan.verify_slices)
+                scheduler_metrics["prefill_slices"] += len(plan.prefill_slices)
+                prefetch_next_plan()
+            except Exception:
+                abort_admission_plan(plan)
+                raise
+            return plan
 
         # ---------------------- 主循环 -------------------------------
         sched_mode = getattr(self.args, "server_sched_mode", "fastsd")
@@ -1104,24 +1308,31 @@ class Decoding(ABC):
                 return
 
             while True:
-                # ============ 1) 不断拉取 Draft 请求 ==============
+                # ============ 1) bounded ingress into persistent WorkItems ==============
+                drained = 0
                 try:
-                    while True:
+                    while drained < max(1, int(self.args.batch_size) * 10):
                         req = request_queue.get(timeout=0.01)
                         if req is None:  # 终止信号
                             return
                         recent_prefix_lens.append(int(req["prefix_len"]))
                         len_r1, len_r2 = _update_length_thresholds(recent_prefix_lens)
                         cat = _length_category(req["prefix_len"], len_r1, len_r2)
-                        task_queues[req["task_type"]][cat].put(req)
+                        work_id = str(req.get("work_id", f"{req['proc_id']}:{time.monotonic_ns()}"))
+                        req["work_id"] = work_id
+                        req["response_key"] = req.get("response_key", req["proc_id"])
+                        req["server_enqueue_monotonic"] = time.monotonic()
+                        req["current_time"] = req["server_enqueue_monotonic"]
+                        item = WorkItem.from_request(req, category=cat, cycle=scheduler_state["current_cycle"], work_id=work_id)
+                        work_items[work_id] = item
+                        task_queues[req["task_type"]][cat].put(item)
+                        drained += 1
                 except queue.Empty:
                     pass
 
-                # fastsd path: keep all cloud-side scheduling optimizations.
+                # FastSD only: construct one unified plan, then execute Verify
+                # and Prefill batches in the fixed order.
                 sort_task_queues()
-
-                has_verify = any(not q.empty() for q in task_queues["verify"].values())
-                has_prefill = any(not q.empty() for q in task_queues["prefill"].values())
 
                 if getattr(self.args, "debug_pipeline", False):
                     self.color_print(
@@ -1129,17 +1340,28 @@ class Decoding(ABC):
                         3,
                     )
 
-                if has_verify:
-                    verify_underutilized = schedule_tasks("verify")
-                    if _should_switch_to_prefill(verify_underutilized, has_prefill_tasks=has_prefill):
-                        schedule_tasks("prefill")
-                elif has_prefill:
-                    schedule_tasks("prefill")
+                if any(not q.empty() for t in task_queues.values() for q in t.values()):
+                    scheduler_metrics["iterations"] += 1
+                    schedule_iteration()
                 else:
                     time.sleep(0.01)
         finally:
             if energy_service is not None:
                 energy_service.shutdown()
+
+            # Preserve scheduler evidence for the experiment report.  GPU
+            # runs may terminate through the worker's normal shutdown path,
+            # so best-effort persistence belongs in ``finally``.
+            self.last_generation_metrics["fastsd_scheduler"] = dict(scheduler_metrics)
+            metrics_dir = getattr(self.args, "exp_name", None)
+            if metrics_dir:
+                try:
+                    os.makedirs(metrics_dir, exist_ok=True)
+                    metrics_path = os.path.join(metrics_dir, "scheduler_metrics.json")
+                    with open(metrics_path, "w", encoding="utf-8") as metrics_file:
+                        json.dump(self.last_generation_metrics, metrics_file, indent=2, default=str)
+                except Exception as exc:  # pragma: no cover - diagnostics only
+                    self.color_print(f"[FASTSD] failed to persist scheduler metrics: {exc}", 2)
 
             # if (time.time() - last_prefill) < 10 and any(not q.empty() for q in task_queues["verify"].values()):
             #     schedule_tasks("verify")

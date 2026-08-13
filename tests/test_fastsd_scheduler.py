@@ -2,9 +2,14 @@ import math
 import unittest
 
 from src.fastsd_scheduler import (
+    AdmissionPlan,
+    WorkItem,
     build_fixed_wrr_order,
+    commit_admission_plan,
     compute_priority_score,
+    plan_iteration,
     predict_next_verify_proc_ids,
+    reserve_admission_plan,
     should_switch_to_prefill,
     update_length_thresholds,
 )
@@ -104,6 +109,105 @@ class FastSDSchedulerTests(unittest.TestCase):
         )
 
         self.assertEqual(predicted, ["m1", "l1"])
+
+    @staticmethod
+    def _item(work_id, task_type, category, total, *, bridge=0, cycle=0, missed=0):
+        return WorkItem(
+            work_id=work_id,
+            proc_id=work_id,
+            task_type=task_type,
+            category=category,
+            request={
+                "proc_id": work_id,
+                "task_type": task_type,
+                "current_time": 0.0,
+                "gamma": total,
+            },
+            total_tokens=total,
+            bridge_pending=bridge,
+            enqueue_cycle=cycle,
+            missed_cycles=missed,
+        )
+
+    def test_plan_uses_one_budget_for_verify_and_prefill_and_slices(self):
+        queues = {
+            "verify": {"short": [self._item("v1", "verify", "short", 8)], "mid": [], "long": []},
+            "prefill": {"short": [self._item("p1", "prefill", "short", 100)], "mid": [], "long": []},
+        }
+        plan = plan_iteration(queues, token_budget=16, max_num_seqs=2, min_prefill_chunk_tokens=8, prefill_chunk_quantum=8)
+        self.assertLessEqual(plan.used_tokens, 16)
+        self.assertEqual(plan.verify_slices[0].forward_token_count, 8)
+        self.assertEqual(plan.prefill_slices[0].draft_token_count, 8)
+        self.assertEqual(plan.selected_work_ids, ["v1", "p1"])
+        self.assertEqual(queues["prefill"]["short"][0].cursor, 0)
+
+    def test_bridge_cost_counts_against_budget(self):
+        item = self._item("v1", "verify", "short", 4, bridge=1)
+        plan = plan_iteration(
+            {"verify": {"short": [item], "mid": [], "long": []}, "prefill": {"short": [], "mid": [], "long": []}},
+            token_budget=4,
+            max_num_seqs=1,
+            min_prefill_chunk_tokens=4,
+        )
+        self.assertEqual(plan.used_tokens, 4)
+        self.assertEqual(plan.verify_slices[0].draft_token_count, 3)
+        self.assertEqual(plan.verify_slices[0].forward_token_count, 4)
+        self.assertTrue(plan.verify_slices[0].includes_bridge)
+
+    def test_initial_external_bridge_is_admission_cost(self):
+        request = {
+            "proc_id": "v1",
+            "task_type": "verify",
+            "gamma": 3,
+            "has_bridge_token": True,
+            "prefix_len": 8,
+            "draft_output": [[101, 11, 12, 13]],
+        }
+        item = WorkItem.from_request(request, category="short")
+        plan = plan_iteration(
+            {"verify": {"short": [item], "mid": [], "long": []}, "prefill": {"short": [], "mid": [], "long": []}},
+            token_budget=4,
+            max_num_seqs=1,
+            min_prefill_chunk_tokens=4,
+        )
+        self.assertEqual(plan.used_tokens, 4)
+        self.assertEqual(plan.verify_slices[0].draft_token_count, 3)
+        self.assertTrue(plan.verify_slices[0].includes_bridge)
+
+    def test_verify_is_chunked_when_remaining_budget_is_smaller_than_gamma(self):
+        item = self._item("v1", "verify", "short", 8)
+        plan = plan_iteration(
+            {"verify": {"short": [item], "mid": [], "long": []}, "prefill": {"short": [], "mid": [], "long": []}},
+            token_budget=3,
+            max_num_seqs=1,
+            min_prefill_chunk_tokens=3,
+        )
+        self.assertEqual(plan.used_tokens, 3)
+        self.assertEqual(plan.verify_slices[0].draft_token_count, 3)
+
+    def test_dry_run_and_reservation_commit_lifecycle(self):
+        item = self._item("p1", "prefill", "short", 20)
+        queues = {"prefill": {"short": [item], "mid": [], "long": []}, "verify": {"short": [], "mid": [], "long": []}}
+        before = (item.cursor, item.state)
+        plan = plan_iteration(queues, token_budget=8, max_num_seqs=1, min_prefill_chunk_tokens=8, prefill_chunk_quantum=8)
+        self.assertEqual((item.cursor, item.state), before)
+        reserve_admission_plan(plan)
+        self.assertEqual(item.state, "reserved")
+        commit_admission_plan(plan)
+        self.assertEqual(item.cursor, 8)
+        self.assertEqual(item.state, "ready")
+
+    def test_overdue_prefill_overrides_verify_within_category(self):
+        verify = self._item("v1", "verify", "short", 4)
+        prefill = self._item("p1", "prefill", "short", 20, missed=2)
+        plan = plan_iteration(
+            {"verify": {"short": [verify], "mid": [], "long": []}, "prefill": {"short": [prefill], "mid": [], "long": []}},
+            token_budget=8,
+            max_num_seqs=1,
+            min_prefill_chunk_tokens=8,
+            prefill_chunk_quantum=8,
+        )
+        self.assertEqual(plan.prefill_slices[0].work_id, "p1")
 
 
 if __name__ == "__main__":

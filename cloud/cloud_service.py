@@ -1,13 +1,14 @@
 import asyncio
 import multiprocessing as mp
 import os
+import queue as py_queue
 import sys
 import threading
 import uuid
 from typing import Dict, Optional
 
 import torch
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
@@ -27,6 +28,8 @@ worker_proc: Optional[mp.Process] = None
 
 # FastAPI 请求等待表
 _pending: Dict[str, asyncio.Future] = {}
+_pending_sessions: Dict[str, str] = {}
+_pending_meta: Dict[str, str] = {}
 _pending_lock = threading.Lock()
 _cloud_time_lock = threading.Lock()
 _cloud_total_ms_sum: float = 0.0
@@ -136,11 +139,32 @@ def _start_result_dispatcher(loop: asyncio.AbstractEventLoop) -> None:
             if response_queue is None:
                 time.sleep(0.01)
                 continue
-            msg = response_queue.get()
+            try:
+                msg = response_queue.get(timeout=0.5)
+            except py_queue.Empty:
+                # A dead worker must not leave HTTP callers awaiting a
+                # Future forever.  The next request will receive a 503 from
+                # ``_enqueue_and_wait`` as well.
+                if worker_proc is not None and not worker_proc.is_alive():
+                    with _pending_lock:
+                        pending = list(_pending.values())
+                        _pending.clear()
+                        _pending_meta.clear()
+                        _pending_sessions.clear()
+                    for fut in pending:
+                        if not fut.done():
+                            loop.call_soon_threadsafe(
+                                fut.set_exception,
+                                RuntimeError("target worker exited before returning a response"),
+                            )
+                continue
             req_id = msg.get("request_id")
             payload = msg.get("payload", {})
             with _pending_lock:
                 fut = _pending.pop(req_id, None)
+                session_id = _pending_meta.pop(req_id, None)
+                if session_id is not None and _pending_sessions.get(session_id) == req_id:
+                    _pending_sessions.pop(session_id, None)
             if fut is not None and not fut.done():
                 loop.call_soon_threadsafe(fut.set_result, payload)
 
@@ -160,8 +184,17 @@ def startup_event() -> None:
 
 @app.get("/health")
 def health() -> dict:
-    status = "ok" if request_queue is not None else "not_initialized"
-    return {"status": status}
+    if request_queue is None:
+        status = "not_initialized"
+    elif worker_proc is None or not worker_proc.is_alive():
+        status = "failed"
+    else:
+        status = "ok"
+    return {
+        "status": status,
+        "worker_alive": bool(worker_proc is not None and worker_proc.is_alive()),
+        "model_ready": bool(worker_proc is not None and worker_proc.is_alive()),
+    }
 
 
 @app.post("/session/init")
@@ -176,15 +209,37 @@ def session_init() -> dict:
 async def _enqueue_and_wait(request_dict: dict, req_id: str) -> dict:
     if request_queue is None:
         return {"error": "queues_not_initialized"}
+    if worker_proc is not None and not worker_proc.is_alive():
+        raise HTTPException(status_code=503, detail="target worker is not alive")
 
     loop = asyncio.get_running_loop()
     fut = loop.create_future()
+    response_key = uuid.uuid4().hex
     with _pending_lock:
-        _pending[req_id] = fut
-
-    request_queue.put(request_dict)
-    result = await fut
-    return result
+        if req_id in _pending_sessions:
+            raise HTTPException(status_code=409, detail="session already has an in-flight request")
+        _pending[response_key] = fut
+        _pending_sessions[req_id] = response_key
+        _pending_meta[response_key] = req_id
+    request_dict["response_key"] = response_key
+    request_dict["proc_id"] = req_id
+    try:
+        request_queue.put(request_dict)
+        return await fut
+    except asyncio.CancelledError:
+        with _pending_lock:
+            _pending.pop(response_key, None)
+            _pending_meta.pop(response_key, None)
+            if _pending_sessions.get(req_id) == response_key:
+                _pending_sessions.pop(req_id, None)
+        raise
+    except BaseException:
+        with _pending_lock:
+            _pending.pop(response_key, None)
+            _pending_meta.pop(response_key, None)
+            if _pending_sessions.get(req_id) == response_key:
+                _pending_sessions.pop(req_id, None)
+        raise
 
 
 @app.post("/prefill")
