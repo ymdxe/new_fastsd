@@ -329,8 +329,9 @@ def main() -> None:
 
     worker_proc = _start_worker(args, request_queue, response_queue)
 
+    host = os.environ.get("CLOUD_SERVICE_HOST", "0.0.0.0")
     port = int(os.environ.get("CLOUD_SERVICE_PORT", "8001"))
-    uvicorn.run(app, host="0.0.0.0", port=port, workers=1)
+    uvicorn.run(app, host=host, port=port, workers=1)
 
 
 if __name__ == "__main__":
