@@ -451,7 +451,118 @@ node2: exp/comparison/qwen3_8b_0.6b_mt_bench_2gpu_seed42/fastsd_03bd03d_cloud/
 node2: /tmp/new_fastsd_mtbench_2gpu_03bd03d_cloud.log
 ```
 
-## 8. 结果目录约定
+## 8. 普通投机解码与 Draft-only 对照（2026-08-13）
+
+### 8.1 公平性约束与有效版本
+
+两个新对照继续使用第 7 节完全相同的 canonical manifest：
+
+```text
+dataset       = MT-Bench 80 条第一轮问题
+workload_hash = f100fe17c5b30626e80da573c307f0340d5005eb12c5fbd00d15f921f6a04455
+max_new_tokens = 256
+temperature = 0, top_k = 0, top_p = 1, seed = 42
+```
+
+普通投机解码使用 node1 GPU0/1 上两个 Qwen3-0.6B Draft worker，以及 node2 GPU0
+上的 Qwen3-8B Target；`profile=vanilla`、`server_sched_mode=vanilla`、pipeline 和
+proactive draft 均关闭，`gamma=4`。最终有效实现提交为 `23db00d95dfb`。
+
+Draft-only 只使用 node1 GPU0/1，每卡一个 Qwen3-0.6B 自回归 worker；它不访问 node2，
+也不执行 Target verify。最终有效实现提交为 `c234a605ac26`。两个入口均使用 Qwen3 chat
+template、`add_generation_prompt=True` 和 `enable_thinking=False`。
+
+### 8.2 对照运行暴露并修复的问题
+
+1. Draft-only 原入口直接编码 MT-Bench 裸问题，与 FastSD 的 Qwen3 chat template 不一致；
+   提交 `98117e1` 统一了 prompt 格式。
+2. tensor-free Cloud IPC 已在 FastSD ingress 恢复 tensor，但 strict-FCFS vanilla 分支在恢复
+   之前直接调用 `.to()`，首个 `/prefill` 因 list 无 `.to()` 崩溃。提交 `23db00d` 将
+   tensorize 提升为两个调度分支共享的 ingress 步骤。
+3. Draft-only immediate 模式曾把 closed-loop worker 本地排队时间记入 `arrival_lag`，而 Edge
+   immediate 模式固定为 0，导致不可比的 scheduled TTFT。提交 `c234a60` 对齐了辅助指标。
+4. wrapper 初次由系统 Python 启动，缺少 `auto_gptq`；正式运行显式使用
+   `/home/hdd/zhangh/envs/new_fastsd/bin/python`。所有失败日志均保留，未计入结果。
+
+最终本地回归为 51 项：50 通过，1 个真实 Torch KV 测试因 Windows 本地无 Torch 跳过。
+
+### 8.3 三方法公共指标
+
+| 方法 | 请求 | 生成 tokens | wallclock (s) | throughput (tok/s) | TTFT avg / P95 / P99 (ms) | TPOT avg / P95 / P99 (ms) | E2E avg / P95 / P99 (ms) | acceptance | accepted / verify |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| FastSD | 80 | 16,643 | 1143.409 | 14.5556 | 940.92 / 1273.78 / 1464.31 | 128.82 / 183.56 / 209.14 | 28058.61 / 45877.29 / 47555.05 | 0.48848 | 2.13555 |
+| standard_sd | 80 | 16,699 | 1532.675 | 10.8953 | 1255.34 / 1983.03 / 2125.40 | 176.47 / 288.79 / 308.96 | 37855.40 / 58732.78 / 66527.31 | 0.49503 | 2.17240 |
+| draft_only | 80 | 14,410 | 162.370 | 88.7480 | 39.40 / 32.76 / 598.65 | 21.84 / 25.01 / 27.56 | 3976.98 / 6365.65 / 7052.08 | N/A | N/A |
+
+Draft-only 的平均 TTFT 高于 P95，是因为两个 worker 各自首次模型执行形成少数约 0.6 秒
+冷启动离群点；P50/P90/P95 分别为 24.25/26.74/32.76 ms。所有方法都报告真实整段
+wallclock throughput，不使用各 worker active-window 吞吐替代。
+
+相对 standard_sd，FastSD 的系统吞吐提高 33.59%，wallclock 降低 25.40%，TTFT 平均值
+降低 25.05%、P95 降低 35.77%，TPOT 平均值降低 27.00%、P95 降低 36.44%，请求 E2E
+平均值降低 25.88%。这组结果只说明当前两 closed-loop session、两 A5000 Draft 的系统性能；
+`token_budget=512` 仍然严重过配，不能据此外推高并发收益。
+
+Draft-only 的速度不能解释为与 8B Target 方法同质量：它生成的是 0.6B 模型输出，生成 token
+总数和停止位置也不同。本轮未运行统一 MT-Bench LLM judge，因此不报告质量胜率。
+
+### 8.4 完整性与正确性边界
+
+- standard_sd：80/80 非空，两个 worker 各 40 条，47 条达到 256-token 上限，Edge/Cloud
+  错误为 0；
+- draft_only：80/80 非空，两个 worker 各 40 条，35 条达到 256-token 上限，worker 错误为 0；
+- 两者 workload hash 均与 FastSD 完全一致；
+- 运行结束后 node1 GPU0/1 和 node2 GPU0 均回到约 15 MiB，8001 服务和两段 SSH 隧道已释放。
+
+必须保留一个尚未关闭的正确性风险：逐样本比较 FastSD 与 standard_sd，只有 26/80 输出文本
+逐字一致，60/80 的生成 token 数相同。动态 batch 与单请求 GEMM 可能因 BF16 数值路径不同在
+接近的 logits 上选择不同 token，但现有证据也不能排除 FastSD KV/bridge 状态语义仍有问题。
+所以当前数据可作为性能和稳定性结果，不能作为 target-output parity 已通过的证据。正式论文实验
+前必须补同一 Target 的 monolithic greedy oracle，并比较 token-level 首个分叉位置和最终 KV/logits。
+
+### 8.5 MT-Bench 分类别指标
+
+standard_sd：
+
+| 类别 | 请求 | 平均 tokens | TTFT avg (ms) | TPOT avg (ms) | E2E avg (ms) | acceptance |
+|---|---:|---:|---:|---:|---:|---:|
+| coding | 10 | 254.9 | 1226.88 | 157.10 | 41061.59 | 0.6300 |
+| extraction | 10 | 80.3 | 1471.04 | 152.16 | 13488.12 | 0.7400 |
+| humanities | 10 | 256.0 | 1107.24 | 167.16 | 43732.77 | 0.4200 |
+| math | 10 | 225.1 | 1026.52 | 116.18 | 26518.18 | 0.7900 |
+| reasoning | 10 | 194.6 | 1254.72 | 173.26 | 34767.96 | 0.5200 |
+| roleplay | 10 | 208.9 | 1439.70 | 259.78 | 53862.75 | 0.3200 |
+| stem | 10 | 255.1 | 1163.74 | 176.96 | 46106.57 | 0.5000 |
+| writing | 10 | 195.0 | 1352.89 | 209.14 | 43305.31 | 0.3700 |
+
+draft_only：
+
+| 类别 | 请求 | 平均 tokens | TTFT avg (ms) | TPOT avg (ms) | E2E avg (ms) |
+|---|---:|---:|---:|---:|---:|
+| coding | 10 | 251.5 | 23.83 | 21.44 | 5396.38 |
+| extraction | 10 | 79.2 | 25.38 | 21.55 | 1709.35 |
+| humanities | 10 | 244.0 | 23.86 | 21.40 | 5222.84 |
+| math | 10 | 216.3 | 25.72 | 22.95 | 5016.21 |
+| reasoning | 10 | 109.4 | 24.18 | 21.30 | 2337.78 |
+| roleplay | 10 | 146.5 | 24.55 | 21.38 | 3136.74 |
+| stem | 10 | 246.2 | 25.52 | 22.90 | 5639.38 |
+| writing | 10 | 147.9 | 142.13 | 21.83 | 3357.13 |
+
+### 8.6 证据路径
+
+```text
+exp/comparison/qwen3_8b_0.6b_mt_bench_2gpu_seed42/standard_sd_23db00d/
+exp/comparison/qwen3_8b_0.6b_mt_bench_2gpu_seed42/standard_sd_23db00d_cloud/
+exp/comparison/qwen3_8b_0.6b_mt_bench_2gpu_seed42/draft_only/
+exp/comparison/qwen3_8b_0.6b_mt_bench_2gpu_seed42/normalized/standard_sd/
+exp/comparison/qwen3_8b_0.6b_mt_bench_2gpu_seed42/normalized/draft_only/
+exp/comparison/qwen3_8b_0.6b_mt_bench_2gpu_seed42/normalized/comparison_fastsd_standard_draft.csv
+```
+
+本节没有包含 SpecEdge 数值；SpecEdge 必须在同一 manifest、同一两 A5000 Draft 和一 A6000
+Target 拓扑上独立跑完后再加入四方法表。
+
+## 9. 结果目录约定
 
 正式结果统一放在：
 
