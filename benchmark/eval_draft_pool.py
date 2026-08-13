@@ -128,6 +128,7 @@ def _worker(
     start_epoch,
     workload_hash: str,
     num_workers: int,
+    arrival_distribution: str,
 ) -> None:
     model = _load_model(model_path, device)
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -139,10 +140,15 @@ def _worker(
     with Path(output_path).open("w", encoding="utf-8") as output:
         for record in records[worker_idx::num_workers]:
             scheduled = float(record.get("scheduled_arrival_s", 0.0))
-            remaining = float(start_epoch.value) + scheduled - time.time()
-            if remaining > 0:
-                time.sleep(remaining)
-            actual_arrival = max(0.0, time.time() - float(start_epoch.value))
+            if arrival_distribution == "poisson":
+                remaining = float(start_epoch.value) + scheduled - time.time()
+                if remaining > 0:
+                    time.sleep(remaining)
+                actual_arrival = max(0.0, time.time() - float(start_epoch.value))
+            else:
+                # Match Edge's closed-loop immediate-workload convention:
+                # worker-local queueing is not reported as arrival lag.
+                actual_arrival = 0.0
             request_start = time.perf_counter()
             input_ids = _encode_prompt(tokenizer, record["prompt"], record["dataset"])
             seed_everything(int(generation["seed"]) + int(record["global_index"]))
@@ -214,6 +220,7 @@ def run(config_path: str) -> int:
                 start_epoch,
                 manifest["workload_hash"],
                 len(devices),
+                config["dataset"].get("arrival_distribution", "immediate"),
             ),
         )
         process.start()

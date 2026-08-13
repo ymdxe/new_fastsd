@@ -92,6 +92,8 @@ class DraftOnlyPromptTests(unittest.TestCase):
         )
         self.assertIn("tokenizer.apply_chat_template", source)
         self.assertIn("enable_thinking=False", source)
+        self.assertIn('arrival_distribution == "poisson"', source)
+        self.assertIn("actual_arrival = 0.0", source)
 
 
 class SpecEdgeAdapterTests(unittest.TestCase):
