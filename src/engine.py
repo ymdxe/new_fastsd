@@ -1114,7 +1114,7 @@ class Decoding(ABC):
                 min_prefill_chunk_tokens=int(self.args.min_prefill_chunk_tokens),
                 prefill_chunk_quantum=int(self.args.prefill_chunk_quantum),
                 accept_stats=accept_stats,
-                now=time.monotonic(),
+                now=time.time(),
             )
             desired = set(next_plan.verify_proc_ids)
             current = set(preloaded_gpu_pids)
@@ -1182,7 +1182,7 @@ class Decoding(ABC):
                 min_prefill_chunk_tokens=int(self.args.min_prefill_chunk_tokens),
                 prefill_chunk_quantum=int(self.args.prefill_chunk_quantum),
                 accept_stats=accept_stats,
-                now=time.monotonic(),
+                now=time.time(),
             )
             if not plan.selected_work_ids:
                 return plan
@@ -1322,7 +1322,10 @@ class Decoding(ABC):
                         req["work_id"] = work_id
                         req["response_key"] = req.get("response_key", req["proc_id"])
                         req["server_enqueue_monotonic"] = time.monotonic()
-                        req["current_time"] = req["server_enqueue_monotonic"]
+                        # Priority scores use wall-clock ``current_time``;
+                        # keep the monotonic timestamp separately for queue
+                        # latency diagnostics.
+                        req["current_time"] = time.time()
                         item = WorkItem.from_request(req, category=cat, cycle=scheduler_state["current_cycle"], work_id=work_id)
                         work_items[work_id] = item
                         task_queues[req["task_type"]][cat].put(item)
