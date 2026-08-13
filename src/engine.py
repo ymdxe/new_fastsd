@@ -14,6 +14,7 @@ from abc import ABC, abstractmethod
 from accelerate import Accelerator
 from .kvcache import KVCacheModel
 from .kvcache_batching import KVCacheModel_batching
+from .kvcache_varlen import varlen_generate
 from .kvcache4RC import KVCacheModel as KVCache2Model
 from .cache_offload_policy import should_offload_target_cache
 from .util import seed_everything, norm_logits, sample, max_fn
@@ -742,6 +743,7 @@ class Decoding(ABC):
             """
             batch : 同一种 task_type (全部 prefill or 全部 verify)
             """
+            kv_batch_mode = getattr(self.args, "kv_batch_mode", "varlen")
             proc_ids = [req["proc_id"] for req in batch]
             response_keys = {
                 req["proc_id"]: req.get("response_key", req["proc_id"])
@@ -757,20 +759,8 @@ class Decoding(ABC):
             prefix_len = [req["prefix_len"] for req in batch]
 
             if batch[0]["task_type"] == "prefill":
-                # 按最大长度 pad
                 seqs = [req["draft_output"].to(target_model.device) for req in batch]
                 input_lens = [x.shape[1] for x in seqs]
-                max_T = max(x.shape[1] for x in seqs)
-                padded = []
-                for x in seqs:
-                    pad_len = max_T - x.shape[1]
-                    if pad_len:
-                        pad = torch.full((1, pad_len), tokenizer.pad_token_id, device=x.device, dtype=x.dtype)
-                        padded.append(torch.cat([x, pad], dim=1))
-                    else:
-                        padded.append(x)
-                x_batch = torch.cat(padded, dim=0)  # (B, max_T)
-
                 continuation = [bool(req.get("_prefill_continuation", False)) for req in batch]
                 # New prompts reset only the first chunk. Continuation chunks
                 # append to the persistent cache instead of rebuilding it.
@@ -780,10 +770,11 @@ class Decoding(ABC):
                         if pid not in [req["proc_id"] for req, cont in zip(batch, continuation) if cont]:
                             kv_cache_manager.reset(pid)
 
-                if any(continuation):
-                    # A continuation batch may contain fresh and existing
-                    # rows; forward_new_tokens routes them to the correct
-                    # primitive while preserving per-row lengths.
+                if kv_batch_mode == "varlen":
+                    # Padding-free path: linear layers run on the concatenation
+                    # of real tokens and attention runs per sequence. Fresh rows
+                    # pass the full prompt as residual (cache was reset above);
+                    # continuation rows pass only the new chunk.
                     with cache_lock:
                         for pid, cont in zip(proc_ids, continuation):
                             if cont:
@@ -791,22 +782,62 @@ class Decoding(ABC):
                                 kv_cache_manager._past_key_values[pid] = move_dynamic_cache_to(
                                     cache, target_model.device
                                 )
-                    kv_cache_manager.forward_new_tokens(
-                        x_batch,
-                        proc_ids=proc_ids,
-                        pad_token_id=tokenizer.pad_token_id,
-                        input_lens=input_lens,
-                        reset_pids=[pid for pid, cont in zip(proc_ids, continuation) if not cont],
+                    residuals = []
+                    for pid, cont, x in zip(proc_ids, continuation, seqs):
+                        if cont:
+                            cached_len = kv_cache_manager._past_key_values[pid].get_seq_length()
+                            residuals.append(x[:, cached_len:])
+                        else:
+                            residuals.append(x)
+                    varlen_generate(
+                        kv_cache_manager,
+                        target_model,
+                        residuals,
+                        proc_ids,
+                        tokenizer.pad_token_id,
+                        is_prefill=True,
                     )
                 else:
-                    kv_cache_manager.generate(
-                        x_batch,
-                        1,
-                        proc_ids=proc_ids,
-                        pad_token_id=tokenizer.pad_token_id,
-                        is_prefill=True,
-                        input_lens=input_lens,
-                    )
+                    # ---- original padded path (kept verbatim) ----
+                    # 按最大长度 pad
+                    max_T = max(x.shape[1] for x in seqs)
+                    padded = []
+                    for x in seqs:
+                        pad_len = max_T - x.shape[1]
+                        if pad_len:
+                            pad = torch.full((1, pad_len), tokenizer.pad_token_id, device=x.device, dtype=x.dtype)
+                            padded.append(torch.cat([x, pad], dim=1))
+                        else:
+                            padded.append(x)
+                    x_batch = torch.cat(padded, dim=0)  # (B, max_T)
+
+                    if any(continuation):
+                        # A continuation batch may contain fresh and existing
+                        # rows; forward_new_tokens routes them to the correct
+                        # primitive while preserving per-row lengths.
+                        with cache_lock:
+                            for pid, cont in zip(proc_ids, continuation):
+                                if cont:
+                                    cache = kv_cache_manager._past_key_values[pid]
+                                    kv_cache_manager._past_key_values[pid] = move_dynamic_cache_to(
+                                        cache, target_model.device
+                                    )
+                        kv_cache_manager.forward_new_tokens(
+                            x_batch,
+                            proc_ids=proc_ids,
+                            pad_token_id=tokenizer.pad_token_id,
+                            input_lens=input_lens,
+                            reset_pids=[pid for pid, cont in zip(proc_ids, continuation) if not cont],
+                        )
+                    else:
+                        kv_cache_manager.generate(
+                            x_batch,
+                            1,
+                            proc_ids=proc_ids,
+                            pad_token_id=tokenizer.pad_token_id,
+                            is_prefill=True,
+                            input_lens=input_lens,
+                        )
 
                 # prefill之后，将KV cache移到CPU节省显存
                 with cache_lock:
@@ -818,43 +849,6 @@ class Decoding(ABC):
                 self.color_print(f"process prefill tasks from: {proc_ids}", 3)
             else:  # verify 批量
                 seqs = [req["draft_output"].to(target_model.device) for req in batch]
-                x_batch = []
-                verify_input_lens = []
-                for req, x in zip(batch, seqs):
-                    # tail_only 模式下，edge 仅发送 [final_token + gamma_draft] 或 [gamma_draft]。
-                    # 这里补一个虚拟前缀长度，让 kvcache 内部按 cached_len 正确截取 residual。
-                    if req.get("tail_only", False):
-                        pid = req["proc_id"]
-                        cached_len = kv_cache_manager._past_key_values[pid].get_seq_length()
-                        pad = torch.full(
-                            (1, cached_len),
-                            tokenizer.pad_token_id,
-                            dtype=x.dtype,
-                            device=x.device,
-                        )
-                        x_batch.append(torch.cat((pad, x), dim=1))
-                        verify_input_lens.append(cached_len + x.shape[1])
-                    else:
-                        x_batch.append(x)
-                        verify_input_lens.append(x.shape[1])
-                # The KV primitive accepts one dense tensor.  Padding is
-                # right-sided and excluded through ``verify_input_lens``;
-                # admission accounting still counts only real new tokens.
-                max_verify_T = max(x.shape[1] for x in x_batch)
-                padded_verify = []
-                for x in x_batch:
-                    pad_len = max_verify_T - x.shape[1]
-                    if pad_len:
-                        pad = torch.full(
-                            (1, pad_len),
-                            tokenizer.pad_token_id,
-                            dtype=x.dtype,
-                            device=x.device,
-                        )
-                        padded_verify.append(torch.cat((x, pad), dim=1))
-                    else:
-                        padded_verify.append(x)
-                x_batch = torch.cat(padded_verify, dim=0)
                 debug_enabled = getattr(self.args, "debug_verify_tokens", False)
                 debug_tail = 16
 
@@ -880,14 +874,72 @@ class Decoding(ABC):
                         kv_cache_manager._past_key_values[pid] = move_dynamic_cache_to(cache, target_model.device)
 
                 verify_compute_start = time.time()
-                _ = kv_cache_manager.generate(
-                    x_batch,
-                    1,
-                    proc_ids=proc_ids,
-                    pad_token_id=tokenizer.pad_token_id,
-                    is_prefill=False,
-                    input_lens=verify_input_lens,
-                )
+                if kv_batch_mode == "varlen":
+                    # Padding-free path: tail_only rows pass the received tail
+                    # as residual; full-prefix rows pass only the uncached part.
+                    residuals = []
+                    for req, x in zip(batch, seqs):
+                        pid = req["proc_id"]
+                        cached_len = kv_cache_manager._past_key_values[pid].get_seq_length()
+                        if req.get("tail_only", False):
+                            residuals.append(x)
+                        else:
+                            residuals.append(x[:, cached_len:])
+                    _ = varlen_generate(
+                        kv_cache_manager,
+                        target_model,
+                        residuals,
+                        proc_ids,
+                        tokenizer.pad_token_id,
+                        is_prefill=False,
+                    )
+                else:
+                    # ---- original padded path (kept verbatim) ----
+                    x_batch = []
+                    verify_input_lens = []
+                    for req, x in zip(batch, seqs):
+                        # tail_only 模式下，edge 仅发送 [final_token + gamma_draft] 或 [gamma_draft]。
+                        # 这里补一个虚拟前缀长度，让 kvcache 内部按 cached_len 正确截取 residual。
+                        if req.get("tail_only", False):
+                            pid = req["proc_id"]
+                            cached_len = kv_cache_manager._past_key_values[pid].get_seq_length()
+                            pad = torch.full(
+                                (1, cached_len),
+                                tokenizer.pad_token_id,
+                                dtype=x.dtype,
+                                device=x.device,
+                            )
+                            x_batch.append(torch.cat((pad, x), dim=1))
+                            verify_input_lens.append(cached_len + x.shape[1])
+                        else:
+                            x_batch.append(x)
+                            verify_input_lens.append(x.shape[1])
+                    # The KV primitive accepts one dense tensor.  Padding is
+                    # right-sided and excluded through ``verify_input_lens``;
+                    # admission accounting still counts only real new tokens.
+                    max_verify_T = max(x.shape[1] for x in x_batch)
+                    padded_verify = []
+                    for x in x_batch:
+                        pad_len = max_verify_T - x.shape[1]
+                        if pad_len:
+                            pad = torch.full(
+                                (1, pad_len),
+                                tokenizer.pad_token_id,
+                                dtype=x.dtype,
+                                device=x.device,
+                            )
+                            padded_verify.append(torch.cat((x, pad), dim=1))
+                        else:
+                            padded_verify.append(x)
+                    x_batch = torch.cat(padded_verify, dim=0)
+                    _ = kv_cache_manager.generate(
+                        x_batch,
+                        1,
+                        proc_ids=proc_ids,
+                        pad_token_id=tokenizer.pad_token_id,
+                        is_prefill=False,
+                        input_lens=verify_input_lens,
+                    )
                 verify_elapsed = time.time() - verify_compute_start
 
                 # verify之后，将KV cache移到CPU节省显存

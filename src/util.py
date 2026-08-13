@@ -203,6 +203,13 @@ def parse_arguments():
         help="cloud scheduling mode: fastsd uses custom optimizations; pipeline uses baseline pipeline scheduling only",
     )
     parser.add_argument(
+        "--kv_batch_mode",
+        type=str,
+        default="varlen",
+        choices=["varlen", "padded"],
+        help="cloud KV batch forward: varlen uses the padding-free per-sequence path; padded keeps the legacy pad-to-max path",
+    )
+    parser.add_argument(
         "--profile",
         type=str,
         default="custom",
