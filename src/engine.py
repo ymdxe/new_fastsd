@@ -55,30 +55,44 @@ class Decoding(ABC):
         self.draft_forward_times = 0
         self.target_forward_times = 0
         self.num_acc_tokens = []
+        self.last_generation_metrics = {}
+
+    def _load_model_on_device(self, model_path: str, device: str):
+        quant_config = os.path.join(model_path, "quantize_config.json")
+        if os.path.exists(quant_config):
+            if AutoGPTQForCausalLM is None:
+                raise RuntimeError(
+                    f"auto_gptq is required for quantized model loading: {model_path}"
+                )
+            return AutoGPTQForCausalLM.from_quantized(
+                model_path,
+                device=device,
+                use_safetensors=True,
+                trust_remote_code=True,
+                use_triton=False,
+            ).eval()
+        return AutoModelForCausalLM.from_pretrained(
+            model_path,
+            device_map={"": device},
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+        ).eval()
     
     def load_model(self):
         # * load models according to different evaluation methods.
         self.color_print(f"Loading models:\n{self.args.draft_model}\n{self.args.target_model}", 3)
         if self.args.eval_mode == "small":
-            self.draft_model = AutoModelForCausalLM.from_pretrained(self.args.draft_model, device_map="auto", torch_dtype=torch.bfloat16, trust_remote_code=True).eval()
+            self.draft_model = self._load_model_on_device(
+                self.args.draft_model, self.args.draft_device
+            )
         elif self.args.eval_mode == "large":
             self.target_model = AutoModelForCausalLM.from_pretrained(self.args.target_model, device_map="auto", torch_dtype=torch.bfloat16, trust_remote_code=True).eval()
         elif self.args.eval_mode == "sd":
-            # self.draft_model = AutoModelForCausalLM.from_pretrained(self.args.draft_model, device_map="cuda:0", torch_dtype=torch.bfloat16, trust_remote_code=True).eval()
-            # self.target_model = AutoModelForCausalLM.from_pretrained(self.args.target_model, device_map="cuda:1", torch_dtype=torch.bfloat16, trust_remote_code=True).eval()
-
-            self.draft_model = AutoGPTQForCausalLM.from_quantized(
-                self.args.draft_model,
-                device="cuda:1",
-                use_safetensors=True,
-                trust_remote_code=True,
+            self.draft_model = self._load_model_on_device(
+                self.args.draft_model, self.args.draft_device
             )
-
-            self.target_model = AutoGPTQForCausalLM.from_quantized(
-                self.args.target_model,
-                device="cuda:0",
-                use_safetensors=True,
-                trust_remote_code=True,
+            self.target_model = self._load_model_on_device(
+                self.args.target_model, self.args.target_device
             )
 
         elif self.args.eval_mode in ["para_sd", "para_sd_wo_1", "para_sd_wo_1"]:
@@ -193,6 +207,8 @@ class Decoding(ABC):
             raise RuntimeError("Auto-Regressive Decoding can be used only in small / large eval mode!")
         
         prefix = prefix.to(model.device)
+        generation_start = time.perf_counter()
+        first_token_time = None
 
         prefix_len = prefix.shape[1]
         max_tokens = prefix_len + self.args.max_tokens
@@ -218,11 +234,30 @@ class Decoding(ABC):
             past_key_values = outputs.past_key_values
             idx_next = sample(last_p)
             x = torch.cat((x, idx_next), dim=1)
+            if first_token_time is None:
+                torch.cuda.synchronize(model.device)
+                first_token_time = time.perf_counter()
+        torch.cuda.synchronize(model.device)
+        completion_time = time.perf_counter()
+        generated_tokens = int(x.shape[1] - prefix_len)
+        self.last_generation_metrics = {
+            "ttft_ms": (first_token_time - generation_start) * 1000.0,
+            "tpot_ms": (
+                (completion_time - first_token_time) * 1000.0 / (generated_tokens - 1)
+                if generated_tokens > 1
+                else 0.0
+            ),
+            "e2e_ms": (completion_time - generation_start) * 1000.0,
+            "generated_tokens": generated_tokens,
+        }
         return x
 
     @torch.no_grad()
     def speculative_decoding(self, prefix):
-        max_tokens = prefix.shape[1] + self.args.max_tokens
+        original_prefix_len = prefix.shape[1]
+        max_tokens = original_prefix_len + self.args.max_tokens
+        generation_start = time.perf_counter()
+        first_token_time = None
         
         draft_device = self.draft_model.device
         target_device = self.target_model.device
@@ -274,6 +309,23 @@ class Decoding(ABC):
                 t = torch.argmax(target_logits_next, dim=-1).unsqueeze(-1)
                 target_model_cache.rollback(n + 2)
             prefix = torch.cat((prefix, t), dim=1)
+            prefix = prefix[:, :max_tokens]
+            if first_token_time is None:
+                torch.cuda.synchronize(draft_device)
+                first_token_time = time.perf_counter()
+        torch.cuda.synchronize(draft_device)
+        completion_time = time.perf_counter()
+        generated_tokens = int(prefix.shape[1] - original_prefix_len)
+        self.last_generation_metrics = {
+            "ttft_ms": (first_token_time - generation_start) * 1000.0,
+            "tpot_ms": (
+                (completion_time - first_token_time) * 1000.0 / (generated_tokens - 1)
+                if generated_tokens > 1
+                else 0.0
+            ),
+            "e2e_ms": (completion_time - generation_start) * 1000.0,
+            "generated_tokens": generated_tokens,
+        }
         return prefix
 
     @torch.no_grad()

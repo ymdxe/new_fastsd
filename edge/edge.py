@@ -481,10 +481,14 @@ class EdgeRunner(Decoding):
             raise RuntimeError(f"{len(failed)} draft process(es) failed with exit codes {failed}")
 
     def _resolve_data_file(self) -> str:
+        if self.args.dataset_file:
+            return self.args.dataset_file
         if self.args.dataset == "humaneval":
             default_file = "humaneval.jsonl"
         elif self.args.dataset == "gsm8k":
             default_file = "gsm8k.jsonl"
+        elif self.args.dataset == "mgsm":
+            default_file = "mgsm.jsonl"
         elif self.args.dataset == "mt_bench":
             default_file = "mt_bench.jsonl"
         else:
@@ -526,9 +530,12 @@ class EdgeRunner(Decoding):
         arrival_offsets = None
         arrival_origin = None
         if self.args.arrival_distribution == "poisson":
-            arrival_offsets = poisson_arrival_offsets(
-                len(samples), self.args.arrival_rate, self.args.arrival_seed
-            )
+            if samples and all("scheduled_arrival_s" in sample for sample in samples):
+                arrival_offsets = [float(sample["scheduled_arrival_s"]) for sample in samples]
+            else:
+                arrival_offsets = poisson_arrival_offsets(
+                    len(samples), self.args.arrival_rate, self.args.arrival_seed
+                )
             if arrival_barrier is not None:
                 arrival_barrier.wait()
                 if proc_id == 0:
@@ -557,12 +564,18 @@ class EdgeRunner(Decoding):
             )
             approx_model_cache.vocab_size = self.args.vocab_size
 
-            if self.args.dataset == "gsm8k":
+            if "sample_id" in sample and "prompt" in sample:
+                input_text = sample["prompt"].strip()
+                task_id = str(sample["sample_id"])
+            elif self.args.dataset == "gsm8k":
                 input_text = self._preprocess_gsm8k(sample["question"].strip())
                 task_id = sample.get("task_id", f"gsm8k-{proc_id}-{idx}")
             elif self.args.dataset == "humaneval":
                 input_text = sample["prompt"].strip()
                 task_id = sample.get("task_id", f"humaneval-{proc_id}-{idx}")
+            elif self.args.dataset == "mgsm":
+                input_text = sample["question"].strip()
+                task_id = str(sample.get("question_id", f"mgsm-{proc_id}-{idx}"))
             else:
                 input_text = sample["turns"][0].strip()
                 task_id = str(sample.get("task_id", f"mtbench-{proc_id}-{idx}"))
@@ -811,7 +824,7 @@ class EdgeRunner(Decoding):
                         2,
                     )
                     break
-                if self.args.dataset == "humaneval":
+                if self.args.stop_policy == "dataset" and self.args.dataset == "humaneval":
                     current_text = tokenizer.decode(
                         prefix[0, input_ids.shape[1]:], skip_special_tokens=True
                     )
@@ -827,7 +840,7 @@ class EdgeRunner(Decoding):
                             2,
                         )
                         break
-                if self.args.dataset == "gsm8k":
+                if self.args.stop_policy == "dataset" and self.args.dataset == "gsm8k":
                     current_text = tokenizer.decode(
                         prefix[0, input_ids.shape[1]:], skip_special_tokens=True
                     )
@@ -919,9 +932,15 @@ class EdgeRunner(Decoding):
                 "accepted_total": int(accepted_total),
                 "drafted_total": int(drafted_total),
                 "accept_rate": float(accepted_total / drafted_total) if drafted_total > 0 else 0.0,
+                "mean_accepted_tokens_per_verify": (
+                    float(accepted_total / rounds) if rounds > 0 else None
+                ),
                 "reuse_hit_rounds": int(reuse_hit_rounds),
                 "reuse_miss_rounds": int(reuse_miss_rounds),
                 "reuse_skip_not_full_accept_rounds": int(reuse_miss_not_full_accept_rounds),
+                "output_text": generated_text,
+                "reference": sample.get("reference", sample.get("answer")),
+                "workload_hash": self.args.workload_hash,
             }
             with open(self._metrics_path(proc_id), "a") as f:
                 f.write(json.dumps(per_task, ensure_ascii=True) + "\n")

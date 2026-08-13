@@ -18,6 +18,7 @@ If you are new to the repo, read the detailed guide first:
 - [docs/REPOSITORY_GUIDE.md](docs/REPOSITORY_GUIDE.md)
 - [docs/CAMPUS_SERVER_EXTERNAL_ACCESS.md](docs/CAMPUS_SERVER_EXTERNAL_ACCESS.md)
 - [baselines/specedge/README.md](baselines/specedge/README.md) — pinned official SpecEdge baseline and paper-aligned reproduction configs
+- [docs/FOUR_METHOD_EVALUATION.md](docs/FOUR_METHOD_EVALUATION.md) — FastSD / SpecEdge / standard SD / draft-only unified datasets and metrics
 
 Quick pointers:
 
@@ -25,5 +26,6 @@ Quick pointers:
 - Start cloud target service: `python cloud/cloud_service.py --exp_name <name>`
 - Start edge runner with a preset profile: `bash scripts/run_fastsd_profile.sh <exp_name>`
 - Run the complete local test suite (including the pinned SpecEdge baseline checks): `python scripts/run_tests.py`
+- Prepare the four-method comparison workload: `python scripts/eval_suite.py prepare --config configs/evaluation/qwen3_8b_0.6b_humaneval.json`
 
 The repository currently has local uncommitted changes copied from the remote development server. Check `git status --short` before assuming a clean baseline.
