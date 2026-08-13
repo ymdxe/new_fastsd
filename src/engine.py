@@ -34,6 +34,7 @@ from .fastsd_scheduler import (
     FASTSD_DYNAMIC_WINDOW,
     build_fixed_wrr_order as _build_fixed_wrr_order,
     compute_priority_score as _compute_priority_score,
+    full_prefix_bridge_tokens,
     length_category as _length_category,
     predict_next_verify_proc_ids as _predict_next_verify_proc_ids,
     WorkItem,
@@ -1166,6 +1167,12 @@ class Decoding(ABC):
                 # Edge.  Subsequent slices use the correction token returned
                 # by the preceding target forward.
                 bridge_token = int(source[0, 0].item())
+            elif bridge_token is None and item.bridge_pending and sl.offset == 0:
+                if int(item.bridge_pending) != 1:
+                    raise ValueError(
+                        f"unsupported full-prefix bridge count: {item.bridge_pending}"
+                    )
+                bridge_token = int(source[0, item.base_prefix_len - 1].item())
             if bridge_token is not None:
                 bridge = torch.tensor([[int(bridge_token)]], dtype=source.dtype, device=source.device)
                 req["draft_output"] = torch.cat((bridge, draft_tokens), dim=1)
@@ -1334,6 +1341,13 @@ class Decoding(ABC):
                         # keep the monotonic timestamp separately for queue
                         # latency diagnostics.
                         req["current_time"] = time.time()
+                        if req["task_type"] == "verify" and not req.get("tail_only", False):
+                            cached_len = kv_cache_manager._past_key_values[
+                                req["proc_id"]
+                            ].get_seq_length()
+                            req["bridge_tokens"] = full_prefix_bridge_tokens(
+                                req["prefix_len"], cached_len
+                            )
                         item = WorkItem.from_request(req, category=cat, cycle=scheduler_state["current_cycle"], work_id=work_id)
                         work_items[work_id] = item
                         task_queues[req["task_type"]][cat].put(item)

@@ -24,6 +24,23 @@ FASTSD_VERIFY_WRR_ORDER = (
 FASTSD_QUEUE_ORDER = ("SV", "SP", "MV", "MP", "LV", "LP")
 
 
+def full_prefix_bridge_tokens(prefix_len: int, cached_len: int) -> int:
+    """Return the uncached correction-token count for a full-prefix verify.
+
+    The target deliberately rolls back before the correction/final token, so
+    the next non-pipeline request may have a logical prefix exactly one token
+    longer than its target KV cache.  That token is a real forward token and
+    must be included in both admission cost and the internal tail-only slice.
+    """
+    missing = int(prefix_len) - int(cached_len)
+    if missing not in (0, 1):
+        raise ValueError(
+            "full-prefix verify expects target cache to trail logical prefix "
+            f"by at most one token, got prefix_len={prefix_len}, cached_len={cached_len}"
+        )
+    return missing
+
+
 def build_fixed_wrr_order():
     return list(FASTSD_VERIFY_WRR_ORDER)
 

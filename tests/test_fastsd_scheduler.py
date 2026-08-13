@@ -4,6 +4,7 @@ import unittest
 from src.fastsd_scheduler import (
     AdmissionPlan,
     WorkItem,
+    full_prefix_bridge_tokens,
     build_fixed_wrr_order,
     commit_admission_plan,
     compute_priority_score,
@@ -16,6 +17,13 @@ from src.fastsd_scheduler import (
 
 
 class FastSDSchedulerTests(unittest.TestCase):
+    def test_full_prefix_bridge_count_tracks_uncached_correction(self):
+        self.assertEqual(full_prefix_bridge_tokens(106, 106), 0)
+        self.assertEqual(full_prefix_bridge_tokens(107, 106), 1)
+
+        with self.assertRaisesRegex(ValueError, "trail logical prefix"):
+            full_prefix_bridge_tokens(108, 106)
+
     def test_build_fixed_wrr_order_uses_631_ratio(self):
         order = build_fixed_wrr_order()
         self.assertEqual(len(order), 10)
