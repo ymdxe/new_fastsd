@@ -573,7 +573,7 @@ class Decoding(ABC):
 
             response_queues[proc_id].put({
                 "accepted": accepted_len,
-                "final_token": new_token,
+                "final_token": int(new_token.item()),
             })
 
             # Update accept statistics
@@ -1008,7 +1008,7 @@ class Decoding(ABC):
 
                 response_payload = {
                     "accepted": accepted_len,
-                    "final_token": new_token,
+                    "final_token": int(new_token.item()),
                     "verify_ms": verify_elapsed * 1000.0,
                 }
                 if getattr(self.args, "enable_pipeline", True) and getattr(self.args, "pipeline_gamma_adapt", True):
@@ -1330,6 +1330,16 @@ class Decoding(ABC):
                         req = request_queue.get(timeout=0.01)
                         if req is None:  # 终止信号
                             return
+                        draft_output = req.get("draft_output")
+                        if not torch.is_tensor(draft_output):
+                            draft_output = torch.tensor(draft_output, dtype=torch.long)
+                            if draft_output.dim() == 1:
+                                draft_output = draft_output.unsqueeze(0)
+                            if draft_output.dim() != 2:
+                                raise ValueError(
+                                    "draft_output must be a flat token list or a 2-D tensor"
+                                )
+                            req["draft_output"] = draft_output
                         recent_prefix_lens.append(int(req["prefix_len"]))
                         len_r1, len_r2 = _update_length_thresholds(recent_prefix_lens)
                         cat = _length_category(req["prefix_len"], len_r1, len_r2)

@@ -249,11 +249,13 @@ async def prefill(req: PrefillRequest) -> dict:
 
     req_id = req.session_id
 
-    draft_output_tensor = torch.tensor(req.draft_output, dtype=torch.long).unsqueeze(0)
-
     request_dict = {
         "task_id": req.task_id,
-        "draft_output": draft_output_tensor,
+        # Keep multiprocessing.Queue payloads tensor-free.  Passing a torch
+        # storage through the queue uses the resource_sharer FD channel and
+        # eventually fails in long experiments with "received 0 items of
+        # ancdata".  The target worker tensorizes this plain list on ingress.
+        "draft_output": [int(token) for token in req.draft_output],
         "prefix_len": req.prefix_len,
         "proc_id": req_id,
         "lag": req.lag,
@@ -275,12 +277,11 @@ async def verify(req: VerifyRequest) -> dict:
 
     req_id = req.session_id
 
-    draft_output_tensor = torch.tensor(req.draft_output, dtype=torch.long).unsqueeze(0)
     avg_cloud_total_ms = _get_avg_cloud_total_ms()
 
     request_dict = {
         "task_id": req.task_id,
-        "draft_output": draft_output_tensor,
+        "draft_output": [int(token) for token in req.draft_output],
         "prefix_len": req.prefix_len,
         "proc_id": req_id,
         "lag": req.lag,
