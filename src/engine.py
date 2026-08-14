@@ -713,7 +713,7 @@ class Decoding(ABC):
             non-numeric types, which must never reach arithmetic downstream."""
             try:
                 f = float(value)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 return float(default)
             if not math.isfinite(f):
                 return float(default)
@@ -726,7 +726,7 @@ class Decoding(ABC):
                 return int(value)
             try:
                 f = float(value)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 return int(default)
             if not math.isfinite(f) or abs(f) > 1e12:
                 return int(default)
@@ -1009,7 +1009,10 @@ class Decoding(ABC):
                 x = req["draft_output"].to(target_model.device)
                 tail_only = req.get("tail_only", False) or req.get("_chunked_internal", False)
                 has_bridge_token = req.get("has_bridge_token", False)
-                req_gamma = max(1, _safe_int(req.get("gamma", self.args.gamma), default=self.args.gamma))
+                req_gamma = min(
+                    int(getattr(self.args, "max_tokens", 400) or 400),
+                    max(1, _safe_int(req.get("gamma", self.args.gamma), default=self.args.gamma)),
+                )
 
                 if req["task_type"] == "prefill":
                     # prefill 仅初始化 cache，回滚到 prefix 长度供下一轮 verify 使用
