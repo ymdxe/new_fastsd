@@ -704,6 +704,9 @@ class Decoding(ABC):
         len_r2 = FASTSD_DEFAULT_R2
         cache_lock = threading.Lock()
         preloaded_gpu_pids = set()
+        # pids whose cache is currently owned by the executing batch (forward +
+        # rollback window). The async prefetch worker must never touch these.
+        active_pids = set()
 
         def update_ema(store: dict, pid, value: float) -> float:
             alpha = float(getattr(self.args, "pipeline_ema_alpha", 0.2))
@@ -750,6 +753,22 @@ class Decoding(ABC):
             """
             kv_batch_mode = getattr(self.args, "kv_batch_mode", "varlen")
             proc_ids = [req["proc_id"] for req in batch]
+            # Mark this batch's caches as active for the whole forward +
+            # rollback window so the async prefetch worker never evicts or
+            # moves a cache the main thread is currently using.
+            with cache_lock:
+                active_pids.update(proc_ids)
+            try:
+                return _handle_request_batch_inner(
+                    batch, return_responses, kv_batch_mode, proc_ids
+                )
+            finally:
+                with cache_lock:
+                    active_pids.difference_update(proc_ids)
+
+        def _handle_request_batch_inner(
+            batch, return_responses, kv_batch_mode, proc_ids
+        ):
             response_keys = {
                 req["proc_id"]: req.get("response_key", req["proc_id"])
                 for req in batch
@@ -1068,7 +1087,9 @@ class Decoding(ABC):
                     "verify_ms": verify_elapsed * 1000.0,
                 }
                 if getattr(self.args, "enable_pipeline", True) and getattr(self.args, "pipeline_gamma_adapt", True):
-                    # Target: T_verify ~= T_edge_draft + RTT.
+                    # Target: edge 在等待 verify 的完整往返窗口
+                    # （T_verify + RTT）内持续 proactive draft，所以
+                    # T_edge_draft(gamma) ~= T_verify + RTT。
                     # Use online EMA to suggest per-session gamma for next round.
                     drafted_tokens = max(1, req_gamma)
                     edge_per_tok = float(req.get("lag", 0.0)) / drafted_tokens
@@ -1084,12 +1105,25 @@ class Decoding(ABC):
                         0.0, float(req.get("transport_rtt", req.get("edge_rtt", 0.0)))
                     )
                     v_ema = update_ema(verify_time_ema, pid, max(1e-6, verify_budget))
-                    d_ema = update_ema(edge_draft_per_token_ema, pid, max(1e-6, edge_per_tok))
-                    rtt_ema = update_ema(edge_rtt_ema, pid, transport_rtt)
-                    target_draft_time = max(1e-6, v_ema - rtt_ema)
-                    suggested = int(round(target_draft_time / d_ema))
+                    rtt_ema = update_ema(edge_rtt_ema, pid, max(0.0, transport_rtt))
+                    if edge_per_tok > 0:
+                        d_ema = update_ema(edge_draft_per_token_ema, pid, edge_per_tok)
+                    else:
+                        # Edge reported lag=0: keep the previous estimate instead
+                        # of seeding d_ema with 1e-6, which would pin gamma at max.
+                        d_ema = edge_draft_per_token_ema.get(pid)
+                    # 目标：让 edge 在等待 verify 的完整往返窗口（verify 时间 +
+                    # 传输 RTT）内恰好 draft 出 gamma 个 token。旧公式
+                    # (v_ema - rtt_ema) / d_ema 在 rtt_ema > v_ema 时恒为负、
+                    # 被 min_gamma 兜底成 1（r5 实验 TPOT 恶化 44% 的根因）。
+                    # 新公式恒为正，RTT 大时 gamma 随之增大以填满等待窗口。
                     min_gamma = int(getattr(self.args, "pipeline_gamma_min", 1))
                     max_gamma = int(getattr(self.args, "pipeline_gamma_max", 16))
+                    if d_ema is None or d_ema <= 0:
+                        suggested = int(getattr(self.args, "gamma", 4) or 4)
+                    else:
+                        draft_window = v_ema + rtt_ema
+                        suggested = int(round(draft_window / d_ema))
                     suggested = max(min_gamma, min(max_gamma, suggested))
                     response_payload["suggested_gamma"] = suggested
                     if getattr(self.args, "debug_pipeline", False):
@@ -1099,7 +1133,7 @@ class Decoding(ABC):
                             f"avg_cloud_total={avg_cloud_total_ms:.2f}ms "
                             f"transport_rtt={transport_rtt*1000:.2f}ms v_ema={v_ema*1000:.2f}ms "
                             f"d_ema={d_ema*1000:.4f}ms/tok rtt_ema={rtt_ema*1000:.2f}ms "
-                            f"target_draft={target_draft_time*1000:.2f}ms suggested_gamma={suggested}",
+                            f"draft_window={draft_window*1000:.2f}ms suggested_gamma={suggested}",
                             3,
                         )
 
@@ -1125,16 +1159,85 @@ class Decoding(ABC):
                     for item in items:
                         task_queues[ttype][cat].put(item)
 
-        def preload_kvcache(proc_ids):
-            if not proc_ids:
-                return
-            with cache_lock:
-                for pid in proc_ids:
-                    cache = kv_cache_manager._past_key_values.get(pid)
-                    if cache is None:
-                        continue
-                    kv_cache_manager._past_key_values[pid] = move_dynamic_cache_to(cache, target_model.device)
-                    preloaded_gpu_pids.add(pid)
+
+        # ---- 异步 KV 预取：后台线程执行 CPU<->GPU 搬移 ----
+        # 主线程只做 dry-run 规划并提交 desired pids；搬移由 daemon 线程执行，
+        # 与主线程的 verify/prefill 前向并发。若下一轮 verify 前主线程的强制
+        # move 先执行，worker 的搬移退化为幂等 no-op（目标 device 相同）。
+        # 队列容量 1 且只保留最新预测：旧预测未执行完时被新预测替换。
+        # 执行时重新计算 current/stale/to_gpu（提交时的快照可能已过期），
+        # 且绝不触碰 active_pids（当前 batch 正在使用中的 cache）。
+        prefetch_tasks = queue.Queue(maxsize=1)
+        prefetch_stop = threading.Event()
+
+        def _prefetch_worker():
+            while not prefetch_stop.is_set():
+                try:
+                    desired = prefetch_tasks.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                try:
+                    with cache_lock:
+                        current = set(preloaded_gpu_pids)
+                        stale = (current - desired) - active_pids
+                        to_gpu = (desired - current) - active_pids
+                        # Evict-before-load under the lock (entry swaps only);
+                        # the actual tensor copies happen outside the lock so
+                        # the main thread is never blocked on a long transfer.
+                        # Snapshots record identity + length + device so a
+                        # stale copy is never installed over a cache that the
+                        # main thread mutated in place meanwhile.
+                        for pid in stale:
+                            preloaded_gpu_pids.discard(pid)
+                        to_cpu_snapshot = [
+                            (
+                                pid,
+                                kv_cache_manager._past_key_values.get(pid),
+                                kv_cache_manager._past_key_values.get(pid).get_seq_length()
+                                if kv_cache_manager._past_key_values.get(pid) is not None
+                                else 0,
+                            )
+                            for pid in stale
+                        ]
+                        to_gpu_snapshot = [
+                            (
+                                pid,
+                                kv_cache_manager._past_key_values.get(pid),
+                                kv_cache_manager._past_key_values.get(pid).get_seq_length()
+                                if kv_cache_manager._past_key_values.get(pid) is not None
+                                else 0,
+                            )
+                            for pid in to_gpu
+                        ]
+                    for pid, cache, seq_len in to_cpu_snapshot:
+                        if cache is None:
+                            continue
+                        moved = move_dynamic_cache_to(cache, "cpu")
+                        with cache_lock:
+                            if pid not in active_pids and kv_cache_manager._past_key_values.get(pid) is cache:
+                                kv_cache_manager._past_key_values[pid] = moved
+                    for pid, cache, seq_len in to_gpu_snapshot:
+                        if cache is None:
+                            continue
+                        moved = move_dynamic_cache_to(cache, target_model.device)
+                        with cache_lock:
+                            cur = kv_cache_manager._past_key_values.get(pid)
+                            if (
+                                pid not in active_pids
+                                and cur is cache
+                                and cur.get_seq_length() == seq_len
+                            ):
+                                kv_cache_manager._past_key_values[pid] = moved
+                                preloaded_gpu_pids.add(pid)
+                except Exception:
+                    # A failed prefetch must never take down the target worker;
+                    # it only degrades to the synchronous move path next round.
+                    continue
+
+        prefetch_thread = threading.Thread(
+            target=_prefetch_worker, daemon=True, name="fastsd-kv-prefetch"
+        )
+        prefetch_thread.start()
 
         scheduler_state = {"wrr_cursor": 0, "current_cycle": 0}
         scheduler_metrics = {
@@ -1149,6 +1252,8 @@ class Decoding(ABC):
             "prefetch_hits": 0,
             "prefetch_misses": 0,
             "prefetch_evictions": 0,
+            "prefetch_async_submitted": 0,
+            "prefetch_async_dropped": 0,
         }
 
         def _plan_queues():
@@ -1169,6 +1274,10 @@ class Decoding(ABC):
             drained WorkItems are included. When target-cache offload is
             disabled the KV already stays resident on the GPU and the
             prefetch/evict cycle is a no-op, so skip it entirely.
+
+            Only the dry-run planning and metrics run on the main thread; the
+            actual CPU<->GPU cache movement is submitted to the background
+            prefetch worker and overlaps with this round's GPU compute.
             """
             if os.environ.get("FASTSD_DISABLE_TARGET_CACHE_OFFLOAD", "").lower() in {
                 "1",
@@ -1189,18 +1298,31 @@ class Decoding(ABC):
                 now=time.time(),
             )
             desired = set(next_plan.verify_proc_ids)
-            current = set(preloaded_gpu_pids)
-            stale = current - desired
             with cache_lock:
-                for pid in stale:
-                    cache = kv_cache_manager._past_key_values.get(pid)
-                    if cache is not None:
-                        kv_cache_manager._past_key_values[pid] = move_dynamic_cache_to(cache, "cpu")
-                    preloaded_gpu_pids.discard(pid)
+                current = set(preloaded_gpu_pids)
+            stale = current - desired
+            to_gpu = desired - current
             scheduler_metrics["prefetch_evictions"] += len(stale)
             scheduler_metrics["prefetch_hits"] += len(current & desired)
-            scheduler_metrics["prefetch_misses"] += len(desired - current)
-            preload_kvcache(desired - current)
+            scheduler_metrics["prefetch_misses"] += len(to_gpu)
+            if stale or to_gpu:
+                # Keep only the freshest prediction: if the previous task is
+                # still pending, drop it and submit the newer one. The worker
+                # re-derives current/stale at execution time, so only the
+                # desired pid set travels through the queue.
+                try:
+                    prefetch_tasks.put_nowait(desired)
+                    scheduler_metrics["prefetch_async_submitted"] += 1
+                except queue.Full:
+                    try:
+                        prefetch_tasks.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        prefetch_tasks.put_nowait(desired)
+                        scheduler_metrics["prefetch_async_submitted"] += 1
+                    except queue.Full:
+                        scheduler_metrics["prefetch_async_dropped"] += 1
             scheduler_metrics["prefetch_plans"] += 1
 
         def _slice_request(item: WorkItem, sl):
@@ -1464,6 +1586,8 @@ class Decoding(ABC):
         finally:
             if energy_service is not None:
                 energy_service.shutdown()
+            prefetch_stop.set()
+            prefetch_thread.join(timeout=2.0)
 
             # Preserve scheduler evidence for the experiment report.  GPU
             # runs may terminate through the worker's normal shutdown path,
