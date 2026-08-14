@@ -1161,7 +1161,22 @@ class Decoding(ABC):
             }
 
         def prefetch_next_plan():
-            """Use the same pure planner for the next cache residency hint."""
+            """Use the same pure planner for the next cache residency hint.
+
+            Called from the main loop right before ``schedule_iteration`` so
+            the queue snapshot contains the *next* round's candidates (after
+            the previous round was committed). Called after ingress so newly
+            drained WorkItems are included. When target-cache offload is
+            disabled the KV already stays resident on the GPU and the
+            prefetch/evict cycle is a no-op, so skip it entirely.
+            """
+            if os.environ.get("FASTSD_DISABLE_TARGET_CACHE_OFFLOAD", "").lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }:
+                return
             next_plan = plan_iteration(
                 _plan_queues(),
                 token_budget=int(self.args.token_budget),
@@ -1348,7 +1363,6 @@ class Decoding(ABC):
                 scheduler_metrics["used_tokens"] += plan.used_tokens
                 scheduler_metrics["verify_slices"] += len(plan.verify_slices)
                 scheduler_metrics["prefill_slices"] += len(plan.prefill_slices)
-                prefetch_next_plan()
             except Exception:
                 abort_admission_plan(plan)
                 raise
@@ -1438,6 +1452,12 @@ class Decoding(ABC):
 
                 if any(not q.empty() for t in task_queues.values() for q in t.values()):
                     scheduler_metrics["iterations"] += 1
+                    # Prefetch before planning: the queue snapshot now holds
+                    # the next round's candidates, so the residency hint
+                    # covers the WorkItems the upcoming plan will actually
+                    # verify (previously it ran after commit and always saw
+                    # an empty candidate set).
+                    prefetch_next_plan()
                     schedule_iteration()
                 else:
                     time.sleep(0.01)
