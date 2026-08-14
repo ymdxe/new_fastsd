@@ -719,6 +719,19 @@ class Decoding(ABC):
                 return float(default)
             return f
 
+        def _safe_int(value, default=0) -> int:
+            """Sanitize a request-sourced integer field (gamma / prefix_len):
+            bare int() on crafted values (1e999, 'abc') would crash the worker."""
+            if isinstance(value, bool):
+                return int(value)
+            try:
+                f = float(value)
+            except (TypeError, ValueError):
+                return int(default)
+            if not math.isfinite(f) or abs(f) > 1e12:
+                return int(default)
+            return int(f)
+
         def update_ema(store: dict, pid, value: float) -> float:
             alpha = float(getattr(self.args, "pipeline_ema_alpha", 0.2))
             old = store.get(pid, None)
@@ -996,7 +1009,7 @@ class Decoding(ABC):
                 x = req["draft_output"].to(target_model.device)
                 tail_only = req.get("tail_only", False) or req.get("_chunked_internal", False)
                 has_bridge_token = req.get("has_bridge_token", False)
-                req_gamma = max(1, int(req.get("gamma", self.args.gamma) or self.args.gamma))
+                req_gamma = max(1, _safe_int(req.get("gamma", self.args.gamma), default=self.args.gamma))
 
                 if req["task_type"] == "prefill":
                     # prefill 仅初始化 cache，回滚到 prefix 长度供下一轮 verify 使用
@@ -1561,7 +1574,7 @@ class Decoding(ABC):
                         if req is None:  # 终止信号
                             return
                         req = tensorize_draft_output(req)
-                        recent_prefix_lens.append(int(req["prefix_len"]))
+                        recent_prefix_lens.append(_safe_int(req["prefix_len"]))
                         len_r1, len_r2 = _update_length_thresholds(recent_prefix_lens)
                         cat = _length_category(req["prefix_len"], len_r1, len_r2)
                         work_id = str(req.get("work_id", f"{req['proc_id']}:{time.monotonic_ns()}"))
