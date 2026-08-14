@@ -18,8 +18,9 @@ class CloudIPCPayloadTests(unittest.TestCase):
         )
         self.assertNotIn('"final_token": new_token', engine_text)
         self.assertIn("if not torch.is_tensor(draft_output):", engine_text)
+        self.assertIn("req = tensorize_draft_output(req)", engine_text)
         self.assertGreaterEqual(
-            engine_text.count("req = tensorize_draft_output(req)"),
+            engine_text.count("req = canonicalize_ingress(req)"),
             2,
         )
 

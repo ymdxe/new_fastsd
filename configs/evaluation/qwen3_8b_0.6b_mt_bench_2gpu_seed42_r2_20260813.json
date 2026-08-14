@@ -22,6 +22,22 @@
     "gamma": 4,
     "stop_policy": "eos"
   },
+  "runtime": {
+    "profile": "custom",
+    "server_sched_mode": "fastsd",
+    "kv_batch_mode": "varlen",
+    "batch_size": 2,
+    "token_budget": 64,
+    "min_prefill_chunk_tokens": 16,
+    "prefill_chunk_quantum": 128,
+    "enable_pipeline": true,
+    "enable_proactive_draft": true,
+    "pipeline_gamma_adapt": true,
+    "pipeline_gamma_min": 1,
+    "pipeline_gamma_max": 16,
+    "pipeline_gamma_step": 2,
+    "disable_target_cache_offload": true
+  },
   "topology": {
     "specedge_host": "127.0.0.1:18000",
     "fastsd_server_url": "http://127.0.0.1:18001",

@@ -247,6 +247,12 @@ def parse_arguments():
         help="max gamma allowed by pipeline adaptation",
     )
     parser.add_argument(
+        "--pipeline_gamma_step",
+        type=int,
+        default=2,
+        help="maximum gamma change per round during pipeline adaptation",
+    )
+    parser.add_argument(
         "--pipeline_ema_alpha",
         type=float,
         default=0.2,
@@ -281,6 +287,12 @@ def parse_arguments():
         parser.error("--prefill_chunk_quantum must be positive")
     if args.min_prefill_chunk_tokens > args.token_budget:
         parser.error("--min_prefill_chunk_tokens must not exceed --token_budget")
+    if args.pipeline_gamma_min < 1:
+        parser.error("--pipeline_gamma_min must be positive")
+    if args.pipeline_gamma_max < args.pipeline_gamma_min:
+        parser.error("--pipeline_gamma_max must be >= --pipeline_gamma_min")
+    if args.pipeline_gamma_step <= 0:
+        parser.error("--pipeline_gamma_step must be positive")
     if args.profile != "custom":
         # Baseline profiles must not be mixed with FastSD scheduler.
         if args.server_sched_mode == "fastsd":

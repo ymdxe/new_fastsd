@@ -15,6 +15,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 from src.engine import Decoding
 from src.util import parse_arguments
+from src.request_validation import canonicalize_request
 import uvicorn
 import time
 
@@ -25,6 +26,7 @@ app = FastAPI(title="FastSD Cloud Target Service")
 request_queue: Optional[mp.Queue] = None
 response_queue: Optional[mp.Queue] = None
 worker_proc: Optional[mp.Process] = None
+_request_max_tokens: int = 400
 
 # FastAPI 请求等待表
 _pending: Dict[str, asyncio.Future] = {}
@@ -262,8 +264,17 @@ async def prefill(req: PrefillRequest) -> dict:
         "current_time": req.current_time,
         "task_type": "prefill",
     }
+    try:
+        request_dict = canonicalize_request(
+            request_dict,
+            max_tokens=_request_max_tokens,
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     resp = await _enqueue_and_wait(request_dict, req_id)
+    if "error" in resp:
+        raise HTTPException(status_code=422, detail=str(resp["error"]))
     if "status" in resp:
         return {"session_id": req_id, "status": resp["status"]}
     return {"session_id": req_id, "status": "prefill_ok"}
@@ -293,8 +304,17 @@ async def verify(req: VerifyRequest) -> dict:
         "tail_only": req.tail_only,
         "has_bridge_token": req.has_bridge_token,
     }
+    try:
+        request_dict = canonicalize_request(
+            request_dict,
+            max_tokens=_request_max_tokens,
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     resp = await _enqueue_and_wait(request_dict, req_id)
+    if "error" in resp:
+        raise HTTPException(status_code=422, detail=str(resp["error"]))
     accepted = int(resp["accepted"])
     final_token = resp["final_token"]
     final_token_id = int(final_token.item()) if hasattr(final_token, "item") else int(
@@ -321,8 +341,9 @@ def exit_worker() -> dict:
 
 
 def main() -> None:
-    global request_queue, response_queue, worker_proc
+    global request_queue, response_queue, worker_proc, _request_max_tokens
     args = parse_arguments()
+    _request_max_tokens = int(args.max_tokens)
 
     ctx = mp.get_context("spawn")
     request_queue = ctx.Queue()

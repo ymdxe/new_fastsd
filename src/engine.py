@@ -14,7 +14,7 @@ from abc import ABC, abstractmethod
 from accelerate import Accelerator
 from .kvcache import KVCacheModel
 from .kvcache_batching import KVCacheModel_batching
-from .kvcache_varlen import varlen_generate
+from .kvcache_varlen import varlen_generate, supports_varlen_model
 from .kvcache4RC import KVCacheModel as KVCache2Model
 from .cache_offload_policy import should_offload_target_cache
 from .util import seed_everything, norm_logits, sample, max_fn
@@ -47,6 +47,7 @@ from .fastsd_scheduler import (
     update_length_thresholds as _update_length_thresholds,
     verify_logit_position,
 )
+from .request_validation import canonicalize_request
 
 
 class Decoding(ABC):
@@ -687,6 +688,16 @@ class Decoding(ABC):
                                         top_k=self.args.top_k,
                                         top_p=self.args.top_p)
         kv_cache_manager.vocab_size = self.vocab_size
+        requested_kv_batch_mode = getattr(self.args, "kv_batch_mode", "varlen")
+        if requested_kv_batch_mode == "varlen" and not supports_varlen_model(target_model):
+            # The padding-free implementation follows Qwen3 internals.  Keep
+            # the generic Llama/GPTQ service functional by falling back to the
+            # established Transformers cache path.
+            self.color_print(
+                "[KV] varlen is unsupported for this model; falling back to padded mode",
+                2,
+            )
+            requested_kv_batch_mode = "padded"
 
         # --------------------------- 队列与统计 ---------------------------
         task_queues = {
@@ -775,7 +786,7 @@ class Decoding(ABC):
             """
             batch : 同一种 task_type (全部 prefill or 全部 verify)
             """
-            kv_batch_mode = getattr(self.args, "kv_batch_mode", "varlen")
+            kv_batch_mode = requested_kv_batch_mode
             proc_ids = [req["proc_id"] for req in batch]
             # Mark this batch's caches as active for the whole forward +
             # rollback window so the async prefetch worker never evicts or
@@ -1160,6 +1171,9 @@ class Decoding(ABC):
                         quotient = min(1e9, max(0.0, draft_window / d_ema))
                         suggested = int(round(quotient))
                     suggested = max(min_gamma, min(max_gamma, suggested))
+                    gamma_step = max(1, int(getattr(self.args, "pipeline_gamma_step", 2)))
+                    suggested = max(req_gamma - gamma_step, min(req_gamma + gamma_step, suggested))
+                    suggested = max(min_gamma, min(max_gamma, suggested))
                     response_payload["suggested_gamma"] = suggested
                     if getattr(self.args, "debug_pipeline", False):
                         self.color_print(
@@ -1204,6 +1218,8 @@ class Decoding(ABC):
         # 且绝不触碰 active_pids（当前 batch 正在使用中的 cache）。
         prefetch_tasks = queue.Queue(maxsize=1)
         prefetch_stop = threading.Event()
+        prefetch_async_state = {"completed": 0, "moved": 0, "failed": 0}
+        prefetch_async_state_lock = threading.Lock()
 
         def _prefetch_worker():
             while not prefetch_stop.is_set():
@@ -1212,6 +1228,7 @@ class Decoding(ABC):
                 except queue.Empty:
                     continue
                 try:
+                    moved_count = 0
                     with cache_lock:
                         current = set(preloaded_gpu_pids)
                         stale = (current - desired) - active_pids
@@ -1256,6 +1273,7 @@ class Decoding(ABC):
                                 and cur.get_seq_length() == seq_len
                             ):
                                 kv_cache_manager._past_key_values[pid] = moved
+                                moved_count += 1
                     for pid, cache, seq_len in to_gpu_snapshot:
                         if cache is None:
                             continue
@@ -1269,9 +1287,15 @@ class Decoding(ABC):
                             ):
                                 kv_cache_manager._past_key_values[pid] = moved
                                 preloaded_gpu_pids.add(pid)
+                                moved_count += 1
+                    with prefetch_async_state_lock:
+                        prefetch_async_state["completed"] += 1
+                        prefetch_async_state["moved"] += moved_count
                 except Exception:
                     # A failed prefetch must never take down the target worker;
                     # it only degrades to the synchronous move path next round.
+                    with prefetch_async_state_lock:
+                        prefetch_async_state["failed"] += 1
                     continue
 
         prefetch_thread = threading.Thread(
@@ -1294,6 +1318,9 @@ class Decoding(ABC):
             "prefetch_evictions": 0,
             "prefetch_async_submitted": 0,
             "prefetch_async_dropped": 0,
+            "prefetch_async_completed": 0,
+            "prefetch_async_moved": 0,
+            "prefetch_async_failed": 0,
         }
 
         def _plan_queues():
@@ -1547,6 +1574,22 @@ class Decoding(ABC):
                 req["draft_output"] = draft_output
             return req
 
+        def canonicalize_ingress(req: dict):
+            """Validate one queue message without allowing worker termination."""
+            try:
+                req = tensorize_draft_output(req)
+                return canonicalize_request(
+                    req,
+                    max_tokens=int(getattr(self.args, "max_tokens", 400) or 400),
+                )
+            except (TypeError, ValueError, KeyError) as exc:
+                response_key = req.get("response_key", req.get("proc_id")) if isinstance(req, dict) else None
+                response_queue = response_queues.get(response_key) if response_key is not None else None
+                if response_queue is not None:
+                    response_queue.put({"error": str(exc)})
+                self.color_print(f"[REQUEST-REJECTED] {exc}", 2)
+                return None
+
         # Pipeline baseline: strict FCFS, single-request handling only.
         # No queue categorization, no batching, no preload, no priority scheduling.
         try:
@@ -1556,7 +1599,9 @@ class Decoding(ABC):
                         req = request_queue.get(timeout=0.01)
                         if req is None:
                             return
-                        req = tensorize_draft_output(req)
+                        req = canonicalize_ingress(req)
+                        if req is None:
+                            continue
                         if energy_service is not None:
                             energy_service.enter_active()
                         try:
@@ -1576,8 +1621,10 @@ class Decoding(ABC):
                         req = request_queue.get(timeout=0.01)
                         if req is None:  # 终止信号
                             return
-                        req = tensorize_draft_output(req)
-                        recent_prefix_lens.append(_safe_int(req["prefix_len"]))
+                        req = canonicalize_ingress(req)
+                        if req is None:
+                            continue
+                        recent_prefix_lens.append(req["prefix_len"])
                         len_r1, len_r2 = _update_length_thresholds(recent_prefix_lens)
                         cat = _length_category(req["prefix_len"], len_r1, len_r2)
                         work_id = str(req.get("work_id", f"{req['proc_id']}:{time.monotonic_ns()}"))
@@ -1632,6 +1679,10 @@ class Decoding(ABC):
             # Preserve scheduler evidence for the experiment report.  GPU
             # runs may terminate through the worker's normal shutdown path,
             # so best-effort persistence belongs in ``finally``.
+            with prefetch_async_state_lock:
+                scheduler_metrics["prefetch_async_completed"] = prefetch_async_state["completed"]
+                scheduler_metrics["prefetch_async_moved"] = prefetch_async_state["moved"]
+                scheduler_metrics["prefetch_async_failed"] = prefetch_async_state["failed"]
             self.last_generation_metrics["fastsd_scheduler"] = dict(scheduler_metrics)
             metrics_dir = getattr(self.args, "exp_name", None)
             if metrics_dir:

@@ -33,6 +33,27 @@ from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
 from .util import norm_logits, sample
 
 
+def supports_varlen_model(model) -> bool:
+    """Return whether the hand-fused path matches the model implementation.
+
+    The current implementation explicitly follows Qwen3's q/k RMS norms,
+    rotary embedding and decoder-layer layout.  Unsupported models must use
+    the legacy Transformers path instead of failing at runtime.
+    """
+    config = getattr(model, "config", None)
+    return bool(
+        getattr(config, "model_type", None) == "qwen3"
+        and hasattr(model, "model")
+        and hasattr(model.model, "layers")
+        and bool(model.model.layers)
+        and all(
+            hasattr(layer.self_attn, "q_norm")
+            and hasattr(layer.self_attn, "k_norm")
+            for layer in model.model.layers[:1]
+        )
+    )
+
+
 def varlen_generate(
     kv_manager,
     model,
