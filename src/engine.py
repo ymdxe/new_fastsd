@@ -708,6 +708,17 @@ class Decoding(ABC):
         # rollback window). The async prefetch worker must never touch these.
         active_pids = set()
 
+        def _safe_float(value, default=0.0) -> float:
+            """Sanitize a request-sourced float: JSON can carry inf/NaN or
+            non-numeric types, which must never reach arithmetic downstream."""
+            try:
+                f = float(value)
+            except (TypeError, ValueError):
+                return float(default)
+            if not math.isfinite(f):
+                return float(default)
+            return f
+
         def update_ema(store: dict, pid, value: float) -> float:
             alpha = float(getattr(self.args, "pipeline_ema_alpha", 0.2))
             old = store.get(pid, None)
@@ -1091,10 +1102,13 @@ class Decoding(ABC):
                     # （T_verify + RTT）内持续 proactive draft，所以
                     # T_edge_draft(gamma) ~= T_verify + RTT。
                     # Use online EMA to suggest per-session gamma for next round.
+                    # All request floats are sanitized first: JSON can carry
+                    # inf/NaN, and int(round(inf)) would crash the target
+                    # worker (remotely triggerable DoS).
                     drafted_tokens = max(1, req_gamma)
-                    edge_per_tok = float(req.get("lag", 0.0)) / drafted_tokens
+                    edge_per_tok = _safe_float(req.get("lag", 0.0)) / drafted_tokens
                     avg_cloud_total_ms = max(
-                        0.0, float(req.get("avg_cloud_total_ms", 0.0))
+                        0.0, _safe_float(req.get("avg_cloud_total_ms", 0.0))
                     )
                     # Use global average cloud_total_ms across all tasks when available.
                     # Fallback to local verify elapsed for warmup.
@@ -1102,7 +1116,8 @@ class Decoding(ABC):
                         avg_cloud_total_ms / 1000.0 if avg_cloud_total_ms > 0.0 else verify_elapsed
                     )
                     transport_rtt = max(
-                        0.0, float(req.get("transport_rtt", req.get("edge_rtt", 0.0)))
+                        0.0,
+                        _safe_float(req.get("transport_rtt", req.get("edge_rtt", 0.0))),
                     )
                     v_ema = update_ema(verify_time_ema, pid, max(1e-6, verify_budget))
                     rtt_ema = update_ema(edge_rtt_ema, pid, max(0.0, transport_rtt))
@@ -1121,9 +1136,13 @@ class Decoding(ABC):
                     max_gamma = int(getattr(self.args, "pipeline_gamma_max", 16))
                     if d_ema is None or d_ema <= 0:
                         suggested = int(getattr(self.args, "gamma", 4) or 4)
+                        draft_window = 0.0  # debug log below must stay defined
                     else:
                         draft_window = v_ema + rtt_ema
-                        suggested = int(round(draft_window / d_ema))
+                        # Clamp before int(): even sanitized inputs can push the
+                        # quotient past int range via extreme EMA values.
+                        quotient = min(1e9, max(0.0, draft_window / d_ema))
+                        suggested = int(round(quotient))
                     suggested = max(min_gamma, min(max_gamma, suggested))
                     response_payload["suggested_gamma"] = suggested
                     if getattr(self.args, "debug_pipeline", False):
@@ -1214,7 +1233,12 @@ class Decoding(ABC):
                             continue
                         moved = move_dynamic_cache_to(cache, "cpu")
                         with cache_lock:
-                            if pid not in active_pids and kv_cache_manager._past_key_values.get(pid) is cache:
+                            cur = kv_cache_manager._past_key_values.get(pid)
+                            if (
+                                pid not in active_pids
+                                and cur is cache
+                                and cur.get_seq_length() == seq_len
+                            ):
                                 kv_cache_manager._past_key_values[pid] = moved
                     for pid, cache, seq_len in to_gpu_snapshot:
                         if cache is None:
