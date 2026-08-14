@@ -43,7 +43,7 @@
     "fastsd_server_url": "http://127.0.0.1:18001",
     "specedge_target_device": "cuda:0",
     "specedge_draft_devices": ["cuda:0", "cuda:1"],
-    "standard_sd_target_device": "cuda:0",
+    "standard_sd_target_device": "cuda:2",
     "standard_sd_draft_device": "cuda:0"
   }
 }
