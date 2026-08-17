@@ -772,13 +772,14 @@ class Decoding(ABC):
         def move_dynamic_cache_to(cache, device):
             legacy_cache = cache.to_legacy_cache()
             current_device = legacy_cache[0][0].device  # 任意一层 key 的 device 作为参考
+            target_device = torch.device(device)
 
-            if str(current_device) == device:
+            if current_device == target_device:
                 return cache  # 已在目标设备上，无需迁移
 
             new_cache = []
             for k, v in legacy_cache:
-                new_cache.append((k.to(device), v.to(device)))
+                new_cache.append((k.to(target_device), v.to(target_device)))
             return DynamicCache.from_legacy_cache(new_cache)
 
         # --------------------- 批量处理（Prefill / Verify） ----------------
@@ -1218,7 +1219,12 @@ class Decoding(ABC):
         # 且绝不触碰 active_pids（当前 batch 正在使用中的 cache）。
         prefetch_tasks = queue.Queue(maxsize=1)
         prefetch_stop = threading.Event()
-        prefetch_async_state = {"completed": 0, "moved": 0, "failed": 0}
+        prefetch_async_state = {
+            "completed": 0,
+            "moved": 0,
+            "failed": 0,
+            "last_error": None,
+        }
         prefetch_async_state_lock = threading.Lock()
 
         def _prefetch_worker():
@@ -1291,11 +1297,18 @@ class Decoding(ABC):
                     with prefetch_async_state_lock:
                         prefetch_async_state["completed"] += 1
                         prefetch_async_state["moved"] += moved_count
-                except Exception:
+                except Exception as exc:
                     # A failed prefetch must never take down the target worker;
                     # it only degrades to the synchronous move path next round.
                     with prefetch_async_state_lock:
                         prefetch_async_state["failed"] += 1
+                        prefetch_async_state["last_error"] = (
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                    self.color_print(
+                        f"[KV-PREFETCH-FAILED] {type(exc).__name__}: {exc}",
+                        2,
+                    )
                     continue
 
         prefetch_thread = threading.Thread(
@@ -1335,10 +1348,10 @@ class Decoding(ABC):
         def prefetch_next_plan():
             """Use the same pure planner for the next cache residency hint.
 
-            Called from the main loop right before ``schedule_iteration`` so
-            the queue snapshot contains the *next* round's candidates (after
-            the previous round was committed). Called after ingress so newly
-            drained WorkItems are included. When target-cache offload is
+            Called after ``schedule_iteration`` so the queue snapshot contains
+            the *next* round's candidates and the current batch has left
+            ``active_pids``. Called after ingress so newly drained WorkItems
+            are included. When target-cache offload is
             disabled the KV already stays resident on the GPU and the
             prefetch/evict cycle is a no-op, so skip it entirely.
 
@@ -1661,13 +1674,12 @@ class Decoding(ABC):
 
                 if any(not q.empty() for t in task_queues.values() for q in t.values()):
                     scheduler_metrics["iterations"] += 1
-                    # Prefetch before planning: the queue snapshot now holds
-                    # the next round's candidates, so the residency hint
-                    # covers the WorkItems the upcoming plan will actually
-                    # verify (previously it ran after commit and always saw
-                    # an empty candidate set).
-                    prefetch_next_plan()
                     schedule_iteration()
+                    # The current batch has now committed and released
+                    # active_pids.  Predict the next plan only after that
+                    # point; predicting before execution selects the same
+                    # WorkItems and the worker correctly rejects them.
+                    prefetch_next_plan()
                 else:
                     time.sleep(0.01)
         finally:
@@ -1683,6 +1695,7 @@ class Decoding(ABC):
                 scheduler_metrics["prefetch_async_completed"] = prefetch_async_state["completed"]
                 scheduler_metrics["prefetch_async_moved"] = prefetch_async_state["moved"]
                 scheduler_metrics["prefetch_async_failed"] = prefetch_async_state["failed"]
+                scheduler_metrics["prefetch_async_last_error"] = prefetch_async_state["last_error"]
             self.last_generation_metrics["fastsd_scheduler"] = dict(scheduler_metrics)
             metrics_dir = getattr(self.args, "exp_name", None)
             if metrics_dir:

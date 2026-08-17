@@ -213,6 +213,33 @@ class FastSDSchedulerTests(unittest.TestCase):
         self.assertEqual(item.cursor, 8)
         self.assertEqual(item.state, "ready")
 
+    def test_plan_after_commit_selects_next_item_for_prefetch(self):
+        first = self._item("v1", "verify", "short", 4)
+        second = self._item("v2", "verify", "short", 4)
+        queues = {
+            "verify": {"short": [first, second], "mid": [], "long": []},
+            "prefill": {"short": [], "mid": [], "long": []},
+        }
+        current = plan_iteration(
+            queues,
+            token_budget=4,
+            max_num_seqs=1,
+            min_prefill_chunk_tokens=4,
+        )
+        reserve_admission_plan(current)
+        commit_admission_plan(current, completed_work_ids={"v1"})
+
+        lookahead = plan_iteration(
+            queues,
+            token_budget=4,
+            current_cycle=current.next_cycle,
+            wrr_cursor=current.next_wrr_cursor,
+            max_num_seqs=1,
+            min_prefill_chunk_tokens=4,
+        )
+        self.assertEqual(current.verify_proc_ids, ["v1"])
+        self.assertEqual(lookahead.verify_proc_ids, ["v2"])
+
     def test_overdue_prefill_overrides_verify_within_category(self):
         verify = self._item("v1", "verify", "short", 4)
         prefill = self._item("p1", "prefill", "short", 20, missed=2)
