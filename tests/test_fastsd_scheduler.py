@@ -236,6 +236,7 @@ class FastSDSchedulerTests(unittest.TestCase):
             wrr_cursor=current.next_wrr_cursor,
             max_num_seqs=1,
             min_prefill_chunk_tokens=4,
+            reserved_work_ids=current.selected_work_ids,
         )
         self.assertEqual(current.verify_proc_ids, ["v1"])
         self.assertEqual(lookahead.verify_proc_ids, ["v2"])

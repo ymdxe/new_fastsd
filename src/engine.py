@@ -1345,13 +1345,13 @@ class Decoding(ABC):
                 for task_type in ("verify", "prefill")
             }
 
-        def prefetch_next_plan():
+        def prefetch_next_plan(reserved_work_ids=()):
             """Use the same pure planner for the next cache residency hint.
 
-            Called after ``schedule_iteration`` so the queue snapshot contains
-            the *next* round's candidates and the current batch has left
-            ``active_pids``. Called after ingress so newly drained WorkItems
-            are included. When target-cache offload is
+            Called after ingress so newly drained WorkItems are included. The
+            caller may reserve the WorkItems in the current plan, making this
+            a true lookahead rather than selecting the batch that is about to
+            become active. When target-cache offload is
             disabled the KV already stays resident on the GPU and the
             prefetch/evict cycle is a no-op, so skip it entirely.
 
@@ -1376,6 +1376,7 @@ class Decoding(ABC):
                 prefill_chunk_quantum=int(self.args.prefill_chunk_quantum),
                 accept_stats=accept_stats,
                 now=time.time(),
+                reserved_work_ids=reserved_work_ids,
             )
             desired = set(next_plan.verify_proc_ids)
             with cache_lock:
@@ -1459,10 +1460,9 @@ class Decoding(ABC):
             req["_chunked_internal"] = True
             return req
 
-        def schedule_iteration():
-            queues_for_plan = _plan_queues()
-            plan = plan_iteration(
-                queues_for_plan,
+        def build_plan(reserved_work_ids=()):
+            return plan_iteration(
+                _plan_queues(),
                 token_budget=int(self.args.token_budget),
                 current_cycle=scheduler_state["current_cycle"],
                 wrr_cursor=scheduler_state["wrr_cursor"],
@@ -1471,7 +1471,12 @@ class Decoding(ABC):
                 prefill_chunk_quantum=int(self.args.prefill_chunk_quantum),
                 accept_stats=accept_stats,
                 now=time.time(),
+                reserved_work_ids=reserved_work_ids,
             )
+
+        def schedule_iteration(plan=None):
+            if plan is None:
+                plan = build_plan()
             if not plan.selected_work_ids:
                 return plan
             reserve_admission_plan(plan)
@@ -1674,12 +1679,14 @@ class Decoding(ABC):
 
                 if any(not q.empty() for t in task_queues.values() for q in t.values()):
                     scheduler_metrics["iterations"] += 1
-                    schedule_iteration()
-                    # The current batch has now committed and released
-                    # active_pids.  Predict the next plan only after that
-                    # point; predicting before execution selects the same
-                    # WorkItems and the worker correctly rejects them.
-                    prefetch_next_plan()
+                    current_plan = build_plan()
+                    # Predict the next plan before execution, but reserve the
+                    # current plan's WorkItems.  The worker can then move
+                    # future caches while this batch owns active_pids.
+                    prefetch_next_plan(
+                        reserved_work_ids=current_plan.selected_work_ids
+                    )
+                    schedule_iteration(current_plan)
                 else:
                     time.sleep(0.01)
         finally:
