@@ -8,6 +8,7 @@ import hashlib
 import json
 import statistics
 import sys
+from datetime import datetime, timezone
 from collections import defaultdict
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -44,6 +45,7 @@ def output_layout(config: dict[str, Any]) -> dict[str, Any]:
         "canonical": local_root / "inputs" / "canonical.jsonl",
         "linux_canonical": linux_root / "inputs" / "canonical.jsonl",
         "manifest": local_root / "run_manifest.json",
+        "commands": local_root / "commands.txt",
         "specedge_config": local_root / "specedge" / "specedge.yaml",
         "linux_specedge_config": linux_root / "specedge" / "specedge.yaml",
     }
@@ -121,6 +123,16 @@ def render_specedge_config(config: dict[str, Any], workload_hash: str, layout: d
     return "\n".join(lines) + "\n"
 
 
+def _append_command_record(path: Path, config_path: str | Path, body: str) -> None:
+    """Append a timestamped, copyable command block to the run directory."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).isoformat()
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(f"\n# command_record_utc: {timestamp}\n")
+        handle.write(f"# config: {config_path}\n")
+        handle.write(body.rstrip() + "\n")
+
+
 def prepare(config_path: str) -> int:
     config = load_config(config_path)
     layout = output_layout(config)
@@ -155,8 +167,14 @@ def prepare(config_path: str) -> int:
         "methods": ["fastsd", "specedge", "standard_sd", "draft_only"],
     }
     write_json(manifest, layout["manifest"])
+    _append_command_record(
+        layout["commands"],
+        config_path,
+        f"cd {REPO_ROOT} && python scripts/eval_suite.py prepare --config {config_path}",
+    )
     print(json.dumps(manifest, indent=2, ensure_ascii=False))
     print(f"SpecEdge config: {layout['specedge_config']}")
+    print(f"Command record: {layout['commands']}")
     return 0
 
 
@@ -187,62 +205,55 @@ def print_plan(config_path: str) -> int:
     integration = f"{repo}/baselines/specedge/integration"
     official = f"{repo}/baselines/specedge/official"
     specedge_raw = f"{layout['linux_root']}/specedge/raw/{run_id}"
-    print("[两台服务器：先生成完全相同的 workload 文件]")
-    print(f"cd {repo} && /home/hdd/zhangh/envs/fastsd/bin/python scripts/eval_suite.py prepare --config {config_path}")
-    print("\n[node1：到 node2 的两个本地端口隧道]")
-    print("ssh -N -L 18000:127.0.0.1:8000 -L 18001:127.0.0.1:8001 zhangh@node2.sanzo.top")
-    print("\n[node2：FastSD target（FastSD 模式）]")
-    print(
-        f"cd {repo} && FASTSD_TARGET_DEVICE={topology['standard_sd_target_device']} "
-        f"/home/hdd/zhangh/envs/fastsd/bin/python cloud/cloud_service.py "
-        f"--target_model {models['target']} --draft_model {models['draft']} --dataset {dataset} "
-        "--server_sched_mode fastsd"
+    plan = "\n".join(
+        [
+            "[两台服务器：先生成完全相同的 workload 文件]",
+            f"cd {repo} && /home/hdd/zhangh/envs/fastsd/bin/python scripts/eval_suite.py prepare --config {config_path}",
+            "\n[node1：到 node2 的两个本地端口隧道]",
+            "ssh -N -L 18000:127.0.0.1:8000 -L 18001:127.0.0.1:8001 node2",
+            "\n[node2：FastSD target（FastSD 模式）]",
+            f"cd {repo} && FASTSD_TARGET_DEVICE={topology['standard_sd_target_device']} "
+            f"/home/hdd/zhangh/envs/fastsd/bin/python cloud/cloud_service.py "
+            f"--target_model {models['target']} --draft_model {models['draft']} --dataset {dataset} "
+            "--server_sched_mode fastsd",
+            "\n[node1：FastSD 方法]",
+            f"cd {repo} && SERVER_URL={topology['fastsd_server_url']} bash scripts/run_fastsd_profile.sh "
+            f"comparison/{run_id}/fastsd {common} --num_drafts {len(topology['specedge_draft_devices'])} "
+            f"--edge_gpus {len(topology['specedge_draft_devices'])} "
+            f"--arrival_distribution {config['dataset']['arrival_distribution']} "
+            f"--arrival_rate {config['dataset']['arrival_rate_rps']} "
+            f"--arrival_seed {config['dataset']['arrival_seed']}",
+            "\n[node2：官方 SpecEdge server，使用 canonical dataset hook]",
+            f"cd {repo} && FASTSD_EVAL_ROLE=server "
+            f"FASTSD_EVAL_DATASET_FILE={layout['linux_canonical']} "
+            f"PYTHONPATH={integration}:{official}/src "
+            f"/home/hdd/zhangh/envs/specedge/bin/python -O {integration}/server.py "
+            f"--config {layout['linux_specedge_config']} --host 127.0.0.1 --port 18000",
+            "\n[node1：适配后的 SpecEdge clients]",
+            f"cd {repo} && /home/hdd/zhangh/envs/specedge/bin/python {integration}/client_host.py "
+            f"--config {layout['linux_specedge_config']}",
+            "\n[node2：停止 FastSD target 后，以 vanilla 调度重启 target]",
+            f"cd {repo} && FASTSD_TARGET_DEVICE={topology['standard_sd_target_device']} "
+            f"/home/hdd/zhangh/envs/fastsd/bin/python cloud/cloud_service.py "
+            f"--target_model {models['target']} --draft_model {models['draft']} --dataset {dataset} "
+            "--server_sched_mode vanilla",
+            "\n[node1：标准投机解码（同样的 A5000 draft + 网络 + A6000 target）]",
+            f"cd {repo} && SERVER_URL={topology['fastsd_server_url']} bash scripts/run_vanilla_profile.sh "
+            f"vanilla comparison/{run_id}/standard_sd {common} "
+            f"--num_drafts {len(topology['specedge_draft_devices'])} "
+            f"--edge_gpus {len(topology['specedge_draft_devices'])} "
+            f"--arrival_distribution {config['dataset']['arrival_distribution']} "
+            f"--arrival_rate {config['dataset']['arrival_rate_rps']} "
+            f"--arrival_seed {config['dataset']['arrival_seed']}",
+            "\n[node1：仅 Draft 模型，同数量 A5000 worker]",
+            f"cd {repo} && /home/hdd/zhangh/envs/fastsd/bin/python benchmark/eval_draft_pool.py "
+            f"--config {config_path}",
+            f"\n[SpecEdge raw result expected at {specedge_raw}]",
+        ]
     )
-    print("\n[node1：FastSD 方法]")
-    print(
-        f"cd {repo} && SERVER_URL={topology['fastsd_server_url']} bash scripts/run_fastsd_profile.sh "
-        f"comparison/{run_id}/fastsd {common} --num_drafts {len(topology['specedge_draft_devices'])} "
-        f"--edge_gpus {len(topology['specedge_draft_devices'])} "
-        f"--arrival_distribution {config['dataset']['arrival_distribution']} "
-        f"--arrival_rate {config['dataset']['arrival_rate_rps']} "
-        f"--arrival_seed {config['dataset']['arrival_seed']}"
-    )
-    print("\n[node2：官方 SpecEdge server，使用 canonical dataset hook]")
-    print(
-        f"cd {repo} && FASTSD_EVAL_ROLE=server "
-        f"FASTSD_EVAL_DATASET_FILE={layout['linux_canonical']} "
-        f"PYTHONPATH={integration}:{official}/src "
-        f"/home/hdd/zhangh/envs/specedge/bin/python -O {integration}/server.py "
-        f"--config {layout['linux_specedge_config']} --host 127.0.0.1 --port 18000"
-    )
-    print("\n[node1：适配后的 SpecEdge clients]")
-    print(
-        f"cd {repo} && /home/hdd/zhangh/envs/specedge/bin/python {integration}/client_host.py "
-        f"--config {layout['linux_specedge_config']}"
-    )
-    print("\n[node2：停止 FastSD target 后，以 vanilla 调度重启 target]")
-    print(
-        f"cd {repo} && FASTSD_TARGET_DEVICE={topology['standard_sd_target_device']} "
-        f"/home/hdd/zhangh/envs/fastsd/bin/python cloud/cloud_service.py "
-        f"--target_model {models['target']} --draft_model {models['draft']} --dataset {dataset} "
-        "--server_sched_mode vanilla"
-    )
-    print("\n[node1：标准投机解码（同样的 A5000 draft + 网络 + A6000 target）]")
-    print(
-        f"cd {repo} && SERVER_URL={topology['fastsd_server_url']} bash scripts/run_vanilla_profile.sh "
-        f"vanilla comparison/{run_id}/standard_sd {common} "
-        f"--num_drafts {len(topology['specedge_draft_devices'])} "
-        f"--edge_gpus {len(topology['specedge_draft_devices'])} "
-        f"--arrival_distribution {config['dataset']['arrival_distribution']} "
-        f"--arrival_rate {config['dataset']['arrival_rate_rps']} "
-        f"--arrival_seed {config['dataset']['arrival_seed']}"
-    )
-    print("\n[node1：仅 Draft 模型，同数量 A5000 worker]")
-    print(
-        f"cd {repo} && /home/hdd/zhangh/envs/fastsd/bin/python benchmark/eval_draft_pool.py "
-        f"--config {config_path}"
-    )
-    print(f"\n[SpecEdge raw result expected at {specedge_raw}]")
+    print(plan)
+    _append_command_record(layout["commands"], config_path, plan)
+    print(f"\nCommand record: {layout['commands']}")
     return 0
 
 

@@ -81,6 +81,11 @@ cd /home/hdd/zhangh/workspace/new_fastsd
   --config configs/evaluation/qwen3_8b_0.6b_humaneval.json
 ```
 
+`prepare` 和 `plan` 会把带 UTC 时间戳的命令块追加保存到
+`exp/comparison/<run_id>/commands.txt`。FastSD 和 standard SD 的 Edge 启动脚本还会在
+实际启动前，把最终展开后的 `python edge/edge.py ...` 命令追加到各自实验目录的
+`commands.txt`，因此该文件同时保留计划命令和实际执行命令。
+
 四种方法应顺序运行，避免互相抢 GPU。FastSD 与 standard SD 共用 8001 端口，但需要
 分别以 `fastsd` 和 `vanilla` 调度模式启动 target。若 node2 的 8000 已被占用，SpecEdge
 使用 `baselines/specedge/integration/server.py --host 127.0.0.1 --port 18000`；它只替换
