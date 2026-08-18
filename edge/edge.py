@@ -532,9 +532,15 @@ class EdgeRunner(Decoding):
         arrival_barrier=None,
         arrival_start_time=None,
     ):
-        gpu_id = (proc_id % max(1, self.args.edge_gpus)) + self.args.edge_gpu_start
-        device = f"cuda:{gpu_id}"
-        self.color_print(f"[Edge {proc_id}] loading draft model on {device}", 3)
+        # Support CPU device for draft workers
+        use_cpu = getattr(self.args, "edge_use_cpu", False)
+        if use_cpu:
+            device = "cpu"
+            self.color_print(f"[Edge {proc_id}] loading draft model on CPU", 3)
+        else:
+            gpu_id = (proc_id % max(1, self.args.edge_gpus)) + self.args.edge_gpu_start
+            device = f"cuda:{gpu_id}"
+            self.color_print(f"[Edge {proc_id}] loading draft model on {device}", 3)
 
         draft_model = self._load_draft_model(self.args.draft_model, device)
 
