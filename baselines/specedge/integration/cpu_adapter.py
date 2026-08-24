@@ -55,6 +55,16 @@ class CPUCompatibleSpecEdgeEngine:
         cache_seq_indices: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> torch.Tensor:
+        # ``KVCache.update`` uses ``seq_indices`` to select the source
+        # positions from the model's per-call K/V tensors.  The official
+        # CUDA GraphEngine sets this while capturing each beam-width graph;
+        # the CPU path has no capture step, so it must set the same mapping
+        # for every forward.  ``cache_seq_indices`` are tree destinations and
+        # may be sparse (for example [2, 4, 5]), so they must not be reused as
+        # source indices here.
+        self._past_key_values.seq_indices = torch.arange(
+            input_ids.size(1), device=self._device, dtype=torch.long
+        )
         return self._model.forward(
             input_ids=input_ids,
             position_ids=position_ids,
