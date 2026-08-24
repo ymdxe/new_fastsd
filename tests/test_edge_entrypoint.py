@@ -1,4 +1,6 @@
 import importlib.util
+import multiprocessing.spawn as mp_spawn
+import os
 import py_compile
 from pathlib import Path
 import sys
@@ -95,6 +97,8 @@ class EdgeEntrypointTests(unittest.TestCase):
         self.assertIn("configure_torch_threads", source)
         self.assertIn("resolve_dtype", source)
         self.assertIn("if torch.cuda.is_available()", source)
+        self.assertIn("configure_spawn_executable()", source)
+        self.assertIn("mp.set_executable(executable)", source)
 
     def test_cpu_non_gptq_import_and_load_do_not_require_auto_gptq(self):
         edge_module, fake_auto_model = _load_edge_with_auto_gptq_blocked()
@@ -118,6 +122,37 @@ class EdgeEntrypointTests(unittest.TestCase):
             with patch.object(edge_module.os.path, "exists", return_value=True):
                 with self.assertRaisesRegex(RuntimeError, "GPTQ draft requested.*auto_gptq"):
                     runner._load_draft_model(model_dir, "cpu")
+
+    def test_spawn_uses_explicit_python_wrapper(self):
+        edge_module, _ = _load_edge_with_auto_gptq_blocked()
+        wrapper = sys.executable
+        expected_wrapper = os.path.abspath(os.path.expanduser(wrapper))
+        previous_wrapper = mp_spawn.get_executable()
+        try:
+            with patch.dict(os.environ, {"PYTHON_BIN": wrapper}):
+                configured = edge_module.configure_spawn_executable()
+            self.assertEqual(configured, expected_wrapper)
+            self.assertEqual(mp_spawn.get_executable(), expected_wrapper)
+        finally:
+            edge_module.mp.set_executable(previous_wrapper)
+
+    def test_invalid_python_wrapper_fails_clearly(self):
+        edge_module, _ = _load_edge_with_auto_gptq_blocked()
+        invalid_wrapper = "/missing/fastsd/python314_glibc"
+        with patch.dict(os.environ, {"PYTHON_BIN": invalid_wrapper}):
+            with patch.object(edge_module.os.path, "isfile", return_value=False):
+                with self.assertRaisesRegex(FileNotFoundError, "PYTHON_BIN"):
+                    edge_module.configure_spawn_executable()
+
+    def test_missing_python_wrapper_preserves_multiprocessing_default(self):
+        edge_module, _ = _load_edge_with_auto_gptq_blocked()
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PYTHON_BIN", None)
+            with patch.object(edge_module.mp, "set_executable") as set_executable:
+                configured = edge_module.configure_spawn_executable()
+
+        self.assertIsNone(configured)
+        set_executable.assert_not_called()
 
 
 if __name__ == "__main__":

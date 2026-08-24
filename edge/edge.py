@@ -24,6 +24,34 @@ from src.runtime import configure_torch_threads, resolve_dtype
 from src.util import parse_arguments, seed_everything
 
 
+def configure_spawn_executable() -> str | None:
+    """Use an explicitly configured Python wrapper for spawn children.
+
+    Python's spawn implementation otherwise derives the child executable from
+    ``sys.executable``.  On node3 that would bypass the glibc-compatible
+    ``PYTHON_BIN`` wrapper and launch the incompatible interpreter directly.
+    With no override, leave multiprocessing's normal interpreter selection
+    untouched.
+    """
+
+    configured = os.environ.get("PYTHON_BIN")
+    if configured is None:
+        return None
+    if not configured:
+        raise ValueError("PYTHON_BIN is set but empty; provide an executable Python wrapper")
+
+    executable = os.path.abspath(os.path.expanduser(configured))
+    if not os.path.isfile(executable):
+        raise FileNotFoundError(
+            f"PYTHON_BIN does not point to a regular file: {executable}"
+        )
+    if not os.access(executable, os.X_OK):
+        raise PermissionError(f"PYTHON_BIN is not executable: {executable}")
+
+    mp.set_executable(executable)
+    return executable
+
+
 class EdgeClient:
     """边缘端 HTTP 客户端，负责与云端 target 服务通信。"""
 
@@ -583,6 +611,7 @@ class EdgeRunner(Decoding):
         self.color_print(f"[METRICS] wrote summary: {summary_path}", 2)
 
     def eval(self):
+        configure_spawn_executable()
         if torch.cuda.is_available():
             torch.cuda.init()
         torch.multiprocessing.set_start_method("spawn", force=True)
