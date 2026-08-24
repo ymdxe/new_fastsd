@@ -12,6 +12,7 @@ from .run_artifacts import require_unique_sample_ids, write_json_once, write_tex
 
 FOUR_METHODS = ("fastsd", "specedge_cpu_adapted", "standard_sd", "draft_only")
 ORACLE_METHOD = "target_only"
+EXACT_GATE_METHODS = ("fastsd", "specedge_cpu_adapted", "standard_sd")
 
 
 def _token_ids(record: dict[str, Any]) -> list[int]:
@@ -137,6 +138,98 @@ def summarize_token_parity(
             ),
         }
     return result
+
+
+def exact_gate_summary(
+    rows: Iterable[dict[str, Any]],
+    *,
+    methods: Iterable[str] = EXACT_GATE_METHODS,
+    reference_method: str = ORACLE_METHOD,
+    expected_sample_ids: Iterable[str] | None = None,
+    sample_ids_by_method: dict[str, Iterable[str]] | None = None,
+) -> dict[str, Any]:
+    """Return an auditable exact-token gate for target-based methods.
+
+    ``draft_only`` may be present in the report, but it is intentionally not
+    included in the enforced method list.  Missing tails, missing samples, and
+    reference tails are all failures for an enforced method.
+    """
+
+    rows_list = list(rows)
+    method_names = list(methods)
+    expected_ids = {str(sample_id) for sample_id in (expected_sample_ids or ())}
+    observed_methods = set()
+    for row in rows_list:
+        observed_methods.update(str(key) for key in row.get("token_ids", {}))
+
+    results: dict[str, Any] = {}
+    for method in method_names:
+        missing = 0
+        mismatch = 0
+        reference_missing = 0
+        mismatching_samples: set[str] = set()
+        available_ids = {
+            str(sample_id)
+            for sample_id in (sample_ids_by_method or {}).get(method, ())
+        }
+        if expected_ids and available_ids:
+            missing_samples = expected_ids - available_ids
+            extra_samples = available_ids - expected_ids
+        elif expected_ids and method not in (sample_ids_by_method or {}):
+            missing_samples = set(expected_ids)
+            extra_samples = set()
+        else:
+            missing_samples = set()
+            extra_samples = set()
+        mismatching_samples.update(missing_samples | extra_samples)
+        for row in rows_list:
+            token_ids = row.get("token_ids", {})
+            token = token_ids.get(method)
+            reference_token = row.get("reference_token_id")
+            if reference_token is None:
+                reference_missing += 1
+                if token is not None:
+                    mismatch += 1
+                    mismatching_samples.add(str(row.get("sample_id")))
+            elif token is None:
+                missing += 1
+                mismatching_samples.add(str(row.get("sample_id")))
+            elif token != reference_token:
+                mismatch += 1
+                mismatching_samples.add(str(row.get("sample_id")))
+        method_missing = method not in observed_methods
+        if method_missing and rows_list:
+            missing += len(rows_list)
+        gate_pass = not (
+            method_missing
+            or missing
+            or mismatch
+            or reference_missing
+            or missing_samples
+            or extra_samples
+        )
+        results[method] = {
+            "gate_enforced": True,
+            "gate_pass": gate_pass,
+            "comparison_count": len(rows_list),
+            "missing": missing,
+            "missing_samples": sorted(missing_samples),
+            "extra_samples": sorted(extra_samples),
+            "mismatch": mismatch,
+            "reference_missing": reference_missing,
+            "mismatching_samples": sorted(mismatching_samples),
+        }
+
+    return {
+        "reference_method": reference_method,
+        "gate_methods": method_names,
+        "report_only_methods": [
+            method for method in FOUR_METHODS if method not in method_names
+        ],
+        "total_comparison_rows": len(rows_list),
+        "methods": results,
+        "gate_pass": all(item["gate_pass"] for item in results.values()),
+    }
 
 
 def write_token_parity_report(

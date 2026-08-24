@@ -11,6 +11,8 @@
   },
   "models": {
     "draft": "/path/to/models/Qwen3-1.7B",
+    "node3_draft": "/path/to/node3/models/Qwen3-1.7B",
+    "node2_draft": "/path/to/node2/models/Qwen3-1.7B",
     "target": "/path/to/models/Qwen3-8B"
   },
   "generation": {
@@ -53,6 +55,12 @@
   "execution": {
     "python": "python",
     "specedge_python": "python",
-    "target_python": "python"
+    "target_python": "python",
+    "node3_repo": "/path/to/fastsd-node3",
+    "node2_repo": "/path/to/fastsd-node2",
+    "node3_edge_python": "python",
+    "node3_specedge_python": "python",
+    "node2_target_python": "python",
+    "node2_specedge_python": "python"
   }
 }

@@ -225,6 +225,11 @@ def run(config_path: str) -> int:
         raise FileExistsError(f"refusing to overwrite existing draft-only output: {output_dir / 'requests.jsonl'}")
 
     threads = config["topology"].get("draft_threads")
+    draft_model = (
+        config["models"].get("node3_draft")
+        or config.get("node3_draft")
+        or config["models"]["draft"]
+    )
 
     ctx = mp.get_context("spawn")
     barrier = ctx.Barrier(len(devices))
@@ -240,7 +245,7 @@ def run(config_path: str) -> int:
                 worker_idx,
                 device,
                 records,
-                config["models"]["draft"],
+                draft_model,
                 config["generation"],
                 str(output_path),
                 barrier,
@@ -281,7 +286,7 @@ def run(config_path: str) -> int:
             else "quality"
         ),
         extra={
-            "draft_model": config["models"]["draft"],
+            "draft_model": draft_model,
             "num_workers": len(devices),
             "draft_threads": threads,
             "warmup_requests_per_worker": int(config["topology"].get("warmup_requests", 0)),

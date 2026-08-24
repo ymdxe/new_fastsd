@@ -27,6 +27,18 @@ DATASET_MATRIX = {
     "gsm8k": {"max_requests": 1319, "mt_bench_turn_policy": "not_applicable"},
     "mt_bench": {"max_requests": 80, "mt_bench_turn_policy": "first_turn_only"},
 }
+DATASET_SUFFIXES = tuple(f"_{name}" for name in DATASET_MATRIX)
+
+
+def stable_run_id(base_run_id: str, dataset_name: str) -> str:
+    """Append exactly one canonical dataset suffix to a base run ID."""
+
+    stem = str(base_run_id)
+    for suffix in sorted(DATASET_SUFFIXES, key=len, reverse=True):
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
+    return f"{stem}_{dataset_name}"
 
 
 def _sha256(path: Path) -> str:
@@ -42,7 +54,7 @@ def generate_matrix(base_path: str | Path, output_dir: str | Path, data_root: st
     generated: list[dict[str, Any]] = []
     for dataset_name, details in DATASET_MATRIX.items():
         config = copy.deepcopy(base)
-        config["run_id"] = f"{base_run_id}_{dataset_name}"
+        config["run_id"] = stable_run_id(base_run_id, dataset_name)
         config["dataset"] = {
             **config.get("dataset", {}),
             "name": dataset_name,

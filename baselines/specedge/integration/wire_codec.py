@@ -60,6 +60,18 @@ class ExplicitSpecEdgeGrpcClient:
         self._codec = codec
         self._channel = grpc.aio.insecure_channel(self._host)
         self._stub = specedge_pb2_grpc.SpecEdgeServiceStub(self._channel)
+        self._request_bytes = 0
+        self._response_bytes = 0
+        self._rpc_count = 0
+
+    def snapshot_stats(self) -> dict[str, int]:
+        """Return measured application-layer protobuf bytes and RPC count."""
+
+        return {
+            "request_bytes": int(self._request_bytes),
+            "response_bytes": int(self._response_bytes),
+            "rpc_count": int(self._rpc_count),
+        }
 
     async def request(
         self,
@@ -89,10 +101,12 @@ class ExplicitSpecEdgeGrpcClient:
             prefix=prefix,
         )
         response = await self._stub.Validate(request)
+        self._request_bytes += request.ByteSize()
+        self._response_bytes += response.ByteSize()
+        self._rpc_count += 1
         return self._codec.decode(
             response.selection,
             device=self._device,
             dtype=torch.long,
             shape=input_ids.size(-1),
         ), response.prefill
-

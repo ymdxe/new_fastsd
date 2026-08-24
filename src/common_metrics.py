@@ -68,7 +68,14 @@ def paired_bootstrap_ci(
         if left[sample_id].get(key) is not None and right[sample_id].get(key) is not None
     ]
     if not pairs:
-        return {"n": 0, "mean_delta": None, "ci95": None, "definition": f"{key} method-baseline"}
+        return {
+            "n": 0,
+            "mean_delta": None,
+            "ci95": None,
+            "seed": int(seed),
+            "iterations": int(iterations),
+            "definition": f"{key} method-baseline",
+        }
     deltas = [left_value - right_value for left_value, right_value in pairs]
     mean_delta = statistics.mean(deltas)
     if len(deltas) == 1:
@@ -84,7 +91,98 @@ def paired_bootstrap_ci(
         "n": len(deltas),
         "mean_delta": mean_delta,
         "ci95": interval,
+        "seed": int(seed),
+        "iterations": int(iterations),
         "definition": f"{key} method-baseline, paired by {sample_key}",
+    }
+
+
+def _with_derived_throughput(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Copy records and expose per-request output throughput for paired analysis."""
+
+    result: list[dict[str, Any]] = []
+    for record in records:
+        item = dict(record)
+        if item.get("throughput_tok_s") is None:
+            e2e_ms = item.get("e2e_ms")
+            generated = item.get("generated_tokens")
+            if e2e_ms is not None and generated is not None and float(e2e_ms) > 0:
+                item["throughput_tok_s"] = float(generated) / (float(e2e_ms) / 1000.0)
+        result.append(item)
+    return result
+
+
+def paired_method_analysis(
+    method_records: Iterable[dict[str, Any]],
+    baseline_records: Iterable[dict[str, Any]],
+    *,
+    method: str = "fastsd",
+    baseline: str = "specedge_cpu_adapted",
+    sample_key: str = "sample_id",
+    seed: int = 42,
+    iterations: int = 10_000,
+) -> dict[str, Any]:
+    """Compare two methods directly with deterministic sample-id pairing.
+
+    Latency metrics use ``baseline - method`` as improvement, while throughput
+    uses ``method - baseline``.  The bootstrap is performed on paired deltas;
+    the reported percentage CI scales that delta interval by the baseline
+    mean, which keeps the output dependency-free and auditable.
+    """
+
+    left = _with_derived_throughput(method_records)
+    right = _with_derived_throughput(baseline_records)
+    metric_directions = {
+        "ttft_ms": "lower_is_better",
+        "e2e_ms": "lower_is_better",
+        "tpot_ms": "lower_is_better",
+        "throughput_tok_s": "higher_is_better",
+    }
+    metrics: dict[str, Any] = {}
+    for key, direction in metric_directions.items():
+        ci = paired_bootstrap_ci(
+            left,
+            right,
+            key=key,
+            sample_key=sample_key,
+            seed=seed,
+            iterations=iterations,
+        )
+        left_by_id = {str(item.get(sample_key)): item for item in left}
+        baseline_values = [
+            float(item[key])
+            for item in right
+            if item.get(sample_key) is not None
+            and item.get(key) is not None
+            and left_by_id.get(str(item.get(sample_key)), {}).get(key) is not None
+        ]
+        baseline_mean = statistics.mean(baseline_values) if baseline_values else None
+        sign = -1.0 if direction == "lower_is_better" else 1.0
+        if baseline_mean and ci["mean_delta"] is not None:
+            improvement_pct = sign * float(ci["mean_delta"]) / baseline_mean * 100.0
+            ci_pct = [
+                sign * float(ci["ci95"][0]) / baseline_mean * 100.0,
+                sign * float(ci["ci95"][1]) / baseline_mean * 100.0,
+            ]
+            ci_pct.sort()
+        else:
+            improvement_pct = None
+            ci_pct = None
+        metrics[key] = {
+            **ci,
+            "baseline_mean": baseline_mean,
+            "improvement_pct": improvement_pct,
+            "improvement_ci95_pct": ci_pct,
+            "direction": direction,
+        }
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "method": method,
+        "baseline": baseline,
+        "paired_by": sample_key,
+        "bootstrap_seed": int(seed),
+        "bootstrap_iterations": int(iterations),
+        "metrics": metrics,
     }
 
 
@@ -92,6 +190,9 @@ def _resource_stats(records: list[dict[str, Any]]) -> dict[str, Any]:
     keys = (
         "network_rtt_ms",
         "network_bytes",
+        "request_bytes",
+        "response_bytes",
+        "rpc_count",
         "kv_copy_ms",
         "kv_copy_bytes",
         "cpu_time_ms",
@@ -209,6 +310,18 @@ def summarize_requests(
             "throughput_tok_s": "all generated output tokens divided by measured run wallclock",
             "goodput_req_s": "successful completed requests divided by measured run wallclock",
             "goodput_tok_s": "tokens from successful completed requests divided by measured run wallclock",
+            "request_bytes": (
+                "serialized application-layer HTTP JSON body or protobuf request ByteSize; "
+                "excludes HTTP/gRPC framing, TCP/IP, and SSH encapsulation"
+            ),
+            "response_bytes": (
+                "serialized application-layer HTTP response body or protobuf response ByteSize; "
+                "excludes HTTP/gRPC framing, TCP/IP, and SSH encapsulation"
+            ),
+            "rpc_count": (
+                "count of measured application RPCs: HTTP POST calls for FastSD or Validate "
+                "calls for SpecEdge"
+            ),
         },
         "resource_metrics": _resource_stats(request_records),
     }

@@ -21,7 +21,7 @@ sys.path.insert(0, str(REPO_ROOT))
 FORMAL_CPUSET = "56-71,80-95"
 FORMAL_CPU_PREFIX = "nice -n 5 numactl --physcpubind=56-71,80-95 --interleave=2,3"
 
-from src.common_metrics import summarize_requests
+from src.common_metrics import paired_method_analysis, summarize_requests
 from src.evaluation import (
     DATASET_FILES,
     load_canonical_jsonl,
@@ -29,7 +29,14 @@ from src.evaluation import (
     workload_fingerprint,
     write_canonical_jsonl,
 )
-from src.parity import FOUR_METHODS, ORACLE_METHOD, build_token_parity_rows, write_token_parity_report
+from src.parity import (
+    FOUR_METHODS,
+    ORACLE_METHOD,
+    build_token_parity_rows,
+    exact_gate_summary,
+    summarize_token_parity,
+    write_token_parity_report,
+)
 from src.run_artifacts import (
     append_command,
     append_status,
@@ -44,6 +51,95 @@ from src.run_artifacts import (
 def load_config(path: str | Path) -> dict[str, Any]:
     with Path(path).open("r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def resolve_execution(
+    config: dict[str, Any], overrides: dict[str, Any] | None = None
+) -> dict[str, str]:
+    """Resolve the exact host/path/interpreter values used by the plan.
+
+    The explicit keys are intentionally host-qualified.  Legacy ``python``,
+    ``target_python``, ``specedge_python`` and ``repo_path_linux`` remain valid
+    fallbacks so historical configs can still be inspected without silently
+    changing their meaning.
+    """
+
+    execution = config.get("execution", {})
+    overrides = overrides or {}
+
+    def pick(name: str, *legacy: str, default: Any = None) -> str:
+        candidates = [overrides.get(name), execution.get(name), config.get(name)]
+        candidates.extend(execution.get(key) for key in legacy)
+        candidates.extend(config.get(key) for key in legacy)
+        candidates.append(default)
+        for value in candidates:
+            if value is not None and str(value).strip():
+                return str(value)
+        raise ValueError(f"missing execution value: {name}")
+
+    node3_repo = pick(
+        "node3_repo",
+        "repo_path_linux",
+        default=config.get("repo_path_linux", ""),
+    )
+    node2_repo = pick(
+        "node2_repo",
+        "repo_path_linux",
+        default=node3_repo,
+    )
+    node3_edge_python = pick(
+        "node3_edge_python",
+        "python",
+        default="python",
+    )
+    node3_specedge_python = pick(
+        "node3_specedge_python",
+        "specedge_python",
+        "node3_edge_python",
+        default=node3_edge_python,
+    )
+    node2_target_python = pick(
+        "node2_target_python",
+        "target_python",
+        "node3_edge_python",
+        default=node3_edge_python,
+    )
+    node2_specedge_python = pick(
+        "node2_specedge_python",
+        "specedge_python",
+        "node2_target_python",
+        default=node2_target_python,
+    )
+    return {
+        "node3_repo": node3_repo,
+        "node2_repo": node2_repo,
+        "node3_edge_python": node3_edge_python,
+        "node3_specedge_python": node3_specedge_python,
+        "node2_target_python": node2_target_python,
+        "node2_specedge_python": node2_specedge_python,
+    }
+
+
+def resolve_models(config: dict[str, Any]) -> dict[str, str]:
+    """Resolve host-local draft copies while keeping the legacy draft fallback."""
+
+    models = config.get("models", {})
+    legacy_draft = models.get("draft") or config.get("draft_model")
+    if not legacy_draft:
+        raise ValueError("missing models.draft fallback")
+    return {
+        "node3_draft": str(
+            models.get("node3_draft")
+            or config.get("node3_draft")
+            or legacy_draft
+        ),
+        "node2_draft": str(
+            models.get("node2_draft")
+            or config.get("node2_draft")
+            or legacy_draft
+        ),
+        "target": str(models["target"]),
+    }
 
 
 def shell_prefix(value: Any) -> tuple[str, str]:
@@ -204,27 +300,46 @@ def validate_experiment_config(config: dict[str, Any]) -> list[str]:
     return notes
 
 
-def output_layout(config: dict[str, Any]) -> dict[str, Any]:
+def output_layout(
+    config: dict[str, Any], execution: dict[str, str] | None = None
+) -> dict[str, Any]:
     local_root = REPO_ROOT / "exp" / "comparison" / config["run_id"]
-    linux_root = (
-        PurePosixPath(config["repo_path_linux"])
+    execution = execution or resolve_execution(config)
+    node3_root = (
+        PurePosixPath(execution["node3_repo"])
+        / "exp"
+        / "comparison"
+        / config["run_id"]
+    )
+    node2_root = (
+        PurePosixPath(execution["node2_repo"])
         / "exp"
         / "comparison"
         / config["run_id"]
     )
     return {
         "local_root": local_root,
-        "linux_root": linux_root,
+        "execution": execution,
+        # ``linux_root`` remains the node3 alias for existing callers.
+        "linux_root": node3_root,
+        "node3_root": node3_root,
+        "node2_root": node2_root,
         "canonical": local_root / "inputs" / "canonical.jsonl",
         "raw_input": local_root / "inputs" / "raw_input.jsonl",
-        "linux_canonical": linux_root / "inputs" / "canonical.jsonl",
+        "linux_canonical": node3_root / "inputs" / "canonical.jsonl",
+        "node3_canonical": node3_root / "inputs" / "canonical.jsonl",
+        "node2_canonical": node2_root / "inputs" / "canonical.jsonl",
         "manifest": local_root / "run_manifest.json",
         "commands": local_root / "commands.txt",
         "status": local_root / "run_status.jsonl",
         "cpu_preflight": local_root / "cpu_preflight.json",
         "cpu_postflight": local_root / "cpu_postflight.json",
         "specedge_config": local_root / "specedge" / "specedge.yaml",
-        "linux_specedge_config": linux_root / "specedge" / "specedge.yaml",
+        "node3_specedge_config": local_root / "specedge" / "specedge.yaml",
+        "node2_specedge_config": local_root / "specedge" / "node2.yaml",
+        "linux_specedge_config": node3_root / "specedge" / "specedge.yaml",
+        "node3_specedge_config_linux": node3_root / "specedge" / "specedge.yaml",
+        "node2_specedge_config_linux": node2_root / "specedge" / "specedge.yaml",
     }
 
 
@@ -236,9 +351,18 @@ def _yaml_scalar(value: Any) -> str:
     return json.dumps(str(value))
 
 
-def render_specedge_config(config: dict[str, Any], workload_hash: str, layout: dict[str, Any]) -> str:
+def render_specedge_config(
+    config: dict[str, Any],
+    workload_hash: str,
+    layout: dict[str, Any],
+    *,
+    host_role: str = "node3",
+) -> str:
+    if host_role not in {"node2", "node3"}:
+        raise ValueError("host_role must be node2 or node3")
     generation = config["generation"]
     topology = config["topology"]
+    models = resolve_models(config)
     draft_devices = topology["specedge_draft_devices"]
     draft_is_cpu = bool(draft_devices) and all(
         str(device).split(":", 1)[0].lower() == "cpu" for device in draft_devices
@@ -246,8 +370,17 @@ def render_specedge_config(config: dict[str, Any], workload_hash: str, layout: d
     client_dtype = "fp32" if draft_is_cpu else "bf16"
     client_engine = "cpu_adapter" if draft_is_cpu else "official_graph_engine"
     client_threads = int(topology.get("draft_threads", 1))
-    linux_root = layout["linux_root"]
-    integration_python = config.get("execution", {}).get("specedge_python", "python")
+    execution = layout.get("execution") or resolve_execution(config)
+    if host_role == "node2":
+        linux_root = layout.get("node2_root", layout["linux_root"])
+        canonical_path = layout.get("node2_canonical", layout["linux_canonical"])
+        integration_python = execution["node2_specedge_python"]
+        repo_root = execution["node2_repo"]
+    else:
+        linux_root = layout.get("node3_root", layout["linux_root"])
+        canonical_path = layout.get("node3_canonical", layout["linux_canonical"])
+        integration_python = execution["node3_specedge_python"]
+        repo_root = execution["node3_repo"]
     specedge_host = topology.get("specedge_host", "127.0.0.1:18000")
     specedge_host_name = str(specedge_host).rsplit(":", 1)[0]
     lines = [
@@ -262,7 +395,7 @@ def render_specedge_config(config: dict[str, Any], workload_hash: str, layout: d
         "  max_len: 4096",
         "server:",
         "  process_name: server",
-        f"  target_model: {_yaml_scalar(config['models']['target'])}",
+        f"  target_model: {_yaml_scalar(models['target'])}",
         f"  device: {_yaml_scalar(topology['specedge_target_device'])}",
         f"  temperature: {float(generation['temperature'])}",
         f"  max_batch_size: {len(draft_devices)}",
@@ -272,7 +405,7 @@ def render_specedge_config(config: dict[str, Any], workload_hash: str, layout: d
         "client:",
         f"  host: {_yaml_scalar(specedge_host)}",
         "  process_name: client",
-        f"  draft_model: {_yaml_scalar(config['models']['draft'])}",
+        f"  draft_model: {_yaml_scalar(models['node2_draft'] if host_role == 'node2' else models['node3_draft'])}",
         "  dataset: fastsd_external",
         f"  dtype: {client_dtype}",
         f"  engine: {client_engine}",
@@ -299,15 +432,17 @@ def render_specedge_config(config: dict[str, Any], workload_hash: str, layout: d
     lines.extend(
         [
             "integration:",
+            f"  host_role: {_yaml_scalar(host_role)}",
+            f"  repo_root: {_yaml_scalar(repo_root)}",
             f"  python: {_yaml_scalar(integration_python)}",
             f"  server_host: {_yaml_scalar(specedge_host_name)}",
             f"  server_port: {int(topology.get('specedge_port', 18000))}",
-            f"  dataset_file: {_yaml_scalar(layout['linux_canonical'])}",
+            f"  dataset_file: {_yaml_scalar(canonical_path)}",
             f"  completion_dir: {_yaml_scalar(linux_root / 'specedge' / 'requests')}",
             f"  workload_hash: {_yaml_scalar(workload_hash)}",
             f"  method: {_yaml_scalar('specedge_cpu_adapted' if draft_is_cpu else 'specedge')}",
-            f"  commands_path: {_yaml_scalar(layout['linux_root'] / 'commands.txt')}",
-            f"  status_path: {_yaml_scalar(layout['linux_root'] / 'run_status.jsonl')}",
+            f"  commands_path: {_yaml_scalar(linux_root / 'commands.txt')}",
+            f"  status_path: {_yaml_scalar(linux_root / 'run_status.jsonl')}",
             f"  arrival_distribution: {_yaml_scalar(config['dataset'].get('arrival_distribution', 'immediate'))}",
             f"  warmup_requests: {int(topology.get('warmup_requests', 0))}",
             "  startup_delay_s: 15",
@@ -324,9 +459,11 @@ def _append_command_record(path: Path, config_path: str | Path, body: str) -> No
 def prepare(config_path: str) -> int:
     config = load_config(config_path)
     validation_notes = validate_experiment_config(config)
+    execution = resolve_execution(config)
     layout = output_layout(config)
     dataset = config["dataset"]
     generation = config["generation"]
+    model_paths = resolve_models(config)
     data_path = Path(dataset["data_path"])
     if not data_path.is_absolute():
         data_path = REPO_ROOT / data_path
@@ -363,6 +500,10 @@ def prepare(config_path: str) -> int:
     write_text_once(
         layout["specedge_config"], render_specedge_config(config, fingerprint, layout)
     )
+    write_text_once(
+        layout["node2_specedge_config"],
+        render_specedge_config(config, fingerprint, layout, host_role="node2"),
+    )
     max_new_tokens = int(generation.get("max_new_tokens", 0))
     evaluation_scope = "communication_smoke" if max_new_tokens <= 16 else "quality"
     draft_devices = list(config["topology"].get("specedge_draft_devices", []))
@@ -377,16 +518,26 @@ def prepare(config_path: str) -> int:
         "num_requests": len(records),
         "dataset": dataset,
         "models": config["models"],
+        "models_by_host": model_paths,
         "generation": generation,
         "evaluation_scope": evaluation_scope,
         "mt_bench_turn_policy": (
             "first_turn_only" if dataset["name"] == "mt_bench" else "not_applicable"
         ),
-        "canonical_dataset": str(layout["linux_canonical"]),
+        "canonical_dataset": str(layout["node3_canonical"]),
+        "canonical_dataset_by_host": {
+            "node3": str(layout["node3_canonical"]),
+            "node2": str(layout["node2_canonical"]),
+        },
         "raw_input": str(layout["raw_input"]),
         "git_sha": git_info,
         "methods": methods,
         "oracle_method": ORACLE_METHOD,
+        "execution": execution,
+        "specedge_configs": {
+            "node3": str(layout["node3_specedge_config_linux"]),
+            "node2": str(layout["node2_specedge_config_linux"]),
+        },
         "topology": {
             "draft_devices": draft_devices,
             "draft_threads": config["topology"].get("draft_threads"),
@@ -418,10 +569,22 @@ def prepare(config_path: str) -> int:
         "validation_notes": validation_notes,
     }
     write_json_once(layout["manifest"], manifest)
+    prepare_command = (
+        f"cd {shlex.quote(execution['node3_repo'])} && "
+        f"{shlex.quote(execution['node3_edge_python'])} scripts/eval_suite.py prepare "
+        f"--config {shlex.quote(str(config_path))}"
+    )
     _append_command_record(
         layout["commands"],
         config_path,
-        f"cd {REPO_ROOT} && python scripts/eval_suite.py prepare --config {config_path}",
+        "\n".join(
+            [
+                f"# resolved_execution={json.dumps(execution, ensure_ascii=False, sort_keys=True)}",
+                f"# node3_specedge_config={layout['node3_specedge_config_linux']}",
+                f"# node2_specedge_config={layout['node2_specedge_config_linux']}",
+                prepare_command,
+            ]
+        ),
     )
     print(json.dumps(manifest, indent=2, ensure_ascii=False))
     print(f"SpecEdge config: {layout['specedge_config']}")
@@ -431,7 +594,7 @@ def prepare(config_path: str) -> int:
         method="suite",
         phase="prepare",
         exit_code=0,
-        command=f"python scripts/eval_suite.py prepare --config {config_path}",
+        command=prepare_command,
     )
     return 0
 
@@ -449,27 +612,68 @@ def print_plan(
     target_host: str | None = None,
     target_port: int | None = None,
     cpu_prefix: str | None = None,
+    node3_edge_python: str | None = None,
+    node3_specedge_python: str | None = None,
+    node2_target_python: str | None = None,
+    node2_specedge_python: str | None = None,
+    node3_repo: str | None = None,
+    node2_repo: str | None = None,
 ) -> int:
     config = load_config(config_path)
     validate_experiment_config(config)
-    layout = output_layout(config)
-    manifest = _read_manifest(config, layout)
-    repo = config["repo_path_linux"]
+    execution_overrides = {
+        key: value
+        for key, value in {
+            "node3_edge_python": node3_edge_python or python_bin,
+            "node3_specedge_python": node3_specedge_python,
+            "node2_target_python": node2_target_python,
+            "node2_specedge_python": node2_specedge_python,
+            "node3_repo": node3_repo,
+            "node2_repo": node2_repo,
+        }.items()
+        if value is not None
+    }
+    resolved_execution = resolve_execution(config, execution_overrides)
+    manifest_layout = output_layout(config)
+    manifest = _read_manifest(config, manifest_layout)
+    if execution_overrides:
+        manifest_execution = manifest.get("execution")
+        if not isinstance(manifest_execution, dict):
+            raise ValueError(
+                "plan interpreter/repo overrides require a prepare manifest with "
+                "resolved execution values; rerun prepare with the resolved config"
+            )
+        mismatches = {
+            key: {"manifest": manifest_execution.get(key), "plan": resolved_execution[key]}
+            for key in resolved_execution
+            if str(manifest_execution.get(key)) != str(resolved_execution[key])
+        }
+        if mismatches:
+            raise ValueError(
+                "plan execution overrides differ from manifest; rerun prepare with the "
+                f"resolved config: {json.dumps(mismatches, ensure_ascii=False, sort_keys=True)}"
+            )
+    execution = resolved_execution
+    layout = output_layout(config, execution=execution)
     run_id = config["run_id"]
     dataset = config["dataset"]["name"]
     generation = config["generation"]
-    models = config["models"]
+    models = resolve_models(config)
     topology = config["topology"]
-    execution = config.get("execution", {})
-    python_bin = python_bin or execution.get("python", "python")
-    target_python = execution.get("target_python", python_bin)
-    specedge_python = execution.get("specedge_python", python_bin)
+    node3_repo = execution["node3_repo"]
+    node2_repo = execution["node2_repo"]
+    node3_edge_python = execution["node3_edge_python"]
+    node3_specedge_python = execution["node3_specedge_python"]
+    node2_target_python = execution["node2_target_python"]
+    node2_specedge_python = execution["node2_specedge_python"]
     draft_devices = list(topology.get("specedge_draft_devices", ["cpu"]))
     worker_count = int(topology.get("draft_workers", len(draft_devices)))
     draft_threads = int(topology.get("draft_threads", 32 if worker_count == 1 else 8))
     physical_cpu_count = int(topology.get("physical_cpu_count", 32))
     target_host = target_host or topology.get("target_host", "127.0.0.1")
-    target_port = int(target_port or topology.get("target_port", 18001))
+    target_port = int(
+        target_port if target_port is not None else topology.get("target_port", 18001)
+    )
     warmup_requests = int(topology.get("warmup_requests", 0))
     raw_cpu_prefix = cpu_prefix if cpu_prefix is not None else topology.get("cpu_prefix", "")
     command_prefix, raw_cpu_prefix = shell_prefix(raw_cpu_prefix)
@@ -490,45 +694,68 @@ def print_plan(
     draft_device = str(draft_devices[0] if draft_devices else "cpu")
     cpu_draft = draft_device.split(":", 1)[0].lower() == "cpu"
     common = (
-        f"--dataset {dataset} --dataset_file {layout['linux_canonical']} "
-        f"--workload_hash {manifest['workload_hash']} --draft_model {models['draft']} "
+        f"--dataset {dataset} --dataset_file {layout['node3_canonical']} "
+        f"--workload_hash {manifest['workload_hash']} --draft_model {models['node3_draft']} "
         f"--target_model {models['target']} --max_tokens {generation['max_new_tokens']} "
         f"--temp {generation['temperature']} --top_k {generation['top_k']} "
         f"--top_p {generation['top_p']} --gamma {generation['gamma']} --seed {generation['seed']} "
         f"--stop_policy {generation.get('stop_policy', 'eos')} "
         f"--warmup_requests {warmup_requests}"
     )
-    integration = f"{repo}/baselines/specedge/integration"
-    official = f"{repo}/baselines/specedge/official"
-    specedge_raw = f"{layout['linux_root']}/specedge/raw/{run_id}"
+    node2_integration = f"{node2_repo}/baselines/specedge/integration"
+    node2_official = f"{node2_repo}/baselines/specedge/official"
+    specedge_raw = f"{layout['node3_root']}/specedge/raw/{run_id}"
+    prepare_command = (
+        f"cd {shlex.quote(node3_repo)} && {shlex.quote(node3_edge_python)} "
+        f"scripts/eval_suite.py prepare --config {shlex.quote(str(config_path))}"
+    )
+    node2_prepare_command = (
+        f"cd {shlex.quote(node2_repo)} && {shlex.quote(node2_target_python)} "
+        f"scripts/eval_suite.py prepare --config {shlex.quote(str(config_path))}"
+    )
+    workload_hash_command = (
+        f"cd {shlex.quote(node3_repo)} && {shlex.quote(node3_edge_python)} "
+        "scripts/eval_suite.py workload-hash "
+        f"--node3-manifest {layout['node3_root']}/run_manifest.json "
+        f"--node2-manifest {layout['node2_root']}/run_manifest.json"
+    )
     plan = "\n".join(
         [
-            "[两台服务器：先生成完全相同的 workload 文件；不下载数据/模型]",
+            "[两台服务器：host-specific roots/interpreters；先生成完全相同的 workload 文件；不下载数据/模型]",
+            f"# resolved_execution={json.dumps(execution, ensure_ascii=False, sort_keys=True)}",
+            f"# resolved_models={json.dumps(models, ensure_ascii=False, sort_keys=True)}",
+            f"# node3_specedge_config={layout['node3_specedge_config_linux']}",
+            f"# node2_specedge_config={layout['node2_specedge_config_linux']}",
             f"# cpu_prefix_raw={json.dumps(raw_cpu_prefix, ensure_ascii=False)}",
             f"# shared_load={str(bool(topology.get('shared_load', True))).lower()} "
             f"fixed_cpuset={json.dumps(str(topology.get('fixed_cpuset', '')), ensure_ascii=False)} "
             f"method_order={json.dumps(topology.get('method_order', list(FOUR_METHODS)), ensure_ascii=False)} "
             f"repeat_index={int(topology.get('repeat_index', 0))}",
-            f"cd {repo} && {shlex.quote(python_bin)} scripts/eval_suite.py prepare --config {config_path}",
+            "\n[node3：prepare（node3 canonical + node3 SpecEdge YAML）]",
+            prepare_command,
+            "\n[node2：prepare（node2 canonical + node2 SpecEdge YAML；不得跳过）]",
+            node2_prepare_command,
+            "\n[两端 workload_hash 门禁：不一致则停止，不运行正式方法]",
+            workload_hash_command,
             "\n[node3：CPU 绑定/背景负载预检（不假设 32 核独占；必须先于正式方法）]",
-            f"cd {repo} && "
+            f"cd {shlex.quote(node3_repo)} && "
             + prefixed_command(
                 command_prefix,
-                f"{shlex.quote(python_bin)} scripts/preflight_cpu.py "
+                f"{shlex.quote(node3_edge_python)} scripts/preflight_cpu.py "
                 f"--threads {draft_threads} --expected-cpu-count {physical_cpu_count} "
                 f"--expected-cpuset {shlex.quote(str(topology.get('fixed_cpuset', '')))} --phase pre "
-                f"--output {layout['linux_root']}/cpu_preflight.json "
-                f"--commands-path {layout['linux_root']}/commands.txt",
+                f"--output {layout['node3_root']}/cpu_preflight.json "
+                f"--commands-path {layout['node3_root']}/commands.txt",
                 environment=cpu_environment,
             ),
             "\n[node2：FastSD target（target_host/port 与 bind host 可配置；物理 GPU 由外部 CUDA_VISIBLE_DEVICES 选择）]",
-            f"cd {repo} && CLOUD_SERVICE_HOST={shlex.quote(target_bind_host)} CLOUD_SERVICE_PORT={target_port} "
+            f"cd {shlex.quote(node2_repo)} && CLOUD_SERVICE_HOST={shlex.quote(target_bind_host)} CLOUD_SERVICE_PORT={target_port} "
             f"FASTSD_TARGET_DEVICE={topology['standard_sd_target_device']} "
-            f"{shlex.quote(target_python)} cloud/cloud_service.py "
-            f"--target_model {models['target']} --draft_model {models['draft']} --dataset {dataset} "
+            f"{shlex.quote(node2_target_python)} cloud/cloud_service.py "
+            f"--target_model {models['target']} --draft_model {models['node2_draft']} --dataset {dataset} "
             "--server_sched_mode fastsd",
             "\n[node3：FastSD stateful EdgeClient（/session/init + /prefill + /verify + rollback）]",
-            f"cd {repo} && "
+            f"cd {shlex.quote(node3_repo)} && "
             + prefixed_command(
                 command_prefix,
                 "bash scripts/run_fastsd_profile.sh "
@@ -539,32 +766,32 @@ def print_plan(
                 f"--arrival_seed {config['dataset']['arrival_seed']}",
                 environment={
                     **cpu_environment,
-                    "PYTHON_BIN": python_bin,
+                    "PYTHON_BIN": node3_edge_python,
                     "SERVER_URL": target_url,
                 },
             ),
             "\n[node2：SpecEdge target server（official target/tree verification core；bind host 可配置）]",
-            f"cd {repo} && FASTSD_EVAL_ROLE=server "
-            f"FASTSD_EVAL_DATASET_FILE={layout['linux_canonical']} "
-            f"PYTHONPATH={integration}:{official}/src "
-            f"{shlex.quote(specedge_python)} -O {integration}/server.py "
-            f"--config {layout['linux_specedge_config']} --host {shlex.quote(specedge_bind_host)} --port {specedge_port}",
+            f"cd {shlex.quote(node2_repo)} && FASTSD_EVAL_ROLE=server "
+            f"FASTSD_EVAL_DATASET_FILE={layout['node2_canonical']} "
+            f"PYTHONPATH={shlex.quote(node2_integration + ':' + node2_official + '/src')} "
+            f"{shlex.quote(node2_specedge_python)} -O {node2_integration}/server.py "
+            f"--config {layout['node2_specedge_config_linux']} --host {shlex.quote(specedge_bind_host)} --port {specedge_port}",
             "\n[node3：SpecEdge CPU adapter（official Tree/SpecExec/proactive semantics preserved）]",
-            f"cd {repo} && "
+            f"cd {shlex.quote(node3_repo)} && "
             + prefixed_command(
                 command_prefix,
-                f"{shlex.quote(specedge_python)} {integration}/client_host.py "
-                f"--config {layout['linux_specedge_config']}",
+                f"{shlex.quote(node3_specedge_python)} {node3_repo}/baselines/specedge/integration/client_host.py "
+                f"--config {layout['node3_specedge_config_linux']}",
                 environment=cpu_environment,
             ),
             "\n[node2：停止 FastSD target 后，以 vanilla 调度重启 target（同一端口/bind host）]",
-            f"cd {repo} && CLOUD_SERVICE_HOST={shlex.quote(target_bind_host)} CLOUD_SERVICE_PORT={target_port} "
+            f"cd {shlex.quote(node2_repo)} && CLOUD_SERVICE_HOST={shlex.quote(target_bind_host)} CLOUD_SERVICE_PORT={target_port} "
             f"FASTSD_TARGET_DEVICE={topology['standard_sd_target_device']} "
-            f"{shlex.quote(target_python)} cloud/cloud_service.py "
-            f"--target_model {models['target']} --draft_model {models['draft']} --dataset {dataset} "
+            f"{shlex.quote(node2_target_python)} cloud/cloud_service.py "
+            f"--target_model {models['target']} --draft_model {models['node2_draft']} --dataset {dataset} "
             "--server_sched_mode vanilla",
             "\n[node3：标准投机解码（同样 CPU draft + 网络 + A6000 target）]",
-            f"cd {repo} && "
+            f"cd {shlex.quote(node3_repo)} && "
             + prefixed_command(
                 command_prefix,
                 "bash scripts/run_vanilla_profile.sh "
@@ -576,31 +803,31 @@ def print_plan(
                 f"--arrival_seed {config['dataset']['arrival_seed']}",
                 environment={
                     **cpu_environment,
-                    "PYTHON_BIN": python_bin,
+                    "PYTHON_BIN": node3_edge_python,
                     "SERVER_URL": target_url,
                 },
             ),
             "\n[node3：Draft-only（同一 CPU runtime；不访问 target）]",
-            f"cd {repo} && "
+            f"cd {shlex.quote(node3_repo)} && "
             + prefixed_command(
                 command_prefix,
-                f"{shlex.quote(python_bin)} benchmark/eval_draft_pool.py --config {config_path}",
+                f"{shlex.quote(node3_edge_python)} benchmark/eval_draft_pool.py --config {shlex.quote(str(config_path))}",
                 environment=cpu_environment,
             ),
             "\n[node2：target-only greedy oracle（只用于 parity/quality reference，不纳入四方法）]",
-            f"cd {repo} && {shlex.quote(target_python)} benchmark/eval_target_only.py --config {config_path}",
+            f"cd {shlex.quote(node2_repo)} && {shlex.quote(node2_target_python)} benchmark/eval_target_only.py --config {shlex.quote(str(config_path))}",
             "\n[网络拓扑说明：默认使用可覆盖的 target_host/port；受限网络可在 node3 建立双段 SSH 本地转发，"
             "让 127.0.0.1:18001 转发到 node2 127.0.0.1:18001。不要把转发命令或凭据写死到仓库。"
             "FastSD/SpecEdge 的请求耗时包含该网络路径，normalize 时保留 TTFT/E2E。]",
             "\n[node3：正式方法完成后记录 CPU 绑定/背景负载 postflight（保留 mpstat/load 快照）]",
-            f"cd {repo} && "
+            f"cd {shlex.quote(node3_repo)} && "
             + prefixed_command(
                 command_prefix,
-                f"{shlex.quote(python_bin)} scripts/preflight_cpu.py "
+                f"{shlex.quote(node3_edge_python)} scripts/preflight_cpu.py "
                 f"--threads {draft_threads} --expected-cpu-count {physical_cpu_count} "
                 f"--expected-cpuset {shlex.quote(str(topology.get('fixed_cpuset', '')))} --phase post "
-                f"--output {layout['linux_root']}/cpu_postflight.json "
-                f"--commands-path {layout['linux_root']}/commands.txt",
+                f"--output {layout['node3_root']}/cpu_postflight.json "
+                f"--commands-path {layout['node3_root']}/commands.txt",
                 environment=cpu_environment,
             ),
             f"\n[method label: {'specedge_cpu_adapted' if cpu_draft else 'specedge'}; raw result expected at {specedge_raw}]",
@@ -613,7 +840,10 @@ def print_plan(
         method="suite",
         phase="plan",
         exit_code=0,
-        command=f"{python_bin} scripts/eval_suite.py plan --config {config_path}",
+        command=(
+            f"{shlex.quote(node3_edge_python)} scripts/eval_suite.py plan "
+            f"--config {shlex.quote(str(config_path))}"
+        ),
     )
     print(f"\nCommand record: {layout['commands']}")
     return 0
@@ -650,6 +880,9 @@ def normalize_fastsd(input_dir: Path, manifest: dict[str, Any]) -> tuple[list[di
             "workload_hash": item.get("workload_hash", manifest.get("workload_hash")),
             "network_rtt_ms": item.get("avg_transport_rtt_ms"),
             "network_bytes": item.get("network_bytes"),
+            "request_bytes": item.get("request_bytes"),
+            "response_bytes": item.get("response_bytes"),
+            "rpc_count": item.get("rpc_count"),
             "kv_copy_ms": item.get("kv_copy_ms"),
             "kv_copy_bytes": item.get("kv_copy_bytes"),
             "reference": item.get("reference"),
@@ -700,6 +933,9 @@ def normalize_specedge(input_dir: Path, manifest: dict[str, Any]) -> tuple[list[
                 "output_text": completion.get("output_text"),
                 "output_token_ids": completion.get("output_token_ids", []),
                 "workload_hash": completion.get("workload_hash", manifest.get("workload_hash")),
+                "request_bytes": completion.get("request_bytes"),
+                "response_bytes": completion.get("response_bytes"),
+                "rpc_count": completion.get("rpc_count"),
                 "reference": completion.get("reference"),
             }
         )
@@ -787,9 +1023,11 @@ def compare(summary_paths: list[str], output: str | None) -> int:
         "scheduled_ttft_p95_ms",
         "tpot_avg_ms", "tpot_p95_ms", "e2e_avg_ms", "accept_rate",
         "mean_accepted_tokens_per_verify", "quality_exact_match",
+        "request_bytes_total", "response_bytes_total", "rpc_count_total",
     ]
     rows = []
     for item in summaries:
+        resources = item.get("resource_metrics", {})
         rows.append({
             "method": item["method"],
             "evaluation_scope": item.get("evaluation_scope", "unknown"),
@@ -805,6 +1043,9 @@ def compare(summary_paths: list[str], output: str | None) -> int:
             "accept_rate": item["accept_rate"],
             "mean_accepted_tokens_per_verify": item["mean_accepted_tokens_per_verify"],
             "quality_exact_match": item["quality_exact_match"],
+            "request_bytes_total": resources.get("request_bytes", {}).get("total"),
+            "response_bytes_total": resources.get("response_bytes", {}).get("total"),
+            "rpc_count_total": resources.get("rpc_count", {}).get("total"),
         })
     print("\t".join(columns))
     for row in rows:
@@ -822,12 +1063,88 @@ def compare(summary_paths: list[str], output: str | None) -> int:
     return 0
 
 
+def _request_path(value: str) -> Path:
+    path = Path(value)
+    if path.is_dir():
+        path = path / "requests.jsonl"
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    return path
+
+
+def _parse_method_path(spec: str) -> tuple[str, Path]:
+    if "=" not in spec:
+        raise ValueError(f"method input must be METHOD=PATH: {spec}")
+    method, raw_path = spec.split("=", 1)
+    if not method:
+        raise ValueError(f"method input has an empty method: {spec}")
+    return method, _request_path(raw_path)
+
+
+def paired_analysis(
+    config_path: str,
+    left_spec: str,
+    right_spec: str,
+    *,
+    output: str | None = None,
+) -> int:
+    """Write direct paired FastSD-vs-SpecEdge bootstrap evidence."""
+
+    config = load_config(config_path)
+    layout = output_layout(config)
+    manifest = _read_manifest(config, layout)
+    left_method, left_path = _parse_method_path(left_spec)
+    right_method, right_path = _parse_method_path(right_spec)
+    left_records = _read_jsonl_files([left_path])
+    right_records = _read_jsonl_files([right_path])
+    workload_hashes = {
+        str(record.get("workload_hash"))
+        for records in (left_records, right_records)
+        for record in records
+        if record.get("workload_hash") is not None
+    }
+    if workload_hashes and workload_hashes != {manifest["workload_hash"]}:
+        raise ValueError(
+            f"paired workload hashes differ from manifest: {sorted(workload_hashes)}"
+        )
+    payload = {
+        "run_id": config["run_id"],
+        "workload_hash": manifest["workload_hash"],
+        "left": {"method": left_method, "path": str(left_path), "samples": len(left_records)},
+        "right": {"method": right_method, "path": str(right_path), "samples": len(right_records)},
+        "analysis": paired_method_analysis(
+            left_records,
+            right_records,
+            method=left_method,
+            baseline=right_method,
+            seed=42,
+            iterations=10_000,
+        ),
+    }
+    output_path = (
+        Path(output)
+        if output
+        else layout["local_root"] / "analysis" / "fastsd_vs_specedge_cpu_adapted.json"
+    )
+    write_json_once(output_path, payload)
+    append_status(
+        layout["status"],
+        method=f"{left_method}_vs_{right_method}",
+        phase="paired_analysis",
+        exit_code=0,
+        command=f"paired --config {config_path} --left {left_spec} --right {right_spec}",
+    )
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0
+
+
 def parity(
     config_path: str,
     input_specs: list[str],
     *,
     reference: str = ORACLE_METHOD,
     output: str | None = None,
+    max_samples: int | None = None,
 ) -> int:
     """Create per-token parity JSONL from normalized/raw request files."""
 
@@ -866,25 +1183,64 @@ def parity(
         raise ValueError(
             f"parity workload hashes differ from manifest: {sorted(workload_hashes)}"
         )
-    rows = build_token_parity_rows(records_by_method, reference_method=reference)
+    if max_samples is None and manifest.get("evaluation_scope") == "communication_smoke":
+        max_samples = 20
+    if max_samples is not None and int(max_samples) <= 0:
+        raise ValueError("parity max_samples must be positive")
+    reference_records = records_by_method[reference]
+    selected_ids = [
+        str(record["sample_id"])
+        for record in reference_records[: int(max_samples) if max_samples else None]
+    ]
+    selected_id_set = set(selected_ids)
+    selected_records = {
+        method: [
+            record for record in records if str(record.get("sample_id")) in selected_id_set
+        ]
+        for method, records in records_by_method.items()
+    }
+    rows = build_token_parity_rows(selected_records, reference_method=reference)
     parity_dir = layout["local_root"] / "parity"
     output_path = Path(output) if output else parity_dir / "token_parity.jsonl"
     summary_path = output_path.with_suffix(".summary.json")
     write_token_parity_report(
         rows,
         output_path,
-        summary_path=summary_path,
         methods=paths.keys(),
         reference_method=reference,
     )
+    summary = summarize_token_parity(rows, methods=paths.keys(), reference_method=reference)
+    gate_records = selected_records if max_samples is not None else records_by_method
+    sample_ids_by_method = {
+        method: [str(record.get("sample_id")) for record in records]
+        for method, records in gate_records.items()
+    }
+    gate = exact_gate_summary(
+        rows,
+        reference_method=reference,
+        expected_sample_ids=selected_ids,
+        sample_ids_by_method=sample_ids_by_method,
+    )
+    summary.update(
+        {
+            "max_samples": int(max_samples) if max_samples is not None else None,
+            "selected_sample_count": len(selected_ids),
+            "selected_sample_ids": selected_ids,
+            "comparison_count": len(rows),
+            "exact_gate": gate,
+        }
+    )
+    write_json_once(summary_path, summary)
+    exit_code = 0 if gate["gate_pass"] else 1
     append_status(
         layout["status"],
         method="suite",
         phase="parity",
-        exit_code=0,
+        exit_code=exit_code,
+        error=None if exit_code == 0 else "exact target-only token parity gate failed",
     )
-    print(json.dumps(json.loads(summary_path.read_text(encoding="utf-8")), indent=2))
-    return 0
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
+    return exit_code
 
 
 def _sha256(path: Path) -> str:
@@ -930,19 +1286,49 @@ def validate_models(config_path: str) -> int:
     return int(failed)
 
 
+def workload_hash_gate(node3_manifest: str, node2_manifest: str) -> int:
+    """Require the two host-local prepare manifests to share one workload hash."""
+
+    left = json.loads(Path(node3_manifest).read_text(encoding="utf-8"))
+    right = json.loads(Path(node2_manifest).read_text(encoding="utf-8"))
+    payload = {
+        "node3_manifest": node3_manifest,
+        "node2_manifest": node2_manifest,
+        "node3_workload_hash": left.get("workload_hash"),
+        "node2_workload_hash": right.get("workload_hash"),
+    }
+    if payload["node3_workload_hash"] != payload["node2_workload_hash"]:
+        print(json.dumps({**payload, "match": False}, indent=2, ensure_ascii=False))
+        return 1
+    print(json.dumps({**payload, "match": True}, indent=2, ensure_ascii=False))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
     for command in ("prepare", "validate-models"):
         child = subparsers.add_parser(command)
         child.add_argument("--config", required=True)
+    hash_parser = subparsers.add_parser(
+        "workload-hash",
+        help="fail unless node3/node2 prepare manifests have the same workload hash",
+    )
+    hash_parser.add_argument("--node3-manifest", required=True)
+    hash_parser.add_argument("--node2-manifest", required=True)
     planner = subparsers.add_parser("plan")
     planner.add_argument("--config", required=True)
     planner.add_argument(
         "--python",
         dest="python_bin",
-        help="explicit node3/specedge interpreter; recorded verbatim in commands.txt",
+        help="legacy alias for node3 FastSD/edge interpreter; recorded verbatim in commands.txt",
     )
+    planner.add_argument("--node3-edge-python")
+    planner.add_argument("--node3-specedge-python")
+    planner.add_argument("--node2-target-python")
+    planner.add_argument("--node2-specedge-python")
+    planner.add_argument("--node3-repo")
+    planner.add_argument("--node2-repo")
     planner.add_argument(
         "--target-host",
         help="target host/IP or local-forward endpoint; topology is user-configurable",
@@ -967,11 +1353,28 @@ def build_parser() -> argparse.ArgumentParser:
     comparator = subparsers.add_parser("compare")
     comparator.add_argument("summaries", nargs="+")
     comparator.add_argument("--output")
+    paired_parser = subparsers.add_parser(
+        "paired",
+        help="direct paired FastSD vs SpecEdge bootstrap analysis",
+    )
+    paired_parser.add_argument("--config", required=True)
+    paired_parser.add_argument("--left", required=True, help="METHOD=PATH; normally fastsd=...")
+    paired_parser.add_argument(
+        "--right",
+        required=True,
+        help="METHOD=PATH; normally specedge_cpu_adapted=...",
+    )
+    paired_parser.add_argument("--output")
     parity_parser = subparsers.add_parser("parity")
     parity_parser.add_argument("--config", required=True)
     parity_parser.add_argument("--input", action="append", required=True, dest="input_specs")
     parity_parser.add_argument("--reference", default=ORACLE_METHOD)
     parity_parser.add_argument("--output")
+    parity_parser.add_argument(
+        "--max-samples",
+        type=int,
+        help="compare the first N reference samples; communication_smoke defaults to 20",
+    )
     return parser
 
 
@@ -986,20 +1389,31 @@ def main(argv: list[str] | None = None) -> int:
             target_host=args.target_host,
             target_port=args.target_port,
             cpu_prefix=args.cpu_prefix,
+            node3_edge_python=args.node3_edge_python,
+            node3_specedge_python=args.node3_specedge_python,
+            node2_target_python=args.node2_target_python,
+            node2_specedge_python=args.node2_specedge_python,
+            node3_repo=args.node3_repo,
+            node2_repo=args.node2_repo,
         )
     if args.command == "normalize":
         return normalize(args.config, args.method, args.input)
     if args.command == "compare":
         return compare(args.summaries, args.output)
+    if args.command == "paired":
+        return paired_analysis(args.config, args.left, args.right, output=args.output)
     if args.command == "parity":
         return parity(
             args.config,
             args.input_specs,
             reference=args.reference,
             output=args.output,
+            max_samples=args.max_samples,
         )
     if args.command == "validate-models":
         return validate_models(args.config)
+    if args.command == "workload-hash":
+        return workload_hash_gate(args.node3_manifest, args.node2_manifest)
     if args.command == "validate-config":
         notes = validate_experiment_config(load_config(args.config))
         print(json.dumps({"valid": True, "notes": notes}, indent=2, ensure_ascii=False))

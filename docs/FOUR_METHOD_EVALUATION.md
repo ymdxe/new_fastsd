@@ -4,10 +4,10 @@
 
 | 方法名 | 实际执行路径 | 拓扑 |
 |---|---|---|
-| `fastsd` | FastSD 调度与协议 | 多个 A5000 draft + 网络 + 一个 A6000 target |
-| `specedge_cpu_adapted` | 固定版本的官方 Tree/SpecExec/proactive 核心 + 本仓库显式 CPU engine/wire adapter | CPU draft + 网络 + 一个 A6000 server |
-| `standard_sd` | FastSD 的 `vanilla` profile，关闭主动 draft、pipeline 和 FastSD 调度 | 与 FastSD 相同 |
-| `draft_only` | 独立 draft worker 池，不访问 target | 与前三组相同数量的 A5000 |
+| `fastsd` | FastSD 调度与 stateful EdgeClient 协议 | node3 单进程 CPU32 draft + 可配置网络 + node2 单张逻辑 `cuda:0` target |
+| `specedge_cpu_adapted` | 固定版本的官方 Tree/SpecExec/proactive 核心 + 本仓库显式 CPU engine/wire adapter | node3 CPU32 draft + 可配置网络 + node2 单张逻辑 `cuda:0` server |
+| `standard_sd` | FastSD 的 `vanilla` profile，关闭主动 draft、pipeline 和 FastSD 调度 | 与 FastSD 相同的 CPU32/target 拓扑 |
+| `draft_only` | 独立 CPU draft worker，不访问 target | 与前三组相同的 node3 CPU32 资源口径 |
 
 官方源码仍固定在 `baselines/specedge/official/`，适配代码只放在
 `baselines/specedge/integration/`，没有改写官方子模块的算法实现。CPU 运行必须标为
@@ -100,16 +100,31 @@ cd /home/hdd/zhangh/workspace/new_fastsd
 
 ## 生成清单与完整命令
 
-在 node1、node2 的相同仓库版本上各执行一次 `prepare`。输出 hash 必须相同：
+在 node3、node2 的相同仓库版本上各执行一次 `prepare`。输出 hash 必须相同：
 
 ```bash
-cd /home/hdd/zhangh/workspace/new_fastsd
-/home/hdd/zhangh/envs/new_fastsd/bin/python scripts/eval_suite.py prepare \
-  --config configs/evaluation/qwen3_8b_0.6b_humaneval.json
+cd <node3-repo>
+<node3-edge-python> scripts/eval_suite.py prepare \
+  --config <resolved-config.json>
+
+cd <node2-repo>
+<node2-target-python> scripts/eval_suite.py prepare \
+  --config <resolved-config.json>
+
+<node3-edge-python> scripts/eval_suite.py workload-hash \
+  --node3-manifest <node3-repo>/exp/comparison/<run_id>/run_manifest.json \
+  --node2-manifest <node2-repo>/exp/comparison/<run_id>/run_manifest.json
 ```
 
-然后生成按窗口和服务器区分的可复制命令（示例中的 `python` 可替换为 node3 的显式
-Python 3.14 interpreter）：
+配置中的 `models.node3_draft` 与 `models.node2_draft` 必须分别指向两台主机的
+Qwen3-1.7B 副本；Cloud target 命令使用 node2 副本，SpecEdge client/server YAML
+分别使用 node3/node2 值。缺少 host-specific 值时才回退到 legacy `models.draft`。
+
+然后生成按窗口和服务器区分的可复制命令。配置中的
+`node3_repo/node2_repo` 以及四个 host-specific interpreter 键会被解析后原样写入
+manifest、plan 和 `commands.txt`；示例中的 `python` 可替换为 node3 的显式 Python 3.14
+interpreter。若使用 plan CLI 覆盖解释器或 repo，必须先用同样的 resolved config
+重新 `prepare`；plan 会拒绝与既有 manifest 不一致的 override：
 
 ```bash
 python scripts/eval_suite.py plan \
@@ -133,6 +148,10 @@ SpecEdge 端口同样按现场拓扑决定是否转发到 node3 的 `127.0.0.1:1
 实际启动前，把最终展开后的 `python edge/edge.py ...` 命令追加到各自实验目录的
 `commands.txt`，因此该文件同时保留计划命令和实际执行命令。
 
+正式现场还应把资源 sidecar 的原始输出/路径写入同一个 `commands.txt`：`mpstat`、
+`pidstat`、`nvidia-smi` 以及 run 前后 load 快照。仓库不新增监控脚本；这些命令由正式
+运行记录执行并保留原始日志，且不假设固定 CPU 集合被独占。
+
 四种方法应顺序运行，避免互相抢 GPU。FastSD 与 standard SD 共用 8001 端口，但需要
 分别以 `fastsd` 和 `vanilla` 调度模式启动 target。若 node2 的 8000 已被占用，SpecEdge
 使用 `baselines/specedge/integration/server.py --host 127.0.0.1 --port 18000`；它只替换
@@ -147,11 +166,14 @@ SpecEdge 端口同样按现场拓扑决定是否转发到 node3 的 `127.0.0.1:1
 - `scheduled_ttft_ms`：清单计划到达时刻到首 token，包含 worker 排队/到达滞后；
 - `tpot_ms`：首 token 后的耗时除以剩余输出 token 数；
 - `e2e_ms`、系统 output token/s、P50/P90/P95/P99；
+- `request_bytes`、`response_bytes`、`rpc_count`：FastSD 记录实际 HTTP JSON
+  应用层序列化字节，SpecEdge 记录 protobuf `ByteSize`；两者均不含协议封装、TCP/IP
+  或 SSH；
 - 投机方法的接受率或每次验证平均接受 token 数；
 - GSM8K/MGSM 数值 exact match；
 - HumanEval 会额外导出 `humaneval_samples.jsonl`，供 pass@1 工具执行。
 
-归一化示例（在 node1）：
+归一化示例（在 node3）：
 
 ```bash
 RUN=/home/hdd/zhangh/workspace/new_fastsd/exp/comparison/qwen3_8b_0.6b_humaneval
@@ -182,6 +204,15 @@ evaluate_functional_correctness \
   --problem_file=data/humaneval.jsonl
 ```
 
+直接 FastSD/SpecEdge 配对分析使用同一 `sample_id`，固定 seed=42、10,000 次 bootstrap，
+并输出 TTFT/E2E/TPOT/吞吐的提升百分比及 95% CI：
+
+```bash
+python scripts/eval_suite.py paired --config "$CFG" \
+  --left fastsd="$RUN/normalized/fastsd/requests.jsonl" \
+  --right specedge_cpu_adapted="$RUN/normalized/specedge_cpu_adapted/requests.jsonl"
+```
+
 ## 当前验证边界
 
 2026-08-13 的历史记录曾在同一 MT-Bench 80 请求 manifest 上完成旧 GPU 拓扑的四方法运行，
@@ -202,3 +233,8 @@ python scripts/eval_suite.py parity --config "$CFG" \
   --input draft_only="$RUN/normalized/draft_only/requests.jsonl" \
   --input target_only="$RUN/target_only/requests.jsonl"
 ```
+
+正式 parity 的 `fastsd`、`specedge_cpu_adapted`、`standard_sd` 相对
+`target_only` 是 exact gate：任一 token 或样本缺失/不一致都会以非零状态结束；
+`draft_only` 只出现在报告中，不影响该 gate。communication smoke 默认只比较前 20 个
+reference samples，也可用 `--max-samples` 显式限制。

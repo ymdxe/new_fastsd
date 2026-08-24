@@ -211,6 +211,7 @@ async def main():
             )
             client.measurement_start = request_start
             await client.generate_exact(int(record["global_index"]))
+            transport_stats = client._validator.snapshot_stats()
             request_e2e_ms = (time.perf_counter() - request_start) * 1000.0
             generated_ids = client._prefix_tokens[0, client._num_original_tokens :]
             completion = tokenizer.decode(generated_ids, skip_special_tokens=True)
@@ -249,6 +250,13 @@ async def main():
                 ),
                 "warmup_requests_per_client": warmup_count,
                 "warmup_included_in_metrics": False,
+                "request_bytes": transport_stats["request_bytes"],
+                "response_bytes": transport_stats["response_bytes"],
+                "rpc_count": transport_stats["rpc_count"],
+                "transport_bytes_definition": (
+                    "application-layer protobuf request/response ByteSize; excludes gRPC framing, "
+                    "TCP/IP, and SSH encapsulation"
+                ),
             }
             output.write(json.dumps(payload, ensure_ascii=False) + "\n")
             output.flush()

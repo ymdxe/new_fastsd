@@ -80,6 +80,7 @@ def main(config_file: str) -> int:
     start_epoch = time.time() + float(config["integration"].get("startup_delay_s", 15.0))
     python = Path(config["integration"].get("python", sys.executable))
     client_script = INTEGRATION_ROOT / "client.py"
+    host_script = Path(__file__).resolve()
     processes: list[subprocess.Popen] = []
     client_idx = 0
 
@@ -115,7 +116,10 @@ def main(config_file: str) -> int:
         )
     exit_code = max((process.wait() for process in processes), default=0)
     integration = config["integration"]
-    command = shlex.join([str(python), str(client_script), "--config", str(config_file)])
+    # The recorded command must identify this orchestration entry point.  The
+    # child processes intentionally still execute client.py, but rerunning the
+    # recorded host command is what reproduces the fan-out behavior.
+    command = shlex.join([str(python), str(host_script), "--config", str(config_file)])
     status_path = integration.get("status_path")
     if status_path:
         append_status(

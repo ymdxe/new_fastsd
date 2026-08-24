@@ -34,16 +34,46 @@ class EdgeClient:
         self.session = requests.Session()
         # 避免 127.0.0.1 请求被环境变量代理劫持到其他服务。
         self.session.trust_env = False
+        self._request_bytes = 0
+        self._response_bytes = 0
+        self._rpc_count = 0
+
+    def snapshot_transport_stats(self) -> Dict[str, int]:
+        """Return application-layer HTTP byte/RPC counters for this client."""
+
+        return {
+            "request_bytes": int(self._request_bytes),
+            "response_bytes": int(self._response_bytes),
+            "rpc_count": int(self._rpc_count),
+        }
+
+    def reset_transport_stats(self) -> None:
+        """Exclude health checks and stateful warmups from measured requests."""
+
+        self._request_bytes = 0
+        self._response_bytes = 0
+        self._rpc_count = 0
 
     def _post(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         url = f"{self.server_url}{path}"
-        response = self.session.post(url, json=payload, timeout=self.timeout)
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        response = self.session.post(
+            url,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            timeout=self.timeout,
+        )
+        self._request_bytes += len(body)
+        self._response_bytes += len(response.content)
+        self._rpc_count += 1
         response.raise_for_status()
         return response.json()
 
     def health(self) -> Dict[str, Any]:
         url = f"{self.server_url}/health"
         response = self.session.get(url, timeout=self.timeout)
+        self._response_bytes += len(response.content)
+        self._rpc_count += 1
         response.raise_for_status()
         return response.json()
 
@@ -633,6 +663,7 @@ class EdgeRunner(Decoding):
             samples = [json.loads(line) for line in f.readlines()]
 
         self._warmup_stateful_requests(client, draft_model, tokenizer, samples, proc_id)
+        client.reset_transport_stats()
 
         indexed_samples = shard_samples(
             samples,
@@ -671,6 +702,7 @@ class EdgeRunner(Decoding):
                 actual_arrival_s = 0.0
             arrival_lag_ms = max(0.0, (actual_arrival_s - scheduled_arrival_s) * 1000.0)
             request_start = time.monotonic()
+            transport_before = client.snapshot_transport_stats()
             session_id = client.init_session()
             approx_model_cache = KVCacheModel(
                 draft_model, self.args.temp, self.args.top_k, self.args.top_p
@@ -958,6 +990,11 @@ class EdgeRunner(Decoding):
 
             verify_executor.shutdown(wait=True)
             completion_time = time.monotonic()
+            transport_after = client.snapshot_transport_stats()
+            transport_delta = {
+                key: int(transport_after[key] - transport_before[key])
+                for key in ("request_bytes", "response_bytes", "rpc_count")
+            }
 
             generated_text = tokenizer.decode(
                 prefix[0, input_ids.shape[1]:], skip_special_tokens=True
@@ -1044,6 +1081,13 @@ class EdgeRunner(Decoding):
                 ],
                 "reference": sample.get("reference", sample.get("answer")),
                 "workload_hash": self.args.workload_hash,
+                "request_bytes": transport_delta["request_bytes"],
+                "response_bytes": transport_delta["response_bytes"],
+                "rpc_count": transport_delta["rpc_count"],
+                "transport_bytes_definition": (
+                    "application-layer HTTP JSON body/response bytes; excludes HTTP framing, "
+                    "TCP/IP, and SSH encapsulation"
+                ),
             }
             with open(self._metrics_path(proc_id), "a") as f:
                 f.write(json.dumps(per_task, ensure_ascii=True) + "\n")
