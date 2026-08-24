@@ -14,9 +14,26 @@ echo ""
 
 # 检查仓库
 echo "========== Git 仓库 =========="
-if [ -d ".git" ]; then
+if git rev-parse --git-dir >/dev/null 2>&1; then
     echo "✓ 当前在 Git 仓库中"
-    echo "  分支: $(git branch --show-current)"
+    # The newer branch-display option is unavailable on the Git 1.8.3.1
+    # installed on the CentOS 7 servers.  symbolic-ref works on both old and
+    # new Git; report the commit explicitly when HEAD is detached.
+    branch_ref="$(git symbolic-ref HEAD 2>/dev/null)"
+    if [ -n "$branch_ref" ]; then
+        case "$branch_ref" in
+            refs/heads/*) branch_name="${branch_ref#refs/heads/}" ;;
+            *) branch_name="$branch_ref" ;;
+        esac
+        echo "  分支: $branch_name"
+    else
+        detached_commit="$(git rev-parse --short HEAD 2>/dev/null)"
+        if [ -n "$detached_commit" ]; then
+            echo "  分支: detached (commit $detached_commit)"
+        else
+            echo "  分支: detached (commit unavailable)"
+        fi
+    fi
     echo "  最新提交: $(git log --oneline -1)"
 else
     echo "✗ 当前不在 Git 仓库中"
@@ -55,18 +72,50 @@ echo ""
 
 # 检查模型
 echo "========== 模型路径 =========="
-for model_path in \
-    "/home/hdd/zhangh/models/Qwen3-1.7B" \
-    "/home/hdd/zhangh/models/Qwen3-8B" \
-    "/home/hdd/zhangh/models/Qwen3-0.6B"; do
-    if [ -d "$model_path" ]; then
-        echo "  ✓ $model_path"
-        if [ -f "$model_path/config.json" ]; then
-            vocab_size=$(grep -o '"vocab_size": [0-9]*' "$model_path/config.json" | cut -d' ' -f2)
-            echo "    vocab_size: $vocab_size"
+model_roots=()
+add_model_root() {
+    local candidate_root existing_root
+    candidate_root="$1"
+    [ -n "$candidate_root" ] || return 0
+    for existing_root in "${model_roots[@]}"; do
+        [ "$existing_root" = "$candidate_root" ] && return 0
+    done
+    model_roots[${#model_roots[@]}]="$candidate_root"
+}
+
+# FASTSD_MODEL_ROOTS is a colon-separated override for site-specific layouts.
+# Keep both known server roots as defaults so the same script reports the
+# node3 draft copy and the node2 target copy without assuming one filesystem.
+if [ -n "${FASTSD_MODEL_ROOTS:-}" ]; then
+    saved_ifs="$IFS"
+    IFS=:
+    for configured_root in $FASTSD_MODEL_ROOTS; do
+        add_model_root "$configured_root"
+    done
+    IFS="$saved_ifs"
+fi
+add_model_root "${FASTSD_MODEL_ROOT:-}"
+add_model_root "/home/zhangh/models"
+add_model_root "/home/hdd/zhangh/models"
+[ -n "${HOME:-}" ] && add_model_root "$HOME/models"
+add_model_root "$(pwd)/models"
+
+echo "  搜索根目录: ${model_roots[*]}"
+for model_name in Qwen3-1.7B Qwen3-8B Qwen3-0.6B; do
+    found_model=0
+    for model_root in "${model_roots[@]}"; do
+        model_path="${model_root%/}/$model_name"
+        if [ -d "$model_path" ]; then
+            found_model=1
+            echo "  ✓ $model_path"
+            if [ -f "$model_path/config.json" ]; then
+                vocab_size=$(grep -o '"vocab_size": [0-9]*' "$model_path/config.json" | cut -d' ' -f2)
+                echo "    vocab_size: $vocab_size"
+            fi
         fi
-    else
-        echo "  ✗ $model_path (不存在)"
+    done
+    if [ "$found_model" -eq 0 ]; then
+        echo "  ✗ $model_name (搜索根目录中不存在)"
     fi
 done
 echo ""
@@ -82,10 +131,32 @@ echo ""
 
 # 检查CPU
 echo "========== CPU 信息 =========="
-echo "  CPU核心数: $(nproc)"
-echo "  物理核心: $(lscpu | grep '^Core(s) per socket:' | awk '{print $4}')"
-echo "  Socket数: $(lscpu | grep '^Socket(s):' | awk '{print $2}')"
-echo "  NUMA节点: $(lscpu | grep '^NUMA node(s):' | awk '{print $3}')"
+echo "  CPU核心数: $(nproc 2>/dev/null || echo 'unknown')"
+
+# lscpu's English keys are stable across the two servers when forced through
+# the C locale.  The old script printed only Core(s) per socket (24); report
+# the total physical-core count and retain the inputs used to derive it.
+lscpu_value() {
+    LC_ALL=C lscpu 2>/dev/null | awk -F: -v key="$1" \
+        '$1 ~ ("^" key) { gsub(/[[:space:]]/, "", $2); print $2; exit }'
+}
+cores_per_socket="$(lscpu_value 'Core\(s\) per socket')"
+sockets="$(lscpu_value 'Socket\(s\)')"
+physical_core_inputs_valid=1
+case "$cores_per_socket" in
+    ''|*[!0-9]*) physical_core_inputs_valid=0 ;;
+esac
+case "$sockets" in
+    ''|*[!0-9]*) physical_core_inputs_valid=0 ;;
+esac
+if [ "$physical_core_inputs_valid" -eq 1 ]; then
+    physical_cores=$((cores_per_socket * sockets))
+    echo "  物理核心: $physical_cores (每Socket $cores_per_socket × $sockets Socket)"
+else
+    echo "  物理核心: unknown (lscpu 缺少可验证的 Core(s) per socket/Socket(s))"
+fi
+echo "  Socket数: ${sockets:-unknown}"
+echo "  NUMA节点: $(lscpu_value 'NUMA node\(s\)' || echo 'unknown')"
 echo ""
 
 # 检查内存
