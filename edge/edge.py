@@ -12,7 +12,6 @@ from typing import Any, Dict, List
 
 import requests
 import torch
-from auto_gptq import AutoGPTQForCausalLM
 from transformers import AutoModelForCausalLM
 
 sys.path.append(os.path.join(sys.path[0], "../"))
@@ -148,6 +147,13 @@ class EdgeRunner(Decoding):
         """Load either a GPTQ draft or a regular Transformers checkpoint."""
         quant_config = os.path.join(model_path, "quantize_config.json")
         if os.path.exists(quant_config):
+            try:
+                from auto_gptq import AutoGPTQForCausalLM
+            except ImportError as exc:
+                raise RuntimeError(
+                    "GPTQ draft requested, but auto_gptq is unavailable. "
+                    "Install auto-gptq or provide a non-GPTQ Transformers checkpoint."
+                ) from exc
             return AutoGPTQForCausalLM.from_quantized(
                 model_path,
                 device=device,
