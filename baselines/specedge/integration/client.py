@@ -14,6 +14,8 @@ import torch
 
 INTEGRATION_ROOT = Path(__file__).resolve().parent
 SPECEDGE_ROOT = INTEGRATION_ROOT.parent / "official"
+FASTSD_ROOT = INTEGRATION_ROOT.parents[2]
+sys.path.insert(0, str(FASTSD_ROOT))
 sys.path.insert(0, str(SPECEDGE_ROOT / "src"))
 
 import grpc
@@ -23,29 +25,17 @@ import util
 from config import SpecEdgeClientConfig as config
 
 
-_official_encode = util.encode
-
-
-def _encode_bfloat16_compatible(target: torch.Tensor) -> bytes:
-    if target.dtype == torch.bfloat16:
-        return (
-            target.contiguous()
-            .cpu()
-            .view(torch.uint16)
-            .numpy()
-            .tobytes()
-        )
-    return _official_encode(target)
-
-
-# Official SpecEdge serializes tensors through NumPy, which cannot expose a
-# bfloat16 dtype. Preserve the exact 16-bit payload while leaving its wire
-# format and the server-side torch.frombuffer(..., dtype=bfloat16) unchanged.
-util.encode = _encode_bfloat16_compatible
-
 from specedge.client.specexec import SpecExecClient
 from specedge.engine.graph import GraphEngine
 from specedge_grpc import specedge_pb2, specedge_pb2_grpc
+from src.runtime import configure_torch_threads
+
+from cpu_adapter import (
+    CPUCompatibleSpecEdgeEngine,
+    CPUCompatibleTiming,
+    cpu_timing_adapter,
+)
+from wire_codec import ExplicitSpecEdgeGrpcClient
 
 
 class IntegratedSpecExecClient(SpecExecClient):
@@ -53,11 +43,23 @@ class IntegratedSpecExecClient(SpecExecClient):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # The official client constructs its controller internally. Replace
+        # only the transport object with the explicit repository adapter; the
+        # official Tree/SpecExec/proactive logic remains the execution core.
+        self._validator = ExplicitSpecEdgeGrpcClient(
+            config.host,
+            self._device,
+            wire_mask_dtype=torch.bfloat16,
+        )
         self.measurement_start = None
         self.first_token_time = None
 
     async def _cycle(self, req_idx: int, step_idx: int, prefill=False):
-        fresh_tokens = await super()._cycle(req_idx, step_idx, prefill=prefill)
+        if self._device.type == "cpu":
+            with cpu_timing_adapter():
+                fresh_tokens = await super()._cycle(req_idx, step_idx, prefill=prefill)
+        else:
+            fresh_tokens = await super()._cycle(req_idx, step_idx, prefill=prefill)
         if self.first_token_time is None:
             self.first_token_time = time.perf_counter()
         return fresh_tokens
@@ -115,32 +117,79 @@ def load_shard() -> list[dict]:
     return records[config.client_idx :: num_clients]
 
 
+async def warmup_specedge(engine, tokenizer, records: list[dict]) -> int:
+    """Run official SpecExec cycles before the timed workload.
+
+    The official result logger records these cycles with negative request IDs;
+    the suite normalizer excludes those IDs.  Completion JSONL is only opened
+    after this function returns, so warmups cannot enter request-level metrics.
+    """
+
+    count = int(os.environ.get("FASTSD_EVAL_WARMUP_REQUESTS", "0"))
+    if count < 0:
+        raise ValueError("FASTSD_EVAL_WARMUP_REQUESTS must be non-negative")
+    if count == 0 or not records:
+        return 0
+    original_max_new_tokens = int(config.max_new_tokens)
+    config.max_new_tokens = 1
+    try:
+        prompt = format_prompt(tokenizer, records[0])
+        for warmup_idx in range(count):
+            warmup_client = IntegratedSpecExecClient(
+                engine=engine,
+                tokenizer=tokenizer,
+                prompt=prompt,
+                max_len=config.max_len,
+            )
+            await warmup_client.generate_exact(-1 - warmup_idx)
+    finally:
+        config.max_new_tokens = original_max_new_tokens
+    return count
+
+
 async def main():
     logger = log.get_logger()
     records = load_shard()
     random.seed(config.seed + config.client_idx)
 
+    if config.device.type == "cpu":
+        configure_torch_threads(int(os.environ.get("SPECEDGE_THREADS", "1")))
     logger.info("Loading draft model %s on %s", config.draft_model, config.device)
     draft_model = util.load_graph_model(
         name=config.draft_model,
         device=config.device,
         dtype=config.dtype,
     )
-    engine = GraphEngine(
-        model=draft_model,
-        max_len=config.max_len,
-        max_n_beams=config.max_n_beams,
-    )
+    if config.device.type == "cpu":
+        engine = CPUCompatibleSpecEdgeEngine(
+            model=draft_model,
+            max_len=config.max_len,
+            max_n_beams=config.max_n_beams,
+        )
+    else:
+        engine = GraphEngine(
+            model=draft_model,
+            max_len=config.max_len,
+            max_n_beams=config.max_n_beams,
+        )
     tokenizer = util.load_tokenizer(config.draft_model)
 
     with grpc.insecure_channel(config.host) as channel:
         stub = specedge_pb2_grpc.SpecEdgeServiceStub(channel)
         _ = stub.Sync(specedge_pb2.SyncRequest())
 
+    warmup_count = await warmup_specedge(engine, tokenizer, records)
+
     start_epoch = float(os.environ["FASTSD_EVAL_START_EPOCH"])
+    # A slow model warmup must not shift the scheduled workload origin.
+    delay = start_epoch - time.time()
+    if delay > 0:
+        await asyncio.sleep(delay)
     completion_dir = Path(os.environ["FASTSD_EVAL_COMPLETION_DIR"])
     completion_dir.mkdir(parents=True, exist_ok=True)
     output_path = completion_dir / f"client_{config.client_idx}_requests.jsonl"
+    if output_path.exists():
+        raise FileExistsError(f"refusing to overwrite SpecEdge completion output: {output_path}")
 
     with output_path.open("w", encoding="utf-8") as output:
         for record in records:
@@ -189,8 +238,17 @@ async def main():
                     else 0.0
                 ),
                 "output_text": completion,
+                "output_token_ids": [int(token_id) for token_id in generated_ids.tolist()],
                 "reference": record.get("reference"),
                 "workload_hash": os.environ.get("FASTSD_EVAL_WORKLOAD_HASH"),
+                "method": os.environ.get("FASTSD_EVAL_METHOD", "specedge_cpu_adapted"),
+                "engine_adapter": (
+                    "specedge_cpu_adapted"
+                    if config.device.type == "cpu"
+                    else "official_graph_engine"
+                ),
+                "warmup_requests_per_client": warmup_count,
+                "warmup_included_in_metrics": False,
             }
             output.write(json.dumps(payload, ensure_ascii=False) + "\n")
             output.flush()

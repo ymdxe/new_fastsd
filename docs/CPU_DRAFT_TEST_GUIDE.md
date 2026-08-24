@@ -1,3 +1,10 @@
+# 说明：旧版一次性 worker 仅作通信 smoke harness
+
+本文件中的 `scripts/cpu_draft_worker.py` `/generate` 路径不是 FastSD 的正式实现，不能
+替代 `EdgeClient` 的 `/session/init`、`/prefill`、`/verify` 和 rollback/KV 生命周期。
+正式四方法实验请使用 `scripts/eval_suite.py prepare/plan`；max_new_tokens=16 的历史结果
+只能标为 `communication_smoke`。
+
 # CPU Draft + GPU Target 通信测试指南
 
 ## 概述

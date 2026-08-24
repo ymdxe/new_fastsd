@@ -18,6 +18,7 @@ from .kvcache_varlen import varlen_generate, supports_varlen_model
 from .kvcache4RC import KVCacheModel as KVCache2Model
 from .cache_offload_policy import should_offload_target_cache
 from .util import seed_everything, norm_logits, sample, max_fn
+from .runtime import resolve_dtype, synchronize
 from transformers.cache_utils import DynamicCache
 import queue
 from collections import defaultdict, deque
@@ -68,7 +69,12 @@ class Decoding(ABC):
         self.num_acc_tokens = []
         self.last_generation_metrics = {}
 
-    def _load_model_on_device(self, model_path: str, device: str):
+    def _load_model_on_device(
+        self,
+        model_path: str,
+        device: str,
+        dtype: str | torch.dtype | None = None,
+    ):
         quant_config = os.path.join(model_path, "quantize_config.json")
         if os.path.exists(quant_config):
             if AutoGPTQForCausalLM is None:
@@ -85,7 +91,7 @@ class Decoding(ABC):
         return AutoModelForCausalLM.from_pretrained(
             model_path,
             device_map={"": device},
-            torch_dtype=torch.bfloat16,
+            torch_dtype=resolve_dtype(dtype, device),
             trust_remote_code=True,
         ).eval()
     
@@ -94,16 +100,22 @@ class Decoding(ABC):
         self.color_print(f"Loading models:\n{self.args.draft_model}\n{self.args.target_model}", 3)
         if self.args.eval_mode == "small":
             self.draft_model = self._load_model_on_device(
-                self.args.draft_model, self.args.draft_device
+                self.args.draft_model,
+                self.args.draft_device,
+                getattr(self.args, "draft_dtype", "auto"),
             )
         elif self.args.eval_mode == "large":
             self.target_model = AutoModelForCausalLM.from_pretrained(self.args.target_model, device_map="auto", torch_dtype=torch.bfloat16, trust_remote_code=True).eval()
         elif self.args.eval_mode == "sd":
             self.draft_model = self._load_model_on_device(
-                self.args.draft_model, self.args.draft_device
+                self.args.draft_model,
+                self.args.draft_device,
+                getattr(self.args, "draft_dtype", "auto"),
             )
             self.target_model = self._load_model_on_device(
-                self.args.target_model, self.args.target_device
+                self.args.target_model,
+                self.args.target_device,
+                getattr(self.args, "target_dtype", "bfloat16"),
             )
 
         elif self.args.eval_mode in ["para_sd", "para_sd_wo_1", "para_sd_wo_1"]:
@@ -139,7 +151,9 @@ class Decoding(ABC):
         return AutoModelForCausalLM.from_pretrained(
             model_path,
             device_map={"": device},
-            torch_dtype=torch.bfloat16,
+            torch_dtype=resolve_dtype(
+                getattr(self.args, "target_dtype", "bfloat16"), device
+            ),
             trust_remote_code=True,
         ).eval()
 
@@ -251,9 +265,9 @@ class Decoding(ABC):
             idx_next = sample(last_p)
             x = torch.cat((x, idx_next), dim=1)
             if first_token_time is None:
-                torch.cuda.synchronize(model.device)
+                synchronize(model.device)
                 first_token_time = time.perf_counter()
-        torch.cuda.synchronize(model.device)
+        synchronize(model.device)
         completion_time = time.perf_counter()
         generated_tokens = int(x.shape[1] - prefix_len)
         self.last_generation_metrics = {
@@ -327,9 +341,9 @@ class Decoding(ABC):
             prefix = torch.cat((prefix, t), dim=1)
             prefix = prefix[:, :max_tokens]
             if first_token_time is None:
-                torch.cuda.synchronize(draft_device)
+                synchronize(draft_device)
                 first_token_time = time.perf_counter()
-        torch.cuda.synchronize(draft_device)
+        synchronize(draft_device)
         completion_time = time.perf_counter()
         generated_tokens = int(prefix.shape[1] - original_prefix_len)
         self.last_generation_metrics = {

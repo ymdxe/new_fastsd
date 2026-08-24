@@ -12,6 +12,10 @@ from pathlib import Path
 
 import yaml
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT))
+from src.run_artifacts import append_command, append_status
+
 
 INTEGRATION_ROOT = Path(__file__).resolve().parent
 SPECEDGE_ROOT = INTEGRATION_ROOT.parent / "official"
@@ -22,6 +26,10 @@ def _client_environment(config: dict, client_idx: int, device: str, start_epoch:
     client = config["client"]
     proactive = client["proactive"]
     integration = config["integration"]
+    client_dtype = client.get(
+        "dtype",
+        "fp32" if str(device).split(":", 1)[0] == "cpu" else base["dtype"],
+    )
     values = {
         "SPECEDGE_OPTIMIZATION": config["opt"],
         "SPECEDGE_RESULT_PATH": base["result_path"],
@@ -31,7 +39,9 @@ def _client_environment(config: dict, client_idx: int, device: str, start_epoch:
         "SPECEDGE_MAX_LEN": base["max_len"],
         "SPECEDGE_DRAFT_MODEL": client["draft_model"],
         "SPECEDGE_DEVICE": device,
-        "SPECEDGE_DTYPE": base["dtype"],
+        "SPECEDGE_DTYPE": client_dtype,
+        "SPECEDGE_ENGINE": client.get("engine", "official_graph_engine"),
+        "SPECEDGE_THREADS": client.get("threads", 1),
         "SPECEDGE_DATASET": client["dataset"],
         "SPECEDGE_MAX_N_BEAMS": client["max_n_beams"],
         "SPECEDGE_MAX_BEAM_LEN": client["max_beam_len"],
@@ -54,9 +64,11 @@ def _client_environment(config: dict, client_idx: int, device: str, start_epoch:
         "FASTSD_EVAL_NUM_CLIENTS": config["server"]["num_clients"],
         "FASTSD_EVAL_START_EPOCH": start_epoch,
         "FASTSD_EVAL_WORKLOAD_HASH": integration["workload_hash"],
+        "FASTSD_EVAL_METHOD": integration.get("method", "specedge_cpu_adapted"),
         "FASTSD_EVAL_ARRIVAL_DISTRIBUTION": integration.get(
             "arrival_distribution", "immediate"
         ),
+        "FASTSD_EVAL_WARMUP_REQUESTS": integration.get("warmup_requests", 0),
     }
     return {key: str(value) for key, value in values.items()}
 
@@ -66,11 +78,7 @@ def main(config_file: str) -> int:
         config = yaml.safe_load(handle)
 
     start_epoch = time.time() + float(config["integration"].get("startup_delay_s", 15.0))
-    python = Path(
-        config["integration"].get(
-            "python", SPECEDGE_ROOT / ".venv" / "bin" / "python"
-        )
-    )
+    python = Path(config["integration"].get("python", sys.executable))
     client_script = INTEGRATION_ROOT / "client.py"
     processes: list[subprocess.Popen] = []
     client_idx = 0
@@ -105,7 +113,28 @@ def main(config_file: str) -> int:
             f"configured {client_idx} clients but server.num_clients="
             f"{config['server']['num_clients']}"
         )
-    return max((process.wait() for process in processes), default=0)
+    exit_code = max((process.wait() for process in processes), default=0)
+    integration = config["integration"]
+    command = shlex.join([str(python), str(client_script), "--config", str(config_file)])
+    status_path = integration.get("status_path")
+    if status_path:
+        append_status(
+            status_path,
+            method=integration.get("method", "specedge_cpu_adapted"),
+            phase="run",
+            exit_code=exit_code,
+            command=command,
+        )
+    commands_path = integration.get("commands_path")
+    if commands_path:
+        append_command(
+            commands_path,
+            command,
+            config=config_file,
+            status=exit_code,
+            note=integration.get("method", "specedge_cpu_adapted"),
+        )
+    return exit_code
 
 
 if __name__ == "__main__":

@@ -1,16 +1,40 @@
-# FastSD / SpecEdge / 标准投机解码 / Draft-only 统一评测
+# FastSD / SpecEdge CPU adapter / 标准投机解码 / Draft-only 统一评测
 
 本评测入口让四种方法读取同一份请求清单，并统一模型、生成长度、到达过程和指标定义：
 
 | 方法名 | 实际执行路径 | 拓扑 |
 |---|---|---|
 | `fastsd` | FastSD 调度与协议 | 多个 A5000 draft + 网络 + 一个 A6000 target |
-| `specedge` | 固定版本的官方 SpecEdge 核心 + 本仓库数据/指标适配器 | 多个 A5000 client + 网络 + 一个 A6000 server |
+| `specedge_cpu_adapted` | 固定版本的官方 Tree/SpecExec/proactive 核心 + 本仓库显式 CPU engine/wire adapter | CPU draft + 网络 + 一个 A6000 server |
 | `standard_sd` | FastSD 的 `vanilla` profile，关闭主动 draft、pipeline 和 FastSD 调度 | 与 FastSD 相同 |
 | `draft_only` | 独立 draft worker 池，不访问 target | 与前三组相同数量的 A5000 |
 
 官方源码仍固定在 `baselines/specedge/official/`，适配代码只放在
-`baselines/specedge/integration/`，没有改写官方子模块的算法实现。
+`baselines/specedge/integration/`，没有改写官方子模块的算法实现。CPU 运行必须标为
+`specedge_cpu_adapted`，不能写成 untouched official SpecEdge。
+
+## 本次 CPU draft / GPU target 实验边界
+
+- FastSD、standard SD、`specedge_cpu_adapted` 的 draft 都使用 CPU fp32；node2 target 使用
+  bf16。FastSD 保持 `EdgeClient` 的 `/session/init`、`/prefill`、`/verify` 和 rollback/KV
+  生命周期，不使用一次性 `/generate` worker。
+- latency track 是单个 stateful 进程、32 个 PyTorch CPU threads；throughput track 才配置
+  4 个进程、每个 8 threads。`scripts/prepare_32worker_experiment.py` 生成的是历史一次性
+  worker/多模型副本方案，现已阻止作为本实验入口。
+- node3 interpreter 由 `eval_suite.py plan --python <absolute-interpreter>` 显式传入并原样
+  写入 `commands.txt`；target URL/端口和两端 bind host 也由配置提供，默认只绑定
+  `127.0.0.1`。受限网络时，在 node3 使用本地端口转发，把 `127.0.0.1:18001` 转发到
+  node2 的 `127.0.0.1:18001`；不要假设 node3 到 node2 的应用端口直连可用。网络路径
+  开销必须计入 TTFT/E2E。
+- shared-load CPU 口径固定为物理 CPU `56-71,80-95`（NUMA node2/node3 各 16 核），
+  统一前缀为 `nice -n 5 numactl --physcpubind=56-71,80-95 --interleave=2,3`，并设置
+  OMP/MKL/OpenBLAS/Torch threads=32。`cpu_preflight.json` 与 `cpu_postflight.json` 保存
+  affinity、loadavg 和 `mpstat` 快照；manifest 记录 `shared_load`、cpuset、method order
+  与 `repeat_index`。不停止或重绑其他用户进程。
+- `target_only` 是 greedy oracle，只用于 token parity/质量参照，不计入四方法性能表。
+- `max_new_tokens=16` 的结果只称为 `communication_smoke`；HumanEval、MGSM、GSM8K 和
+  MT-Bench 的质量结论应使用更长的生成预算。当前 MT-Bench canonical 路径只取第一轮，
+  因此必须标为 `first_turn_only`，不能宣称完整 MT-Bench judge。
 
 ## 支持的数据集
 
@@ -29,15 +53,25 @@
 默认实验配置是：
 
 ```text
-configs/evaluation/qwen3_8b_0.6b_humaneval.json
-draft  = /home/hdd/zhangh/models/Qwen3-0.6B
-target = /home/hdd/zhangh/models/Qwen3-8B
-HumanEval, 164 requests, Poisson 1 RPS, seed 1234
+configs/evaluation/qwen3_8b_1.7b_four_method_cpu.json
+draft  = /path/to/models/Qwen3-1.7B
+target = /path/to/models/Qwen3-8B
+HumanEval, 164 requests, immediate arrival, seed 42
 max_new_tokens=256, temperature=0, gamma=4, stop_policy=eos
-2 x A5000 draft, 1 x A6000 target
+1 x 32-thread CPU draft, 1 x logical cuda:0 target
 ```
 
-换数据集时只需复制 JSON 配置并修改 `dataset.name`、`data_path`、请求数和到达率。
+四个正式数据集配置由同一模板生成，保证 generation/topology/seed 一致，且 run ID 唯一：
+
+```bash
+python scripts/make_evaluation_matrix.py \
+  --base-config configs/evaluation/qwen3_8b_1.7b_four_method_cpu.json \
+  --data-root data \
+  --output-dir configs/evaluation/matrix/qwen3_8b_1.7b_four_method_cpu
+```
+
+入口生成 HumanEval-164、MGSM-110、GSM8K-1319、MT-Bench-80 四个 config 和
+`matrix_manifest.json`；MT-Bench 明确写入 `first_turn_only`。不要手工修改四份 JSON。
 
 ## 运行前检查
 
@@ -74,15 +108,28 @@ cd /home/hdd/zhangh/workspace/new_fastsd
   --config configs/evaluation/qwen3_8b_0.6b_humaneval.json
 ```
 
-然后生成按窗口和服务器区分的可复制命令：
+然后生成按窗口和服务器区分的可复制命令（示例中的 `python` 可替换为 node3 的显式
+Python 3.14 interpreter）：
 
 ```bash
-/home/hdd/zhangh/envs/new_fastsd/bin/python scripts/eval_suite.py plan \
-  --config configs/evaluation/qwen3_8b_0.6b_humaneval.json
+python scripts/eval_suite.py plan \
+  --config configs/evaluation/qwen3_8b_1.7b_four_method_cpu.json \
+  --python /absolute/path/to/python314_glibc \
+  --target-host 127.0.0.1 --target-port 18001
 ```
 
+若 node3 到 node2 的应用端口被策略丢弃，在执行上述计划前由现场网络方案建立双段
+SSH 本地转发（占位示意，不包含凭据或固定主机名）：
+
+```bash
+ssh -J <jump-host> -N -L 18001:127.0.0.1:18001 <node2-hop>
+```
+
+SpecEdge 端口同样按现场拓扑决定是否转发到 node3 的 `127.0.0.1:18000`。计划中的
+`target_host/specedge_host` 可以覆盖，不能写死不可达的 `node2`。
+
 `prepare` 和 `plan` 会把带 UTC 时间戳的命令块追加保存到
-`exp/comparison/<run_id>/commands.txt`。FastSD 和 standard SD 的 Edge 启动脚本还会在
+`exp/comparison/<run_id>/commands.txt`，并记录 `run_status.jsonl`。FastSD 和 standard SD 的 Edge 启动脚本还会在
 实际启动前，把最终展开后的 `python edge/edge.py ...` 命令追加到各自实验目录的
 `commands.txt`，因此该文件同时保留计划命令和实际执行命令。
 
@@ -111,7 +158,7 @@ RUN=/home/hdd/zhangh/workspace/new_fastsd/exp/comparison/qwen3_8b_0.6b_humaneval
 CFG=configs/evaluation/qwen3_8b_0.6b_humaneval.json
 
 /home/hdd/zhangh/envs/new_fastsd/bin/python scripts/eval_suite.py normalize --config "$CFG" --method fastsd --input "$RUN/fastsd"
-/home/hdd/zhangh/envs/new_fastsd/bin/python scripts/eval_suite.py normalize --config "$CFG" --method specedge --input "$RUN/specedge/raw/qwen3_8b_0.6b_humaneval"
+python scripts/eval_suite.py normalize --config "$CFG" --method specedge_cpu_adapted --input "$RUN/specedge/raw/qwen3_8b_1.7b_four_method_cpu_humaneval"
 /home/hdd/zhangh/envs/new_fastsd/bin/python scripts/eval_suite.py normalize --config "$CFG" --method standard_sd --input "$RUN/standard_sd"
 /home/hdd/zhangh/envs/new_fastsd/bin/python scripts/eval_suite.py normalize --config "$CFG" --method draft_only --input "$RUN/draft_only"
 ```
@@ -137,12 +184,21 @@ evaluate_functional_correctness \
 
 ## 当前验证边界
 
-2026-08-13 已在同一 MT-Bench 80 请求 manifest 上完成 FastSD、官方 SpecEdge 核心加评测
-适配层、standard SD 和 draft-only 四方法单次完整运行。SpecEdge 使用 node1 两张 A5000、
-node2 GPU0 一张 A6000、Python 3.14.7 和官方 lockfile 环境，80/80 请求完成且两端错误为 0。
-完整拓扑、命令、指标和证据边界见
+2026-08-13 的历史记录曾在同一 MT-Bench 80 请求 manifest 上完成旧 GPU 拓扑的四方法运行，
+不能作为本次 CPU56-71,80-95 shared-load 结果。当前 target 只使用逻辑 `cuda:0`；物理
+GPU 选择由外部 `CUDA_VISIBLE_DEVICES` 决定，不在配置中硬编码物理编号。完整拓扑、命令、
+指标和证据边界见
 `docs/plans/2026-08-13-qwen3-cross-server-full-experiment.md`。
 
-这些结果仍不是论文级最终结论：尚未运行多 seed 和统一 MT-Bench LLM judge，且三种 8B
-Target 路径的逐 token output parity 尚未通过。性能数据可用于当前硬件/配置比较，不能替代
-质量与正确性验证。
+历史目录中的 16-token 四方法结果只证明通信路径覆盖，不是完整质量评测；旧结果中的
+`specedge` GPU client 也不能作为本次 `specedge_cpu_adapted` 结论。新运行应在 target-only
+oracle 完成后执行：
+
+```bash
+python scripts/eval_suite.py parity --config "$CFG" \
+  --input fastsd="$RUN/normalized/fastsd/requests.jsonl" \
+  --input specedge_cpu_adapted="$RUN/normalized/specedge_cpu_adapted/requests.jsonl" \
+  --input standard_sd="$RUN/normalized/standard_sd/requests.jsonl" \
+  --input draft_only="$RUN/normalized/draft_only/requests.jsonl" \
+  --input target_only="$RUN/target_only/requests.jsonl"
+```

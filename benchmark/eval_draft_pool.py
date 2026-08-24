@@ -6,6 +6,7 @@ import argparse
 import json
 import multiprocessing as mp
 import os
+import shlex
 import sys
 import time
 from pathlib import Path
@@ -25,6 +26,8 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from src.common_metrics import summarize_requests, write_json
 from src.evaluation import load_canonical_jsonl
+from src.run_artifacts import append_command, append_status, write_text_once
+from src.runtime import configure_torch_threads, resolve_dtype, synchronize
 from src.util import norm_logits, sample, seed_everything
 
 
@@ -53,7 +56,7 @@ def _encode_prompt(tokenizer, prompt: str, dataset: str) -> torch.Tensor:
     return input_ids
 
 
-def _load_model(model_path: str, device: str):
+def _load_model(model_path: str, device: str, dtype: str | None = "auto"):
     if (Path(model_path) / "quantize_config.json").is_file():
         if AutoGPTQForCausalLM is None:
             raise RuntimeError("auto_gptq is required for a quantized draft model")
@@ -67,7 +70,7 @@ def _load_model(model_path: str, device: str):
     return AutoModelForCausalLM.from_pretrained(
         model_path,
         device_map={"": device},
-        torch_dtype=torch.bfloat16,
+        torch_dtype=resolve_dtype(dtype, device),
         trust_remote_code=True,
     ).eval()
 
@@ -94,12 +97,12 @@ def _generate(model, input_ids, tokenizer, generation: dict[str, Any]) -> tuple[
         next_token = sample(probabilities)
         output_ids = torch.cat((output_ids, next_token), dim=1)
         if first_token_time is None:
-            torch.cuda.synchronize(device)
+            synchronize(device)
             first_token_time = time.perf_counter()
         if tokenizer.eos_token_id is not None and int(next_token.item()) == tokenizer.eos_token_id:
             break
 
-    torch.cuda.synchronize(device)
+    synchronize(device)
     end = time.perf_counter()
     generated_tokens = int(output_ids.shape[1] - prompt_len)
     if first_token_time is None:
@@ -129,9 +132,20 @@ def _worker(
     workload_hash: str,
     num_workers: int,
     arrival_distribution: str,
+    threads: int | None,
+    warmup_requests: int,
 ) -> None:
+    configure_torch_threads(threads)
     model = _load_model(model_path, device)
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    if warmup_requests < 0:
+        raise ValueError("warmup_requests must be non-negative")
+    if warmup_requests and records:
+        warmup_generation = {**generation, "max_new_tokens": 1}
+        warmup_input = _encode_prompt(tokenizer, records[0]["prompt"], records[0]["dataset"])
+        for warmup_idx in range(warmup_requests):
+            seed_everything(100000 + worker_idx * warmup_requests + warmup_idx)
+            _generate(model, warmup_input, tokenizer, warmup_generation)
     barrier.wait()
     if worker_idx == 0:
         start_epoch.value = time.time()
@@ -178,6 +192,7 @@ def _worker(
                 "tpot_ms": float(model_metrics["tpot_ms"]),
                 "e2e_ms": request_e2e_ms,
                 "output_text": tokenizer.decode(generated_ids, skip_special_tokens=True),
+                "output_token_ids": [int(token_id) for token_id in generated_ids.tolist()],
                 "reference": record.get("reference"),
             }
             output.write(json.dumps(payload, ensure_ascii=False) + "\n")
@@ -193,11 +208,23 @@ def run(config_path: str) -> int:
         raise FileNotFoundError("run scripts/eval_suite.py prepare before draft-only evaluation")
     records = load_canonical_jsonl(canonical_path)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    devices = list(config["topology"]["specedge_draft_devices"])
+    topology = config["topology"]
+    if "draft_only_devices" in topology:
+        devices = list(topology["draft_only_devices"])
+    elif "draft_device" in topology:
+        devices = [str(topology["draft_device"])]
+    else:
+        devices = list(topology["specedge_draft_devices"])
     if not devices:
         raise ValueError("topology.specedge_draft_devices must contain at least one device")
     output_dir = run_root / "draft_only"
     output_dir.mkdir(parents=True, exist_ok=True)
+    for existing in output_dir.glob("requests_worker*.jsonl"):
+        raise FileExistsError(f"refusing to overwrite existing draft-only output: {existing}")
+    if (output_dir / "requests.jsonl").exists():
+        raise FileExistsError(f"refusing to overwrite existing draft-only output: {output_dir / 'requests.jsonl'}")
+
+    threads = config["topology"].get("draft_threads")
 
     ctx = mp.get_context("spawn")
     barrier = ctx.Barrier(len(devices))
@@ -221,6 +248,8 @@ def run(config_path: str) -> int:
                 manifest["workload_hash"],
                 len(devices),
                 config["dataset"].get("arrival_distribution", "immediate"),
+                int(threads) if threads is not None else None,
+                int(config["topology"].get("warmup_requests", 0)),
             ),
         )
         process.start()
@@ -236,16 +265,28 @@ def run(config_path: str) -> int:
         with path.open("r", encoding="utf-8") as handle:
             request_records.extend(json.loads(line) for line in handle if line.strip())
     request_records.sort(key=lambda item: int(item["global_index"]))
-    with (output_dir / "requests.jsonl").open("w", encoding="utf-8") as output:
-        for record in request_records:
-            output.write(json.dumps(record, ensure_ascii=False) + "\n")
+    write_text_once(
+        output_dir / "requests.jsonl",
+        "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in request_records),
+    )
     summary = summarize_requests(
         request_records,
         method="draft_only",
         dataset=config["dataset"]["name"],
         workload_hash=manifest["workload_hash"],
         run_id=config["run_id"],
-        extra={"draft_model": config["models"]["draft"], "num_workers": len(devices)},
+        evaluation_scope=(
+            "communication_smoke"
+            if int(config["generation"].get("max_new_tokens", 0)) <= 16
+            else "quality"
+        ),
+        extra={
+            "draft_model": config["models"]["draft"],
+            "num_workers": len(devices),
+            "draft_threads": threads,
+            "warmup_requests_per_worker": int(config["topology"].get("warmup_requests", 0)),
+            "warmup_included_in_metrics": False,
+        },
     )
     write_json(summary, output_dir / "common_summary.json")
     print(json.dumps(summary, indent=2, ensure_ascii=False))
@@ -256,4 +297,42 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
     args = parser.parse_args()
-    raise SystemExit(run(args.config))
+    try:
+        exit_code = run(args.config)
+    except Exception as exc:
+        try:
+            failed_config = json.loads(Path(args.config).read_text(encoding="utf-8"))
+            failed_root = REPO_ROOT / "exp" / "comparison" / failed_config["run_id"]
+            append_status(
+                failed_root / "run_status.jsonl",
+                method="draft_only",
+                phase="run",
+                exit_code=1,
+                error=repr(exc),
+            )
+            append_command(
+                failed_root / "commands.txt",
+                shlex.join(sys.argv),
+                status=1,
+                note="draft_only",
+            )
+        finally:
+            raise
+    else:
+        try:
+            success_config = json.loads(Path(args.config).read_text(encoding="utf-8"))
+            success_root = REPO_ROOT / "exp" / "comparison" / success_config["run_id"]
+            append_status(
+                success_root / "run_status.jsonl",
+                method="draft_only",
+                phase="run",
+                exit_code=exit_code,
+            )
+            append_command(
+                success_root / "commands.txt",
+                shlex.join(sys.argv),
+                status=exit_code,
+                note="draft_only",
+            )
+        finally:
+            raise SystemExit(exit_code)

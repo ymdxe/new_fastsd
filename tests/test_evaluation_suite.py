@@ -130,7 +130,7 @@ class SpecEdgeAdapterTests(unittest.TestCase):
         self.assertEqual(rendered["integration"]["server_port"], 18000)
         self.assertEqual(
             rendered["integration"]["python"],
-            "/home/hdd/zhangh/envs/specedge/bin/python",
+            "python",
         )
 
     def test_specedge_mt_bench_adapter_uses_chat_template_and_immediate_arrivals(self):
@@ -144,8 +144,16 @@ class SpecEdgeAdapterTests(unittest.TestCase):
         self.assertIn("tokenizer.apply_chat_template", source)
         self.assertIn("enable_thinking=False", source)
         self.assertIn("actual_arrival = 0.0", source)
-        self.assertIn("target.dtype == torch.bfloat16", source)
-        self.assertIn("view(torch.uint16)", source)
+        wire_source = (
+            Path(__file__).parents[1]
+            / "baselines"
+            / "specedge"
+            / "integration"
+            / "wire_codec.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("torch.bfloat16", wire_source)
+        self.assertIn("view(torch.uint16)", wire_source)
+        self.assertIn("ExplicitSpecEdgeGrpcClient", wire_source)
         server_source = (
             Path(__file__).parents[1]
             / "baselines"

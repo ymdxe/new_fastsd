@@ -22,7 +22,8 @@ esac
 COMMON_ARGS=(--profile "$PROFILE" --exp_name "$EXP_NAME" --server_sched_mode "vanilla" "$@")
 
 SERVER_URL_VALUE="${SERVER_URL:-http://127.0.0.1:8001}"
-EDGE_COMMAND=(python edge/edge.py --server_url "$SERVER_URL_VALUE" "${COMMON_ARGS[@]}")
+PYTHON_BIN_VALUE="${PYTHON_BIN:-python}"
+EDGE_COMMAND=("$PYTHON_BIN_VALUE" edge/edge.py --server_url "$SERVER_URL_VALUE" "${COMMON_ARGS[@]}")
 COMMAND_LOG="${REPO_ROOT}/exp/${EXP_NAME}/commands.txt"
 mkdir -p "$(dirname "$COMMAND_LOG")"
 {
@@ -32,6 +33,12 @@ mkdir -p "$(dirname "$COMMAND_LOG")"
   printf '\n'
 } >> "$COMMAND_LOG"
 
+set +e
 "${EDGE_COMMAND[@]}"
-
+EXIT_STATUS=$?
+set -e
+{
+  printf 'exit_status=%s\n' "$EXIT_STATUS"
+} >> "$COMMAND_LOG"
 echo "Done. Metrics summary: $(pwd)/exp/${EXP_NAME}/edge_metrics_summary.json"
+exit "$EXIT_STATUS"

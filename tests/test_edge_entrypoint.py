@@ -14,6 +14,9 @@ class EdgeEntrypointTests(unittest.TestCase):
         self.assertIn('self.args.dataset != "mt_bench"', source)
         self.assertIn("tokenizer.apply_chat_template", source)
         self.assertIn("enable_thinking=False", source)
+        self.assertIn("configure_torch_threads", source)
+        self.assertIn("resolve_dtype", source)
+        self.assertIn("if torch.cuda.is_available()", source)
 
 
 if __name__ == "__main__":

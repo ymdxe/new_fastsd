@@ -1,3 +1,10 @@
+# Deprecated: legacy one-shot worker experiment
+
+本文档保留为历史记录。它描述的一次性 `/generate` worker、多模型副本和手工 SpecEdge
+KV patch 不符合当前 stateful 四方法实验；`scripts/prepare_32worker_experiment.py` 已
+主动拒绝执行。请改用 `scripts/eval_suite.py prepare/plan`，主 latency track 为单进程
+32 threads，throughput track 才使用 4x8，并使用仓库内显式 CPU/线缆 adapter。
+
 # 32-Worker CPU+GPU 实验指南
 
 本文档说明如何在 node2（GPU target）+ node3（32 CPU draft workers）上运行 FastSD 和 SpecEdge 对比实验。

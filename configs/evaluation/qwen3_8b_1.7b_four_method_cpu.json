@@ -1,0 +1,58 @@
+{
+  "run_id": "qwen3_8b_1.7b_four_method_cpu_humaneval",
+  "repo_path_linux": "/path/to/fastsd",
+  "dataset": {
+    "name": "humaneval",
+    "data_path": "data",
+    "max_requests": 164,
+    "arrival_distribution": "immediate",
+    "arrival_rate_rps": 1.0,
+    "arrival_seed": 1234
+  },
+  "models": {
+    "draft": "/path/to/models/Qwen3-1.7B",
+    "target": "/path/to/models/Qwen3-8B"
+  },
+  "generation": {
+    "max_new_tokens": 256,
+    "temperature": 0.0,
+    "top_k": 0,
+    "top_p": 1.0,
+    "seed": 42,
+    "gamma": 4,
+    "stop_policy": "eos",
+    "target_dtype": "bfloat16"
+  },
+  "topology": {
+    "track": "latency",
+    "concurrency": 1,
+    "warmup_requests": 10,
+    "target_host": "127.0.0.1",
+    "target_port": 18001,
+    "target_bind_host": "127.0.0.1",
+    "specedge_host": "127.0.0.1:18000",
+    "specedge_port": 18000,
+    "specedge_bind_host": "127.0.0.1",
+    "specedge_target_device": "cuda:0",
+    "standard_sd_target_device": "cuda:0",
+    "target_only_device": "cuda:0",
+    "specedge_draft_devices": ["cpu"],
+    "draft_only_devices": ["cpu"],
+    "draft_workers": 1,
+    "draft_threads": 32,
+    "target_threads": 1,
+    "cpu_prefix": "nice -n 5 numactl --physcpubind=56-71,80-95 --interleave=2,3",
+    "shared_load": true,
+    "fixed_cpuset": "56-71,80-95",
+    "physical_cpu_count": 32,
+    "numa_cores_per_node": 16,
+    "numa_node_ids": [2, 3],
+    "method_order": ["fastsd", "specedge_cpu_adapted", "standard_sd", "draft_only"],
+    "repeat_index": 0
+  },
+  "execution": {
+    "python": "python",
+    "specedge_python": "python",
+    "target_python": "python"
+  }
+}

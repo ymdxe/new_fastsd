@@ -19,6 +19,13 @@ https://github.com/kaist-ina/specedge.git
 导出生成文本；官方 `official/` 子模块保持不变。完整流程见
 [`docs/FOUR_METHOD_EVALUATION.md`](../../docs/FOUR_METHOD_EVALUATION.md)。
 
+当 draft device 是 CPU 时，`integration/cpu_adapter.py` 提供
+`CPUCompatibleSpecEdgeEngine` 和 CPU-safe timing boundary；它复用官方模型、KV cache、
+Tree、SpecExec 和 proactive draft 调用协议，不构造一次性 `/generate` worker。网络侧的
+`integration/wire_codec.py` 显式负责 bf16 mask 的 uint16 raw-byte cast，目标端仍使用官方
+gRPC 服务。该路径的结果名称固定为 `specedge_cpu_adapted`，不应写成 untouched official
+SpecEdge。
+
 ## 当前 Windows 本地状态
 
 Windows 本地可以完成源码获取、版本固定、配置检查和 Python 语法编译；不能据此声称

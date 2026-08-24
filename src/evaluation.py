@@ -26,6 +26,8 @@ class EvaluationRecord:
     prompt: str
     reference: Any
     scheduled_arrival_s: float = 0.0
+    turn_index: int = 0
+    turn_count: int = 1
 
 
 def _dataset_file(dataset: str, data_path: str | Path) -> Path:
@@ -61,7 +63,15 @@ def _record_from_raw(dataset: str, raw: dict[str, Any], index: int) -> Evaluatio
         reference = {"category": raw.get("category"), "turns": turns}
     else:  # pragma: no cover - guarded by _dataset_file
         raise ValueError(f"Unsupported dataset: {dataset}")
-    return EvaluationRecord(sample_id, dataset, prompt, reference)
+    turn_count = len(raw.get("turns") or []) if dataset == "mt_bench" else 1
+    return EvaluationRecord(
+        sample_id,
+        dataset,
+        prompt,
+        reference,
+        turn_index=0,
+        turn_count=max(1, turn_count),
+    )
 
 
 def load_evaluation_records(
@@ -95,6 +105,8 @@ def load_evaluation_records(
             prompt=record.prompt,
             reference=record.reference,
             scheduled_arrival_s=float(offsets[index]),
+            turn_index=record.turn_index,
+            turn_count=record.turn_count,
         )
         for index, record in enumerate(records)
     ]

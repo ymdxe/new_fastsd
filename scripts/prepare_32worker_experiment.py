@@ -21,6 +21,14 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+INCOMPATIBLE_WITH_STATEFUL_FASTSD = (
+    "This legacy preparer is deprecated for the four-method experiment: it "
+    "launches one-shot /generate workers and multiple model copies. It does "
+    "not implement EdgeClient /session/init + /prefill + /verify + rollback. "
+    "Use scripts/eval_suite.py prepare/plan with the latency (1 process x 32 "
+    "threads) or throughput (4 processes x 8 threads) track."
+)
+
 
 def get_git_sha(repo_path: Path) -> str:
     """Get current commit SHA."""
@@ -461,6 +469,9 @@ def main():
     parser.add_argument("--arrival_seed", type=int, default=1234)
 
     args = parser.parse_args()
+
+    print(f"[INCOMPATIBLE] {INCOMPATIBLE_WITH_STATEFUL_FASTSD}", file=sys.stderr)
+    return 2
 
     # Create experiment directory
     exp_dir = Path(args.exp_root) / args.run_id

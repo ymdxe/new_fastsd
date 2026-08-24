@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import random
 import re
 import statistics
 from pathlib import Path
@@ -43,6 +44,70 @@ def _metric_stats(records: list[dict[str, Any]], key: str) -> dict[str, float | 
     }
 
 
+def paired_bootstrap_ci(
+    records: Iterable[dict[str, Any]],
+    baseline_records: Iterable[dict[str, Any]],
+    *,
+    key: str,
+    sample_key: str = "sample_id",
+    seed: int = 42,
+    iterations: int = 2000,
+) -> dict[str, Any]:
+    """Return a deterministic paired bootstrap CI for ``method - baseline``.
+
+    Pairing is by ``sample_id`` rather than file order so a worker completion
+    order cannot silently change the comparison.  This is intentionally a
+    dependency-free implementation suitable for the CPU/static test runtime.
+    """
+
+    left = {str(item.get(sample_key)): item for item in records}
+    right = {str(item.get(sample_key)): item for item in baseline_records}
+    pairs = [
+        (float(left[sample_id][key]), float(right[sample_id][key]))
+        for sample_id in sorted(left.keys() & right.keys())
+        if left[sample_id].get(key) is not None and right[sample_id].get(key) is not None
+    ]
+    if not pairs:
+        return {"n": 0, "mean_delta": None, "ci95": None, "definition": f"{key} method-baseline"}
+    deltas = [left_value - right_value for left_value, right_value in pairs]
+    mean_delta = statistics.mean(deltas)
+    if len(deltas) == 1:
+        interval = [deltas[0], deltas[0]]
+    else:
+        rng = random.Random(seed)
+        means = []
+        for _ in range(max(1, int(iterations))):
+            sample = [deltas[rng.randrange(len(deltas))] for _ in deltas]
+            means.append(statistics.mean(sample))
+        interval = [percentile(means, 0.025), percentile(means, 0.975)]
+    return {
+        "n": len(deltas),
+        "mean_delta": mean_delta,
+        "ci95": interval,
+        "definition": f"{key} method-baseline, paired by {sample_key}",
+    }
+
+
+def _resource_stats(records: list[dict[str, Any]]) -> dict[str, Any]:
+    keys = (
+        "network_rtt_ms",
+        "network_bytes",
+        "kv_copy_ms",
+        "kv_copy_bytes",
+        "cpu_time_ms",
+    )
+    result: dict[str, Any] = {}
+    for key in keys:
+        values = _numeric(records, key)
+        if values:
+            result[key] = {
+                "total": sum(values),
+                "avg": statistics.mean(values),
+                "p95": percentile(values, 0.95),
+            }
+    return result
+
+
 def _last_number(value: Any) -> str | None:
     matches = re.findall(r"[-+]?\d+(?:\.\d+)?", str(value).replace(",", ""))
     return matches[-1] if matches else None
@@ -73,6 +138,8 @@ def summarize_requests(
     workload_hash: str,
     run_id: str,
     wallclock_s: float | None = None,
+    evaluation_scope: str = "quality",
+    paired_records: Iterable[dict[str, Any]] | None = None,
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     request_records = list(records)
@@ -92,6 +159,12 @@ def summarize_requests(
             wallclock_s = sum(_numeric(request_records, "e2e_ms")) / 1000.0
 
     accepted_per_verify = _numeric(request_records, "mean_accepted_tokens_per_verify")
+    successful_records = [
+        record
+        for record in request_records
+        if record.get("success", record.get("status", "ok") not in {"error", "failed"})
+    ]
+    successful_tokens = sum(int(record.get("generated_tokens", 0)) for record in successful_records)
     summary = {
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
@@ -99,9 +172,22 @@ def summarize_requests(
         "dataset": dataset,
         "workload_hash": workload_hash,
         "num_requests": len(request_records),
+        "num_successful_requests": len(successful_records),
+        "evaluation_scope": evaluation_scope,
+        "quality_claim": (
+            "communication_smoke_only; max_new_tokens=16 is not a full quality evaluation"
+            if evaluation_scope == "communication_smoke"
+            else "quality metrics are reported for the configured workload"
+        ),
         "total_generated_tokens": generated,
         "wallclock_s": float(wallclock_s or 0.0),
         "throughput_tok_s": generated / wallclock_s if wallclock_s and wallclock_s > 0 else None,
+        "goodput_req_s": (
+            len(successful_records) / wallclock_s if wallclock_s and wallclock_s > 0 else None
+        ),
+        "goodput_tok_s": (
+            successful_tokens / wallclock_s if wallclock_s and wallclock_s > 0 else None
+        ),
         "ttft_ms": _metric_stats(request_records, "ttft_ms"),
         "scheduled_ttft_ms": _metric_stats(request_records, "scheduled_ttft_ms"),
         "tpot_ms": _metric_stats(request_records, "tpot_ms"),
@@ -121,15 +207,25 @@ def summarize_requests(
             "scheduled_ttft_ms": "scheduled workload release to first output token, including arrival lag",
             "tpot_ms": "post-first-output generation time divided by remaining output tokens",
             "throughput_tok_s": "all generated output tokens divided by measured run wallclock",
+            "goodput_req_s": "successful completed requests divided by measured run wallclock",
+            "goodput_tok_s": "tokens from successful completed requests divided by measured run wallclock",
         },
+        "resource_metrics": _resource_stats(request_records),
     }
+    if paired_records is not None:
+        baseline = list(paired_records)
+        summary["paired_ci_vs_baseline"] = {
+            key: paired_bootstrap_ci(request_records, baseline, key=key)
+            for key in ("ttft_ms", "e2e_ms", "generated_tokens")
+        }
     if extra:
         summary.update(extra)
     return summary
 
 
 def write_json(payload: dict[str, Any], path: str | Path) -> Path:
-    output = Path(path)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    return output
+    # Summary artifacts are evidence.  Do not replace a previous failed or
+    # partial result on a rerun; identical content is accepted as idempotent.
+    from .run_artifacts import write_json_once
+
+    return write_json_once(path, payload)

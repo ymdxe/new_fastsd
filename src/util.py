@@ -112,12 +112,44 @@ def parse_arguments():
     parser.add_argument('--num_samples_per_task', '-n', type=int, default=1, help='num_samples for a task (prompt) in humaneval dataset.')
     parser.add_argument('--seed', '-s', type=int, default=1234, help='set a random seed, which can makes the result reproducible')
     parser.add_argument('--max_tokens', type=int, default=400, help='max token number generated.')
+    parser.add_argument(
+        '--warmup_requests',
+        type=int,
+        default=0,
+        help='completed warmup requests per process; excluded from measured JSONL',
+    )
     parser.add_argument('--temp', type=float, default=0, help='temperature for generating new tokens.')
     parser.add_argument('--top_k', type=int, default=0, help='top_k for ungreedy sampling strategy.')
     parser.add_argument('--top_p', type=float, default=0.95, help='top_p for ungreedy sampling strategy.')
     parser.add_argument('--gamma', type=int, default=6, help='guess time.')
     parser.add_argument('--draft_device', type=str, default='cuda:1')
     parser.add_argument('--target_device', type=str, default='cuda:0')
+    parser.add_argument(
+        '--draft_dtype',
+        type=str,
+        default='auto',
+        choices=['auto', 'float32', 'float16', 'bfloat16', 'fp32', 'fp16', 'bf16'],
+        help='draft dtype; auto resolves to float32 on CPU and bfloat16 on CUDA',
+    )
+    parser.add_argument(
+        '--target_dtype',
+        type=str,
+        default='bfloat16',
+        choices=['float32', 'float16', 'bfloat16', 'fp32', 'fp16', 'bf16'],
+        help='target dtype; the cloud target defaults to bfloat16',
+    )
+    parser.add_argument(
+        '--edge_use_cpu',
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help='run the stateful EdgeClient draft loop on CPU',
+    )
+    parser.add_argument(
+        '--edge_threads',
+        type=int,
+        default=1,
+        help='in-process CPU draft thread count; use 32 for latency or 8 for each 4x8 worker',
+    )
     parser.add_argument(
         '--stop_policy',
         type=str,
@@ -279,6 +311,10 @@ def parse_arguments():
         parser.error("--arrival_rate must be positive for Poisson arrivals")
     if args.batch_size <= 0:
         parser.error("--batch_size must be positive")
+    if args.edge_threads <= 0:
+        parser.error("--edge_threads must be positive")
+    if args.warmup_requests < 0:
+        parser.error("--warmup_requests must be non-negative")
     if args.token_budget <= 0:
         parser.error("--token_budget must be positive")
     if args.min_prefill_chunk_tokens <= 0:

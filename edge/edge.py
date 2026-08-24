@@ -21,6 +21,7 @@ from src.arrival import poisson_arrival_offsets, shard_samples
 from src.engine import Decoding
 from src.kvcache import KVCacheModel
 from src.metrics import elapsed_ms, tpot_ms
+from src.runtime import configure_torch_threads, resolve_dtype
 from src.util import parse_arguments, seed_everything
 
 
@@ -113,8 +114,7 @@ class EdgeRunner(Decoding):
             answer_trigger=self.answer_trigger,
         )
 
-    @staticmethod
-    def _load_draft_model(model_path: str, device: str):
+    def _load_draft_model(self, model_path: str, device: str):
         """Load either a GPTQ draft or a regular Transformers checkpoint."""
         quant_config = os.path.join(model_path, "quantize_config.json")
         if os.path.exists(quant_config):
@@ -129,7 +129,7 @@ class EdgeRunner(Decoding):
         return AutoModelForCausalLM.from_pretrained(
             model_path,
             device_map={"": device},
-            torch_dtype=torch.bfloat16,
+            torch_dtype=resolve_dtype(getattr(self.args, "draft_dtype", "auto"), device),
             trust_remote_code=True,
         ).eval()
 
@@ -290,6 +290,78 @@ class EdgeRunner(Decoding):
         """Format GSM8K input in the same few-shot style as benchmark script."""
         return self.gsm8k_prompt + "Q: " + question_text + "\nA:"
 
+    def _sample_prompt(self, sample: dict, proc_id: int, idx: int) -> tuple[str, str]:
+        """Return the canonical prompt/task id for a raw or canonical sample."""
+
+        if "sample_id" in sample and "prompt" in sample:
+            return sample["prompt"].strip(), str(sample["sample_id"])
+        if self.args.dataset == "gsm8k":
+            return (
+                self._preprocess_gsm8k(sample["question"].strip()),
+                str(sample.get("task_id", f"gsm8k-{proc_id}-{idx}")),
+            )
+        if self.args.dataset == "humaneval":
+            return (
+                sample["prompt"].strip(),
+                str(sample.get("task_id", f"humaneval-{proc_id}-{idx}")),
+            )
+        if self.args.dataset == "mgsm":
+            return (
+                sample["question"].strip(),
+                str(sample.get("question_id", f"mgsm-{proc_id}-{idx}")),
+            )
+        return (
+            sample["turns"][0].strip(),
+            str(sample.get("task_id", f"mtbench-{proc_id}-{idx}")),
+        )
+
+    def _warmup_stateful_requests(self, client: EdgeClient, draft_model, tokenizer, samples, proc_id: int) -> None:
+        """Exercise the real session/prefill/verify path before measurement.
+
+        Warmups deliberately do not write metric records.  They are repeated
+        per draft process so every CPU model copy is warmed, while the target
+        receives the same stateful protocol traffic through the configured
+        topology.  Any failed warmup raises and aborts the run rather than
+        silently turning a requested warmup into a no-op.
+        """
+
+        count = int(getattr(self.args, "warmup_requests", 0))
+        if count <= 0 or not samples:
+            return
+        warmup_sample = samples[0]
+        input_text, task_id = self._sample_prompt(warmup_sample, proc_id, 0)
+        input_ids = self._encode_input_ids(tokenizer, input_text).to(draft_model.device)
+        for warmup_idx in range(count):
+            seed_everything(100000 + proc_id * count + warmup_idx)
+            session_id = client.init_session()
+            prefix = input_ids.clone()
+            response = client.prefill(
+                session_id=session_id,
+                task_id=f"warmup-{proc_id}-{warmup_idx}-{task_id}",
+                draft_output=prefix[0].tolist(),
+                prefix_len=prefix.shape[1],
+                lag=0.0,
+                current_time=time.time(),
+            )
+            if response.get("status") != "prefill_ok":
+                raise RuntimeError(f"warmup prefill failed: {response}")
+            cache = KVCacheModel(draft_model, self.args.temp, self.args.top_k, self.args.top_p)
+            cache.vocab_size = self.args.vocab_size
+            draft = cache.generate(prefix, 1)
+            response, _ = client.verify(
+                session_id=session_id,
+                task_id=f"warmup-{proc_id}-{warmup_idx}-{task_id}",
+                draft_output=draft[0].tolist(),
+                prefix_len=prefix.shape[1],
+                lag=0.0,
+                current_time=time.time(),
+                gamma=1,
+                tail_only=False,
+                has_bridge_token=False,
+            )
+            if "final_token" not in response or "accepted" not in response:
+                raise RuntimeError(f"warmup verify failed: {response}")
+
     @staticmethod
     def _percentile(values: List[float], q: float) -> float:
         if not values:
@@ -414,6 +486,8 @@ class EdgeRunner(Decoding):
             "enable_pipeline": bool(getattr(self.args, "enable_pipeline", True)),
             "enable_proactive_draft": bool(getattr(self.args, "enable_proactive_draft", True)),
             "num_drafts": int(self.args.num_drafts),
+            "warmup_requests_per_process": int(getattr(self.args, "warmup_requests", 0)),
+            "warmup_included_in_metrics": False,
             "arrival_distribution": self.args.arrival_distribution,
             "arrival_rate_rps": float(self.args.arrival_rate),
             "arrival_seed": int(self.args.arrival_seed),
@@ -473,13 +547,17 @@ class EdgeRunner(Decoding):
         self.color_print(f"[METRICS] wrote summary: {summary_path}", 2)
 
     def eval(self):
-        torch.cuda.init()
+        if torch.cuda.is_available():
+            torch.cuda.init()
         torch.multiprocessing.set_start_method("spawn", force=True)
-        for old_file in glob.glob(os.path.join(self.args.exp_name, "edge_metrics_proc*.jsonl")):
-            try:
-                os.remove(old_file)
-            except OSError:
-                pass
+        existing_metrics = glob.glob(
+            os.path.join(self.args.exp_name, "edge_metrics_proc*.jsonl")
+        )
+        if existing_metrics:
+            raise FileExistsError(
+                "refusing to overwrite existing Edge metrics; use a new exp_name: "
+                + ", ".join(sorted(existing_metrics))
+            )
 
         # 启动多个边缘 draft 进程，每个进程独立 session_id
         wallclock_start = time.time()
@@ -536,6 +614,7 @@ class EdgeRunner(Decoding):
         use_cpu = getattr(self.args, "edge_use_cpu", False)
         if use_cpu:
             device = "cpu"
+            configure_torch_threads(getattr(self.args, "edge_threads", None))
             self.color_print(f"[Edge {proc_id}] loading draft model on CPU", 3)
         else:
             gpu_id = (proc_id % max(1, self.args.edge_gpus)) + self.args.edge_gpu_start
@@ -552,6 +631,8 @@ class EdgeRunner(Decoding):
         data_file = self._resolve_data_file()
         with open(data_file, "r") as f:
             samples = [json.loads(line) for line in f.readlines()]
+
+        self._warmup_stateful_requests(client, draft_model, tokenizer, samples, proc_id)
 
         indexed_samples = shard_samples(
             samples,
@@ -596,21 +677,7 @@ class EdgeRunner(Decoding):
             )
             approx_model_cache.vocab_size = self.args.vocab_size
 
-            if "sample_id" in sample and "prompt" in sample:
-                input_text = sample["prompt"].strip()
-                task_id = str(sample["sample_id"])
-            elif self.args.dataset == "gsm8k":
-                input_text = self._preprocess_gsm8k(sample["question"].strip())
-                task_id = sample.get("task_id", f"gsm8k-{proc_id}-{idx}")
-            elif self.args.dataset == "humaneval":
-                input_text = sample["prompt"].strip()
-                task_id = sample.get("task_id", f"humaneval-{proc_id}-{idx}")
-            elif self.args.dataset == "mgsm":
-                input_text = sample["question"].strip()
-                task_id = str(sample.get("question_id", f"mgsm-{proc_id}-{idx}"))
-            else:
-                input_text = sample["turns"][0].strip()
-                task_id = str(sample.get("task_id", f"mtbench-{proc_id}-{idx}"))
+            input_text, task_id = self._sample_prompt(sample, proc_id, idx)
 
             # input_text = 'def fib(n'  # for debug
             input_ids = self._encode_input_ids(tokenizer, input_text).to(draft_model.device)
@@ -971,6 +1038,10 @@ class EdgeRunner(Decoding):
                 "reuse_miss_rounds": int(reuse_miss_rounds),
                 "reuse_skip_not_full_accept_rounds": int(reuse_miss_not_full_accept_rounds),
                 "output_text": generated_text,
+                "output_token_ids": [
+                    int(token_id)
+                    for token_id in prefix[0, input_ids.shape[1] :].tolist()
+                ],
                 "reference": sample.get("reference", sample.get("answer")),
                 "workload_hash": self.args.workload_hash,
             }
