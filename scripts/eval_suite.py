@@ -7,6 +7,8 @@ import csv
 import hashlib
 import json
 import os
+import re
+import random
 import shlex
 import statistics
 import sys
@@ -22,7 +24,17 @@ sys.path.insert(0, str(REPO_ROOT))
 FORMAL_CPUSET = "56-71,80-95"
 FORMAL_CPU_PREFIX = "nice -n 5 numactl --physcpubind=56-71,80-95 --interleave=2,3"
 
-from src.common_metrics import paired_method_analysis, summarize_requests
+ANALYSIS_DATASETS = ("humaneval", "gsm8k", "mgsm", "mt_bench")
+ANALYSIS_METHODS = ("fastsd", "specedge_cpu_adapted", "standard_sd", "draft_only")
+ANALYSIS_BOOTSTRAP_SEED = 42
+ANALYSIS_BOOTSTRAP_ITERATIONS = 10_000
+ANALYSIS_SPEEDUP_METRICS = {
+    "e2e_ms": "lower_is_better",
+    "ttft_ms": "lower_is_better",
+    "tpot_ms": "lower_is_better",
+}
+
+from src.common_metrics import paired_method_analysis, percentile, summarize_requests
 from src.evaluation import (
     DATASET_FILES,
     load_canonical_jsonl,
@@ -1108,6 +1120,1214 @@ def compare(summary_paths: list[str], output: str | None) -> int:
     return 0
 
 
+def _resource_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text or text.upper() in {"N/A", "NA", "[N/A]"}:
+        return None
+    match = re.search(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)", text.replace(",", ""))
+    return float(match.group(0)) if match else None
+
+
+def _resource_stats(values: list[float]) -> dict[str, Any] | None:
+    if not values:
+        return None
+    return {
+        "avg": statistics.mean(values),
+        "p95": percentile(values, 0.95),
+        "sample_count": len(values),
+    }
+
+
+def _parse_resource_core_filter(value: str | None) -> set[int] | None:
+    if not value:
+        return None
+    result: set[int] = set()
+    for item in value.split(","):
+        token = item.strip()
+        if not token:
+            continue
+        if "-" in token:
+            start_text, end_text = token.split("-", 1)
+            start, end = int(start_text), int(end_text)
+            result.update(range(min(start, end), max(start, end) + 1))
+        else:
+            result.add(int(token))
+    return result
+
+
+def parse_mpstat_cpu_resource(
+    text: str, *, cores: str | None = None
+) -> dict[str, Any]:
+    """Parse ``mpstat -P <cores> 1`` output without trusting its Average row."""
+
+    expected_cores = _parse_resource_core_filter(cores)
+    header_cpu_pos: int | None = None
+    idle_offset: int | None = None
+    numeric_rows: list[tuple[int, float]] = []
+    all_rows: list[float] = []
+    for raw_line in text.splitlines():
+        tokens = raw_line.split()
+        if "CPU" in tokens and "%idle" in tokens:
+            header_cpu_pos = tokens.index("CPU")
+            idle_offset = tokens.index("%idle") - header_cpu_pos
+            continue
+        if header_cpu_pos is None or idle_offset is None:
+            continue
+        if not tokens or tokens[0].lower().startswith("average"):
+            continue
+        core_pos = header_cpu_pos if header_cpu_pos < len(tokens) else None
+        if core_pos is None or not (
+            tokens[core_pos] == "all" or tokens[core_pos].isdigit()
+        ):
+            core_pos = next(
+                (
+                    index
+                    for index, token in enumerate(tokens)
+                    if token == "all" or token.isdigit()
+                ),
+                None,
+            )
+        if core_pos is None:
+            continue
+        idle_pos = core_pos + idle_offset
+        if idle_pos < 0 or idle_pos >= len(tokens):
+            continue
+        idle = _resource_float(tokens[idle_pos])
+        if idle is None or not 0.0 <= idle <= 100.0:
+            continue
+        utilization = 100.0 - idle
+        core_token = tokens[core_pos]
+        if core_token == "all":
+            if expected_cores is None:
+                all_rows.append(utilization)
+            continue
+        core = int(core_token)
+        numeric_rows.append((core, utilization))
+
+    actual_cores = {core for core, _ in numeric_rows}
+    if expected_cores is not None:
+        missing_cores = sorted(expected_cores - actual_cores)
+        extra_cores = sorted(actual_cores - expected_cores)
+        if missing_cores or extra_cores:
+            raise ValueError(
+                "mpstat CPU core set mismatch: "
+                f"missing cores={missing_cores}; extra cores={extra_cores}"
+            )
+    selected_values = [
+        value
+        for core, value in numeric_rows
+        if expected_cores is None or core in expected_cores
+    ] or all_rows
+    if not selected_values:
+        raise ValueError("no parseable mpstat CPU samples")
+    selected_cores = sorted({core for core, _ in numeric_rows})
+    return {
+        "source": "mpstat",
+        "definition": "CPU utilization = 100 - %idle",
+        "avg": statistics.mean(selected_values),
+        "p95": percentile(selected_values, 0.95),
+        "sample_count": len(selected_values),
+        "core_count": len(selected_cores) if selected_cores else 1,
+        "cores": selected_cores,
+    }
+
+
+def parse_nvidia_smi_csv_resource(
+    text: str, *, gpu_index: int, gpu_uuid: str | None = None
+) -> dict[str, Any]:
+    """Parse headerless ``nvidia-smi --format=csv,noheader`` samples."""
+
+    metric_names = (
+        ("utilization_gpu_pct", 3),
+        ("utilization_memory_pct", 4),
+        ("memory_used_mib", 5),
+        ("memory_free_mib", 6),
+        ("power_draw_w", 7),
+    )
+    values: dict[str, list[float]] = {name: [] for name, _ in metric_names}
+    matched_rows = 0
+    selected_uuid: str | None = None
+    for row in csv.reader(text.splitlines()):
+        if len(row) < 8:
+            continue
+        index = _resource_float(row[1])
+        if index is None or int(index) != gpu_index:
+            continue
+        row_uuid = row[2].strip()
+        if gpu_uuid and row_uuid != gpu_uuid:
+            continue
+        selected_uuid = selected_uuid or row_uuid
+        matched_rows += 1
+        for name, position in metric_names:
+            number = _resource_float(row[position])
+            if number is not None:
+                values[name].append(number)
+    if matched_rows == 0:
+        raise ValueError(f"no nvidia-smi rows matched gpu index {gpu_index}")
+    return {
+        "source": "nvidia-smi",
+        "gpu_index": gpu_index,
+        "gpu_uuid": selected_uuid,
+        "sample_count": matched_rows,
+        **{name: _resource_stats(items) for name, items in values.items()},
+    }
+
+
+def resources(
+    method_dir: str,
+    *,
+    cpu_mpstat: str | None = None,
+    cpu_cores: str | None = None,
+    gpu_nvidia_csv: str | None = None,
+    gpu_index: int | None = None,
+    gpu_uuid: str | None = None,
+    output: str | None = None,
+) -> int:
+    """Create an auditable resource sidecar without modifying ``summary.json``."""
+
+    if not cpu_mpstat and not gpu_nvidia_csv:
+        raise ValueError("resources requires --cpu-mpstat and/or --gpu-nvidia-csv")
+    if gpu_nvidia_csv is not None and gpu_index is None:
+        raise ValueError("--gpu-index is required with --gpu-nvidia-csv")
+    method_path = Path(method_dir)
+    method_path.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, Any] = {"schema_version": 1, "method_dir": str(method_path)}
+    if cpu_mpstat:
+        payload["cpu"] = parse_mpstat_cpu_resource(
+            Path(cpu_mpstat).read_text(encoding="utf-8", errors="replace"),
+            cores=cpu_cores,
+        )
+    if gpu_nvidia_csv:
+        payload["gpu"] = parse_nvidia_smi_csv_resource(
+            Path(gpu_nvidia_csv).read_text(encoding="utf-8", errors="replace"),
+            gpu_index=gpu_index,
+            gpu_uuid=gpu_uuid,
+        )
+    output_path = Path(output) if output else method_path / "resource_metrics.json"
+    write_json_once(output_path, payload)
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _analysis_summary_path(raw_path: str) -> Path:
+    path = Path(raw_path)
+    if path.is_dir():
+        path = path / "summary.json"
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    return path
+
+
+def _parse_analysis_input(spec: str) -> tuple[str, str, Path]:
+    if "=" not in spec:
+        raise ValueError("analysis input must be DATASET/METHOD=SUMMARY_OR_DIR")
+    label, raw_path = spec.split("=", 1)
+    if "/" not in label:
+        raise ValueError("analysis input must be DATASET/METHOD=SUMMARY_OR_DIR")
+    dataset, method = label.split("/", 1)
+    if dataset not in ANALYSIS_DATASETS:
+        raise ValueError(f"unsupported analysis dataset: {dataset}")
+    if method not in ANALYSIS_METHODS:
+        raise ValueError(f"unsupported analysis method: {method}")
+    return dataset, method, _analysis_summary_path(raw_path)
+
+
+def _load_analysis_inputs(input_specs: list[str]) -> dict[tuple[str, str], dict[str, Any]]:
+    entries: dict[tuple[str, str], dict[str, Any]] = {}
+    for spec in input_specs:
+        dataset, method, summary_path = _parse_analysis_input(spec)
+        key = (dataset, method)
+        if key in entries:
+            raise ValueError(f"duplicate analysis input: {dataset}/{method}")
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        reported_dataset = summary.get("dataset")
+        if reported_dataset and reported_dataset != dataset:
+            raise ValueError(
+                f"summary dataset mismatch for {dataset}/{method}: {reported_dataset}"
+            )
+        reported_method = summary.get("method")
+        if reported_method and not (
+            reported_method == method
+            or {reported_method, method} == {"specedge", "specedge_cpu_adapted"}
+        ):
+            raise ValueError(
+                f"summary method mismatch for {dataset}/{method}: {reported_method}"
+            )
+        request_value = summary.get("requests_path") or summary.get("request_file")
+        if request_value:
+            request_path = Path(str(request_value))
+            if not request_path.is_absolute():
+                request_path = summary_path.parent / request_path
+        else:
+            request_path = summary_path.parent / "requests.jsonl"
+        records = _read_jsonl_files([request_path]) if request_path.is_file() else []
+        resource_value = summary.get("resource_metrics_path") or summary.get(
+            "resource_path"
+        )
+        if resource_value:
+            resource_path = Path(str(resource_value))
+            if not resource_path.is_absolute():
+                resource_path = summary_path.parent / resource_path
+        else:
+            resource_path = summary_path.parent / "resource_metrics.json"
+        resources_payload = None
+        if resource_path.is_file():
+            resources_payload = json.loads(resource_path.read_text(encoding="utf-8"))
+        entries[key] = {
+            "dataset": dataset,
+            "method": method,
+            "summary_path": summary_path,
+            "request_path": request_path,
+            "resource_path": resource_path,
+            "summary": summary,
+            "records": records,
+            "resources": resources_payload,
+        }
+    return entries
+
+
+def _analysis_scalar(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return value
+    for key in ("avg", "mean", "value"):
+        if value.get(key) is not None:
+            return value[key]
+    return None
+
+
+def _analysis_lookup(
+    summary: dict[str, Any], names: tuple[str, ...], *, stat: str = "avg"
+) -> Any:
+    containers = [summary]
+    for name in ("resource_metrics", "resources", "utilization", "resource_utilization"):
+        value = summary.get(name)
+        if isinstance(value, dict):
+            containers.append(value)
+    for container in containers:
+        for name in names:
+            if name in container and container[name] is not None:
+                value = container[name]
+                if isinstance(value, dict):
+                    if value.get(stat) is not None:
+                        return value[stat]
+                    if stat == "avg":
+                        return _analysis_scalar(value)
+                elif stat == "avg" or name.endswith("_p95_pct"):
+                    return value
+    return None
+
+
+def _analysis_resource(summary: dict[str, Any], key: str, stat: str) -> Any:
+    for container_name in ("resource_metrics", "resources"):
+        container = summary.get(container_name, {})
+        value = container.get(key) if isinstance(container, dict) else None
+        if isinstance(value, dict):
+            if value.get(stat) is not None:
+                return value[stat]
+        elif value is not None:
+            return value
+    return None
+
+
+def _analysis_sidecar_resource(
+    resources_payload: dict[str, Any] | None, key: str, *, stat: str = "avg"
+) -> Any:
+    if not isinstance(resources_payload, dict):
+        return None
+    if key == "cpu_util_pct":
+        cpu = resources_payload.get("cpu")
+        return cpu.get(stat) if isinstance(cpu, dict) else None
+    if key == "gpu_util_pct":
+        gpu = resources_payload.get("gpu")
+        metric = gpu.get("utilization_gpu_pct") if isinstance(gpu, dict) else None
+        if isinstance(metric, dict):
+            return metric.get(stat)
+    return None
+
+
+def _analysis_aggregate_resources(
+    entries: dict[tuple[str, str], dict[str, Any]], method: str
+) -> dict[str, Any] | None:
+    cpu_weighted_sum = 0.0
+    cpu_samples = 0
+    gpu_weighted_sum = 0.0
+    gpu_samples = 0
+    for dataset in ANALYSIS_DATASETS:
+        payload = entries.get((dataset, method), {}).get("resources")
+        if not isinstance(payload, dict):
+            continue
+        cpu = payload.get("cpu", {})
+        if isinstance(cpu, dict) and cpu.get("avg") is not None:
+            sample_count = int(cpu.get("sample_count", 0) or 0)
+            if sample_count > 0:
+                cpu_weighted_sum += float(cpu["avg"]) * sample_count
+                cpu_samples += sample_count
+        gpu = payload.get("gpu", {})
+        gpu_util = gpu.get("utilization_gpu_pct") if isinstance(gpu, dict) else None
+        if isinstance(gpu_util, dict) and gpu_util.get("avg") is not None:
+            sample_count = int(gpu_util.get("sample_count", 0) or 0)
+            if sample_count > 0:
+                gpu_weighted_sum += float(gpu_util["avg"]) * sample_count
+                gpu_samples += sample_count
+    if not cpu_samples and not gpu_samples:
+        return None
+    payload: dict[str, Any] = {}
+    if cpu_samples:
+        payload["cpu"] = {
+            "avg": cpu_weighted_sum / cpu_samples,
+            "sample_count": cpu_samples,
+        }
+    if gpu_samples:
+        payload["gpu"] = {
+            "utilization_gpu_pct": {
+                "avg": gpu_weighted_sum / gpu_samples,
+                "sample_count": gpu_samples,
+            }
+        }
+    return payload
+
+
+def _analysis_row_from_summary(
+    summary: dict[str, Any] | None,
+    *,
+    scope: str,
+    dataset: str,
+    method: str,
+    num_requests: int | float | None = None,
+    resources_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    summary = summary or {}
+
+    def latency(name: str, stat: str) -> Any:
+        value = summary.get(name, {})
+        return value.get(stat) if isinstance(value, dict) else None
+
+    request_count = summary.get("num_requests") if num_requests is None else num_requests
+    request_bytes_total = _analysis_resource(summary, "request_bytes", "total")
+    response_bytes_total = _analysis_resource(summary, "response_bytes", "total")
+    rpc_count_total = _analysis_resource(summary, "rpc_count", "total")
+
+    def per_request(value: Any) -> float | None:
+        if value is None or request_count in (None, 0):
+            return None
+        return float(value) / float(request_count)
+
+    cpu_util = _analysis_sidecar_resource(resources_payload, "cpu_util_pct")
+    if cpu_util is None:
+        cpu_util = _analysis_lookup(
+            summary,
+            ("cpu_util_pct", "cpu_utilization_pct", "cpu_utilization", "cpu_percent"),
+        )
+    cpu_util_p95 = _analysis_sidecar_resource(
+        resources_payload, "cpu_util_pct", stat="p95"
+    )
+    if cpu_util_p95 is None:
+        cpu_util_p95 = _analysis_lookup(
+            summary,
+            (
+                "cpu_util_p95_pct",
+                "cpu_utilization_p95_pct",
+                "cpu_p95_pct",
+                "cpu_util_pct",
+                "cpu_utilization_pct",
+                "cpu_utilization",
+                "cpu_percent",
+            ),
+            stat="p95",
+        )
+    gpu_util = _analysis_sidecar_resource(resources_payload, "gpu_util_pct")
+    if gpu_util is None:
+        gpu_util = _analysis_lookup(
+            summary,
+            ("gpu_util_pct", "gpu_utilization_pct", "gpu_utilization", "gpu_percent"),
+        )
+    gpu_util_p95 = _analysis_sidecar_resource(
+        resources_payload, "gpu_util_pct", stat="p95"
+    )
+    if gpu_util_p95 is None:
+        gpu_util_p95 = _analysis_lookup(
+            summary,
+            (
+                "gpu_util_p95_pct",
+                "gpu_utilization_p95_pct",
+                "gpu_p95_pct",
+                "gpu_util_pct",
+                "gpu_utilization_pct",
+                "gpu_utilization",
+                "gpu_percent",
+            ),
+            stat="p95",
+        )
+
+    return {
+        "scope": scope,
+        "dataset": dataset,
+        "method": method,
+        "num_requests": request_count,
+        "throughput_tok_s": summary.get("throughput_tok_s"),
+        "goodput_tok_s": summary.get("goodput_tok_s"),
+        "goodput_req_s": summary.get("goodput_req_s"),
+        "ttft_avg_ms": latency("ttft_ms", "avg"),
+        "ttft_p95_ms": latency("ttft_ms", "p95"),
+        "tpot_avg_ms": latency("tpot_ms", "avg"),
+        "tpot_p95_ms": latency("tpot_ms", "p95"),
+        "e2e_avg_ms": latency("e2e_ms", "avg"),
+        "e2e_p95_ms": latency("e2e_ms", "p95"),
+        "accept_rate": summary.get("accept_rate"),
+        "mean_accepted_tokens_per_verify": summary.get(
+            "mean_accepted_tokens_per_verify"
+        ),
+        "network_rtt_ms_avg": _analysis_resource(summary, "network_rtt_ms", "avg"),
+        "request_bytes_total": request_bytes_total,
+        "request_bytes_per_request": per_request(request_bytes_total),
+        "response_bytes_total": response_bytes_total,
+        "response_bytes_per_request": per_request(response_bytes_total),
+        "rpc_count_total": rpc_count_total,
+        "rpc_count_per_request": per_request(rpc_count_total),
+        "cpu_util_pct": cpu_util,
+        "cpu_util_p95_pct": cpu_util_p95,
+        "gpu_util_pct": gpu_util,
+        "gpu_util_p95_pct": gpu_util_p95,
+    }
+
+
+ANALYSIS_PERFORMANCE_FIELDS = (
+    "throughput_tok_s",
+    "goodput_tok_s",
+    "goodput_req_s",
+    "ttft_avg_ms",
+    "ttft_p95_ms",
+    "tpot_avg_ms",
+    "tpot_p95_ms",
+    "e2e_avg_ms",
+    "e2e_p95_ms",
+    "accept_rate",
+    "mean_accepted_tokens_per_verify",
+    "network_rtt_ms_avg",
+    "request_bytes_total",
+    "request_bytes_per_request",
+    "response_bytes_total",
+    "response_bytes_per_request",
+    "rpc_count_total",
+    "rpc_count_per_request",
+    "cpu_util_pct",
+    "cpu_util_p95_pct",
+    "gpu_util_pct",
+    "gpu_util_p95_pct",
+)
+
+
+def _analysis_per_dataset_row(
+    entries: dict[tuple[str, str], dict[str, Any]], dataset: str, method: str
+) -> dict[str, Any]:
+    entry = entries.get((dataset, method))
+    if entry is None:
+        return _analysis_row_from_summary(
+            None, scope="per-dataset", dataset=dataset, method=method
+        )
+    return _analysis_row_from_summary(
+        entry["summary"],
+        scope="per-dataset",
+        dataset=dataset,
+        method=method,
+        num_requests=entry["summary"].get("num_requests", len(entry["records"])),
+        resources_payload=entry.get("resources"),
+    )
+
+
+def _analysis_macro_row(
+    rows: list[dict[str, Any]], method: str
+) -> dict[str, Any]:
+    result = {
+        "scope": "macro",
+        "dataset": "all",
+        "method": method,
+        "num_requests": None,
+    }
+    for field in ANALYSIS_PERFORMANCE_FIELDS:
+        values = [float(row[field]) for row in rows if row.get(field) is not None]
+        result[field] = statistics.mean(values) if values else None
+    for field in (
+        "request_bytes_total",
+        "response_bytes_total",
+        "rpc_count_total",
+    ):
+        result[field] = None
+    counts = [float(row["num_requests"]) for row in rows if row.get("num_requests") is not None]
+    result["num_requests"] = statistics.mean(counts) if counts else None
+    return result
+
+
+def _analysis_micro_row(
+    entries: dict[tuple[str, str], dict[str, Any]], method: str
+) -> dict[str, Any]:
+    records: list[dict[str, Any]] = []
+    wallclocks: list[float] = []
+    present = 0
+    for dataset in ANALYSIS_DATASETS:
+        entry = entries.get((dataset, method))
+        if entry is None:
+            continue
+        present += 1
+        records.extend(dict(record) for record in entry["records"])
+        value = entry["summary"].get("wallclock_s")
+        if value is not None:
+            wallclocks.append(float(value))
+    if not records:
+        return _analysis_row_from_summary(
+            None, scope="micro", dataset="all", method=method
+        )
+    wallclock = sum(wallclocks) if present == len(wallclocks) else None
+    summary = summarize_requests(
+        records,
+        method=method,
+        dataset="micro",
+        workload_hash="mixed-datasets",
+        run_id=f"micro-{method}",
+        wallclock_s=wallclock,
+    )
+    return _analysis_row_from_summary(
+        summary,
+        scope="micro",
+        dataset="all",
+        method=method,
+        num_requests=len(records),
+        resources_payload=_analysis_aggregate_resources(entries, method),
+    )
+
+
+def _analysis_index(
+    records: list[dict[str, Any]], dataset: str
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    indexed: dict[str, dict[str, Any]] = {}
+    duplicates: list[str] = []
+    for record in records:
+        if record.get("sample_id") is None:
+            continue
+        key = f"{dataset}::{record['sample_id']}"
+        if key in indexed:
+            duplicates.append(key)
+        else:
+            indexed[key] = record
+    return indexed, duplicates
+
+
+def _analysis_empty_pair(reason: str) -> dict[str, Any]:
+    return {
+        "pair_count": 0,
+        "method_count": 0,
+        "baseline_count": 0,
+        "missing_method_count": 0,
+        "missing_baseline_count": 0,
+        "duplicate_method_count": 0,
+        "duplicate_baseline_count": 0,
+        "reason": reason,
+        "metrics": {
+            key: {
+                "n": 0,
+                "speedup_x": None,
+                "speedup_pct": None,
+                "ci95_x": None,
+                "iterations": ANALYSIS_BOOTSTRAP_ITERATIONS,
+                "seed": ANALYSIS_BOOTSTRAP_SEED,
+            }
+            for key in ANALYSIS_SPEEDUP_METRICS
+        },
+        "_pairs": {},
+    }
+
+
+def _analysis_speedup_ratio(
+    pairs: list[tuple[float, float]], direction: str
+) -> float | None:
+    if not pairs:
+        return None
+    method_mean = statistics.mean(left for left, _ in pairs)
+    baseline_mean = statistics.mean(right for _, right in pairs)
+    if direction == "lower_is_better":
+        return baseline_mean / method_mean if method_mean > 0 else None
+    return method_mean / baseline_mean if baseline_mean > 0 else None
+
+
+def _analysis_speedup_ci(
+    pairs: list[tuple[float, float]], direction: str
+) -> dict[str, Any]:
+    if not pairs:
+        return {
+            "n": 0,
+            "speedup_x": None,
+            "speedup_pct": None,
+            "ci95_x": None,
+            "iterations": ANALYSIS_BOOTSTRAP_ITERATIONS,
+            "seed": ANALYSIS_BOOTSTRAP_SEED,
+        }
+
+    point = _analysis_speedup_ratio(pairs, direction)
+    if point is None:
+        return {
+            "n": len(pairs),
+            "speedup_x": None,
+            "speedup_pct": None,
+            "ci95_x": None,
+            "iterations": ANALYSIS_BOOTSTRAP_ITERATIONS,
+            "seed": ANALYSIS_BOOTSTRAP_SEED,
+        }
+    rng = random.Random(ANALYSIS_BOOTSTRAP_SEED)
+    bootstrapped: list[float] = []
+    for _ in range(ANALYSIS_BOOTSTRAP_ITERATIONS):
+        sample = [pairs[rng.randrange(len(pairs))] for _ in pairs]
+        value = _analysis_speedup_ratio(sample, direction)
+        if value is not None:
+            bootstrapped.append(value)
+    interval = (
+        [percentile(bootstrapped, 0.025), percentile(bootstrapped, 0.975)]
+        if bootstrapped
+        else None
+    )
+    return {
+        "n": len(pairs),
+        "speedup_x": point,
+        "speedup_pct": (point - 1.0) * 100.0,
+        "ci95_x": interval,
+        "iterations": ANALYSIS_BOOTSTRAP_ITERATIONS,
+        "seed": ANALYSIS_BOOTSTRAP_SEED,
+    }
+
+
+def _analysis_pair_records(
+    method_records: list[dict[str, Any]],
+    baseline_records: list[dict[str, Any]],
+    *,
+    dataset: str,
+) -> dict[str, Any]:
+    method_index, method_duplicates = _analysis_index(method_records, dataset)
+    baseline_index, baseline_duplicates = _analysis_index(baseline_records, dataset)
+    if method_duplicates or baseline_duplicates:
+        result = _analysis_empty_pair("duplicate sample_id; pairing refused")
+        result.update(
+            {
+                "method_count": len(method_index),
+                "baseline_count": len(baseline_index),
+                "duplicate_method_count": len(method_duplicates),
+                "duplicate_baseline_count": len(baseline_duplicates),
+            }
+        )
+        return result
+    method_ids = set(method_index)
+    baseline_ids = set(baseline_index)
+    common_ids = sorted(method_ids & baseline_ids)
+    result = {
+        "pair_count": len(common_ids),
+        "method_count": len(method_ids),
+        "baseline_count": len(baseline_ids),
+        "missing_method_count": len(baseline_ids - method_ids),
+        "missing_baseline_count": len(method_ids - baseline_ids),
+        "duplicate_method_count": 0,
+        "duplicate_baseline_count": 0,
+        "reason": None,
+        "metrics": {},
+        "_pairs": {},
+    }
+    for key, direction in ANALYSIS_SPEEDUP_METRICS.items():
+        pairs = []
+        for sample_id in common_ids:
+            left = method_index[sample_id].get(key)
+            right = baseline_index[sample_id].get(key)
+            if left is None or right is None:
+                continue
+            pairs.append((float(left), float(right)))
+        result["metrics"][key] = _analysis_speedup_ci(pairs, direction)
+        result["_pairs"][key] = pairs
+    return result
+
+
+def _analysis_combined_records(
+    entries: dict[tuple[str, str], dict[str, Any]],
+    method: str,
+    datasets: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for dataset in datasets:
+        entry = entries.get((dataset, method))
+        if entry is None:
+            continue
+        for record in entry["records"]:
+            copied = dict(record)
+            copied["sample_id"] = f"{dataset}::{record.get('sample_id')}"
+            records.append(copied)
+    return records
+
+
+def _analysis_macro_pair(parts: list[dict[str, Any]]) -> dict[str, Any]:
+    if not parts:
+        return _analysis_empty_pair("no valid dataset pairs")
+    result = {
+        "pair_count": sum(part["pair_count"] for part in parts),
+        "method_count": sum(part["method_count"] for part in parts),
+        "baseline_count": sum(part["baseline_count"] for part in parts),
+        "missing_method_count": sum(part["missing_method_count"] for part in parts),
+        "missing_baseline_count": sum(part["missing_baseline_count"] for part in parts),
+        "duplicate_method_count": sum(part["duplicate_method_count"] for part in parts),
+        "duplicate_baseline_count": sum(part["duplicate_baseline_count"] for part in parts),
+        "reason": next((part["reason"] for part in parts if part["reason"]), None),
+        "metrics": {},
+    }
+    for key in ANALYSIS_SPEEDUP_METRICS:
+        usable_parts = [
+            part
+            for part in parts
+            if part["metrics"][key]["speedup_x"] is not None
+            and part.get("_pairs", {}).get(key)
+        ]
+        if not usable_parts:
+            result["metrics"][key] = _analysis_speedup_ci([], ANALYSIS_SPEEDUP_METRICS[key])
+            continue
+        direction = ANALYSIS_SPEEDUP_METRICS[key]
+        macro_units = [part["metrics"][key]["speedup_x"] for part in usable_parts]
+        speedup = statistics.mean(macro_units)
+        rng = random.Random(ANALYSIS_BOOTSTRAP_SEED)
+        macro_bootstrap: list[float] = []
+        for _ in range(ANALYSIS_BOOTSTRAP_ITERATIONS):
+            dataset_speedups: list[float] = []
+            for part in usable_parts:
+                pairs = part["_pairs"][key]
+                resampled_pairs = [pairs[rng.randrange(len(pairs))] for _ in pairs]
+                value = _analysis_speedup_ratio(resampled_pairs, direction)
+                if value is not None:
+                    dataset_speedups.append(value)
+            if dataset_speedups:
+                macro_bootstrap.append(statistics.mean(dataset_speedups))
+        ci = [
+            percentile(macro_bootstrap, 0.025),
+            percentile(macro_bootstrap, 0.975),
+        ]
+        result["metrics"][key] = {
+            "n": sum(part["metrics"][key]["n"] for part in usable_parts),
+            "speedup_x": speedup,
+            "speedup_pct": (speedup - 1.0) * 100.0,
+            "ci95_x": ci,
+            "iterations": ANALYSIS_BOOTSTRAP_ITERATIONS,
+            "seed": ANALYSIS_BOOTSTRAP_SEED,
+        }
+    return result
+
+
+def _analysis_pair_for_scope(
+    entries: dict[tuple[str, str], dict[str, Any]],
+    *,
+    scope: str,
+    dataset: str,
+    method: str,
+    baseline: str,
+    valid_datasets: set[str],
+) -> dict[str, Any]:
+    if scope == "per-dataset":
+        if dataset not in valid_datasets:
+            return _analysis_empty_pair("workload_hash mismatch or missing")
+        left = entries.get((dataset, method), {}).get("records", [])
+        right = entries.get((dataset, baseline), {}).get("records", [])
+        return _analysis_pair_records(left, right, dataset=dataset)
+    datasets = tuple(sorted(valid_datasets))
+    if scope == "macro":
+        parts = []
+        for item in datasets:
+            left = entries.get((item, method), {}).get("records", [])
+            right = entries.get((item, baseline), {}).get("records", [])
+            parts.append(_analysis_pair_records(left, right, dataset=item))
+        return _analysis_macro_pair(parts)
+    left = _analysis_combined_records(entries, method, datasets)
+    right = _analysis_combined_records(entries, baseline, datasets)
+    return _analysis_pair_records(left, right, dataset="all")
+
+
+def _analysis_quality_row(
+    entries: dict[tuple[str, str], dict[str, Any]], dataset: str, method: str
+) -> dict[str, Any]:
+    entry = entries.get((dataset, method))
+    summary = entry["summary"] if entry else {}
+    if dataset in {"gsm8k", "mgsm"}:
+        metric = f"{dataset.upper()} exact match"
+        value = summary.get("quality_exact_match")
+        evidence = (
+            "normalized output_text/reference numeric answer extractor"
+            if value is not None
+            else "N/A: missing normalized output_text/reference"
+        )
+    elif dataset == "humaneval":
+        metric = "HumanEval pass@1"
+        value = _analysis_lookup(
+            summary, ("humaneval_pass_at_1", "quality_pass_at_1", "pass_at_1")
+        )
+        evidence_payload = summary.get("quality_evidence", {})
+        isolated = summary.get("humaneval_isolated_execution") is True
+        if isinstance(evidence_payload, dict):
+            humaneval_evidence = evidence_payload.get("humaneval", evidence_payload.get("pass_at_1", {}))
+            isolated = isolated or (
+                isinstance(humaneval_evidence, dict)
+                and humaneval_evidence.get("isolated_execution") is True
+            )
+        if value is None or not isolated:
+            value = None
+            evidence = "N/A: no explicit isolated HumanEval executor evidence"
+        else:
+            evidence = "isolated HumanEval executor evidence declared in summary"
+    else:
+        metric = "MT-Bench judge score"
+        value = None
+        policy = summary.get("mt_bench_turn_policy", "first_turn_only")
+        evidence = f"N/A: system benchmark, policy={policy}; no judge score"
+    return {
+        "dataset": dataset,
+        "method": method,
+        "metric": metric,
+        "value": value,
+        "mt_bench_policy": (
+            summary.get("mt_bench_turn_policy", "first_turn_only")
+            if dataset == "mt_bench"
+            else "N/A"
+        ),
+        "evidence": evidence,
+    }
+
+
+def _analysis_format(value: Any) -> str:
+    if value is None:
+        return "N/A"
+    if isinstance(value, float):
+        return f"{value:.4g}"
+    return str(value).replace("|", "\\|").replace("\n", " ")
+
+
+def _analysis_speedup_format(metric: dict[str, Any]) -> str:
+    point = metric.get("speedup_x")
+    interval = metric.get("ci95_x")
+    if point is None:
+        return "N/A"
+    if interval is None or interval[0] is None or interval[1] is None:
+        return f"{point:.4g}x"
+    return f"{point:.4g}x [{interval[0]:.4g}, {interval[1]:.4g}]"
+
+
+def _analysis_markdown_table(headers: list[str], rows: list[list[Any]]) -> list[str]:
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+    ]
+    for row in rows:
+        lines.append("| " + " | ".join(_analysis_format(value) for value in row) + " |")
+    return lines
+
+
+def _analysis_nonempty_hash(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _analysis_resolve_comparisons(
+    *,
+    focal_method: str,
+    baseline: str | None,
+    baselines: list[str] | None,
+) -> list[str]:
+    if focal_method not in ANALYSIS_METHODS:
+        raise ValueError(f"unsupported analysis focal method: {focal_method}")
+    if baselines is not None and baseline is not None:
+        raise ValueError("use baseline or baselines, not both")
+    selected = (
+        list(baselines)
+        if baselines is not None
+        else ([baseline] if baseline is not None else [
+            method for method in ANALYSIS_METHODS if method != focal_method
+        ])
+    )
+    if not selected:
+        raise ValueError("analysis comparison requires at least one baseline")
+    if len(set(selected)) != len(selected):
+        raise ValueError("analysis baselines must be unique")
+    for item in selected:
+        if item not in ANALYSIS_METHODS:
+            raise ValueError(f"unsupported analysis baseline: {item}")
+        if item == focal_method:
+            raise ValueError("analysis focal method cannot be its own baseline")
+    return selected
+
+
+def build_analysis_report(
+    input_specs: list[str],
+    *,
+    baseline: str | None = None,
+    focal_method: str = "fastsd",
+    baselines: list[str] | None = None,
+) -> dict[str, Any]:
+    comparison_baselines = _analysis_resolve_comparisons(
+        focal_method=focal_method,
+        baseline=baseline,
+        baselines=baselines,
+    )
+    entries = _load_analysis_inputs(input_specs)
+    issues: list[str] = []
+    valid_datasets: set[str] = set()
+    for dataset in ANALYSIS_DATASETS:
+        missing = [method for method in ANALYSIS_METHODS if (dataset, method) not in entries]
+        if missing:
+            issues.append(f"{dataset}: missing inputs={','.join(missing)}")
+            continue
+        summary_hashes = {
+            method: _analysis_nonempty_hash(
+                entries[(dataset, method)]["summary"].get("workload_hash")
+            )
+            for method in ANALYSIS_METHODS
+        }
+        missing_hashes = [method for method, value in summary_hashes.items() if value is None]
+        if missing_hashes:
+            issues.append(
+                f"{dataset}: workload_hash missing for methods={','.join(missing_hashes)}; "
+                "pairwise speedup blocked"
+            )
+            continue
+        unique_hashes = set(summary_hashes.values())
+        if len(unique_hashes) != 1:
+            issues.append(f"{dataset}: workload_hash mismatch; pairwise speedup blocked")
+            continue
+        summary_hash = next(iter(unique_hashes))
+        request_hashes = {
+            record_hash
+            for method in ANALYSIS_METHODS
+            for record in entries[(dataset, method)]["records"]
+            if (record_hash := _analysis_nonempty_hash(record.get("workload_hash")))
+        }
+        conflicting_request_hashes = request_hashes - {summary_hash}
+        if conflicting_request_hashes:
+            issues.append(
+                f"{dataset}: request workload_hash conflict with summary hash "
+                f"({', '.join(sorted(conflicting_request_hashes))}); pairwise speedup blocked"
+            )
+            continue
+        valid_datasets.add(dataset)
+
+    performance_rows: list[dict[str, Any]] = []
+    for dataset in ANALYSIS_DATASETS:
+        for method in ANALYSIS_METHODS:
+            performance_rows.append(_analysis_per_dataset_row(entries, dataset, method))
+    for method in ANALYSIS_METHODS:
+        dataset_rows = [
+            row for row in performance_rows if row["method"] == method
+        ]
+        performance_rows.append(_analysis_macro_row(dataset_rows, method))
+        performance_rows.append(_analysis_micro_row(entries, method))
+
+    speedup_rows: list[dict[str, Any]] = []
+    for dataset in ANALYSIS_DATASETS:
+        for comparison_baseline in comparison_baselines:
+            pair = _analysis_pair_for_scope(
+                entries,
+                scope="per-dataset",
+                dataset=dataset,
+                method=focal_method,
+                baseline=comparison_baseline,
+                valid_datasets=valid_datasets,
+            )
+            speedup_rows.append(
+                {
+                    "scope": "per-dataset",
+                    "dataset": dataset,
+                    "method": focal_method,
+                    "baseline": comparison_baseline,
+                    **pair,
+                }
+            )
+    for comparison_baseline in comparison_baselines:
+        for scope in ("macro", "micro"):
+            pair = _analysis_pair_for_scope(
+                entries,
+                scope=scope,
+                dataset="all",
+                method=focal_method,
+                baseline=comparison_baseline,
+                valid_datasets=valid_datasets,
+            )
+            speedup_rows.append(
+                {
+                    "scope": scope,
+                    "dataset": "all",
+                    "method": focal_method,
+                    "baseline": comparison_baseline,
+                    **pair,
+                }
+            )
+
+    quality_rows = [
+        _analysis_quality_row(entries, dataset, method)
+        for dataset in ANALYSIS_DATASETS
+        for method in ANALYSIS_METHODS
+    ]
+    missing_cells = []
+    for row in performance_rows:
+        for field in ANALYSIS_PERFORMANCE_FIELDS:
+            if row.get(field) is None:
+                missing_cells.append((row["scope"], row["dataset"], row["method"], field))
+    markdown_lines = [
+        "# FastSD 四数据集四方法分析报告",
+        "",
+        "## 审计元数据",
+        "",
+        f"- 输入：{len(entries)}/{len(ANALYSIS_DATASETS) * len(ANALYSIS_METHODS)} 个 dataset/method 组合",
+        f"- 配对键：`dataset + sample_id`；直接比较：`{focal_method}` vs "
+        f"{', '.join(comparison_baselines)}",
+        f"- paired bootstrap：seed=`{ANALYSIS_BOOTSTRAP_SEED}`，iterations=`{ANALYSIS_BOOTSTRAP_ITERATIONS:,}`，95% percentile CI",
+        "- macro CI：每个 dataset 内对配对样本重采样，再对 dataset speedup 等权平均；不是对四个 point speedup 重采样",
+        "- 通信量：per-dataset 保留 totals 与 per-request；macro totals 为 `N/A`，micro totals 为所有请求之和",
+        "- 资源：per-dataset CPU/GPU avg 与 p95 来自 sidecar；macro p95 为各 dataset p95 等权均值；micro 无 raw sidecar 合并时 p95 为 `N/A`",
+        "- speedup 定义：延迟指标为 `baseline_mean / method_mean`；缺失、重复或 workload hash 不一致时为 `N/A`",
+        "- 缺失数据、未采集资源和未声明隔离质量证据均显示为 `N/A`，不进行推断",
+        "",
+        "## 性能、吞吐、接受率、网络与资源",
+        "",
+    ]
+    performance_headers = [
+        "scope", "dataset", "method", "requests", "throughput tok/s", "goodput tok/s",
+        "goodput req/s", "TTFT avg ms", "TTFT p95 ms", "TPOT avg ms", "TPOT p95 ms",
+        "E2E avg ms", "E2E p95 ms", "accept rate", "accepted/verify", "RTT avg ms",
+        "request bytes total", "request bytes/req", "response bytes total", "response bytes/req",
+        "RPC total", "RPC/req", "CPU util avg %", "CPU util p95 %",
+        "GPU util avg %", "GPU util p95 %",
+    ]
+    performance_keys = [
+        "scope", "dataset", "method", "num_requests", *ANALYSIS_PERFORMANCE_FIELDS
+    ]
+    markdown_lines.extend(
+        _analysis_markdown_table(
+            performance_headers,
+            [[row.get(key) for key in performance_keys] for row in performance_rows],
+        )
+    )
+    markdown_lines.extend(
+        [
+            "",
+            "## 按 sample_id 成对 speedup（含 10,000 次 bootstrap 95% CI）",
+            "",
+            "CI 单位为 speedup 倍数；`pair_count` 是共有 sample_id 数，括号内为各指标实际可计算的 pair 数。",
+            "",
+        ]
+    )
+    speedup_headers = [
+        "scope", "dataset", "method", "baseline", "pair count", "E2E speedup x [95% CI]",
+        "TTFT speedup x [95% CI]", "TPOT speedup x [95% CI]", "metric pair counts", "coverage",
+    ]
+    speedup_table = []
+    for row in speedup_rows:
+        metric_counts = "; ".join(
+            f"{key}={row['metrics'][key]['n']}" for key in ANALYSIS_SPEEDUP_METRICS
+        )
+        coverage = (
+            f"method={row['method_count']}, baseline={row['baseline_count']}, "
+            f"missing_method={row['missing_method_count']}, missing_baseline={row['missing_baseline_count']}"
+        )
+        if row.get("reason"):
+            coverage += f"; {row['reason']}"
+        speedup_table.append(
+            [
+                row["scope"], row["dataset"], row["method"], row["baseline"], row["pair_count"],
+                _analysis_speedup_format(row["metrics"]["e2e_ms"]),
+                _analysis_speedup_format(row["metrics"]["ttft_ms"]),
+                _analysis_speedup_format(row["metrics"]["tpot_ms"]),
+                metric_counts,
+                coverage,
+            ]
+        )
+    markdown_lines.extend(_analysis_markdown_table(speedup_headers, speedup_table))
+    markdown_lines.extend(["", "## 质量指标与证据边界", ""])
+    quality_headers = ["dataset", "method", "metric", "value", "MT-Bench policy", "evidence boundary"]
+    markdown_lines.extend(
+        _analysis_markdown_table(
+            quality_headers,
+            [
+                [
+                    row["dataset"], row["method"], row["metric"], row["value"],
+                    row["mt_bench_policy"], row["evidence"],
+                ]
+                for row in quality_rows
+            ],
+        )
+    )
+    markdown_lines.extend(["", "## 缺失与阻断项", ""])
+    if issues:
+        markdown_lines.extend(f"- {issue}" for issue in issues)
+    else:
+        markdown_lines.append("- 无输入结构或 workload hash 阻断项")
+    markdown_lines.append(f"- 性能资源表中的 N/A 单元格：{len(missing_cells)}")
+    if missing_cells:
+        markdown_lines.append("- 示例缺失项（最多 40 条）：")
+        for scope, dataset, method, field in missing_cells[:40]:
+            markdown_lines.append(f"  - `{scope}/{dataset}/{method}/{field}` = N/A")
+    markdown_lines.extend(
+        [
+            "",
+            "## 质量解释",
+            "",
+            "- GSM8K/MGSM 的 exact match 仅表示当前 normalized `output_text/reference` 数值抽取结果。",
+            "- HumanEval pass@1 只有在 summary 明确声明 isolated executor evidence 时才接受；否则保持 N/A。",
+            "- MT-Bench 当前 canonical 只使用 first turn，报告不将其伪称为完整 judge 质量分数。",
+            "",
+        ]
+    )
+    return {
+        "entries": entries,
+        "issues": issues,
+        "valid_datasets": sorted(valid_datasets),
+        "performance_rows": performance_rows,
+        "speedup_rows": speedup_rows,
+        "focal_method": focal_method,
+        "baselines": comparison_baselines,
+        "quality_rows": quality_rows,
+        "missing_cells": missing_cells,
+        "markdown": "\n".join(markdown_lines),
+    }
+
+
+def analyze(
+    input_specs: list[str],
+    output: str,
+    *,
+    baseline: str | None = None,
+    focal_method: str = "fastsd",
+    baselines: list[str] | None = None,
+) -> int:
+    report = build_analysis_report(
+        input_specs,
+        baseline=baseline,
+        focal_method=focal_method,
+        baselines=baselines,
+    )
+    output_path = Path(output)
+    write_text_once(output_path, report["markdown"] + "\n")
+    print(
+        json.dumps(
+            {
+                "output": str(output_path),
+                "input_count": len(report["entries"]),
+                "valid_datasets": report["valid_datasets"],
+                "missing_cells": len(report["missing_cells"]),
+                "issues": report["issues"],
+                "bootstrap_iterations": ANALYSIS_BOOTSTRAP_ITERATIONS,
+                "focal_method": report["focal_method"],
+                "baselines": report["baselines"],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0
+
+
 def _request_path(value: str) -> Path:
     path = Path(value)
     if path.is_dir():
@@ -1418,6 +2638,20 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["fastsd", "specedge", "specedge_cpu_adapted", "standard_sd", "draft_only"],
     )
     normalizer.add_argument("--input", required=True)
+    resources_parser = subparsers.add_parser(
+        "resources",
+        help="parse CPU/GPU sidecars into an immutable method resource_metrics.json",
+    )
+    resources_parser.add_argument("--method-dir", required=True)
+    resources_parser.add_argument("--cpu-mpstat")
+    resources_parser.add_argument(
+        "--cpu-cores",
+        help="comma-separated mpstat CPU ids or ranges, e.g. 56-71,80-95",
+    )
+    resources_parser.add_argument("--gpu-nvidia-csv")
+    resources_parser.add_argument("--gpu-index", type=int)
+    resources_parser.add_argument("--gpu-uuid")
+    resources_parser.add_argument("--output")
     comparator = subparsers.add_parser("compare")
     comparator.add_argument("summaries", nargs="+")
     comparator.add_argument("--output")
@@ -1433,6 +2667,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="METHOD=PATH; normally specedge_cpu_adapted=...",
     )
     paired_parser.add_argument("--output")
+    analysis_parser = subparsers.add_parser(
+        "analyze",
+        help="generate a four-dataset/four-method paired analysis Markdown report",
+    )
+    analysis_parser.add_argument(
+        "--input",
+        action="append",
+        required=True,
+        dest="input_specs",
+        help="DATASET/METHOD=summary.json or normalized method directory; repeat 16 times",
+    )
+    analysis_parser.add_argument("--output", required=True, help="output Markdown path")
+    analysis_parser.add_argument(
+        "--focal-method",
+        choices=ANALYSIS_METHODS,
+        default="fastsd",
+        help="method on the left side of each direct comparison; default is FastSD",
+    )
+    analysis_parser.add_argument(
+        "--baseline",
+        choices=ANALYSIS_METHODS,
+        action="append",
+        dest="baselines",
+        help="baseline on the right; repeat for a subset, default is every method except focal",
+    )
     parity_parser = subparsers.add_parser("parity")
     parity_parser.add_argument("--config", required=True)
     parity_parser.add_argument("--input", action="append", required=True, dest="input_specs")
@@ -1466,10 +2725,27 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.command == "normalize":
         return normalize(args.config, args.method, args.input)
+    if args.command == "resources":
+        return resources(
+            args.method_dir,
+            cpu_mpstat=args.cpu_mpstat,
+            cpu_cores=args.cpu_cores,
+            gpu_nvidia_csv=args.gpu_nvidia_csv,
+            gpu_index=args.gpu_index,
+            gpu_uuid=args.gpu_uuid,
+            output=args.output,
+        )
     if args.command == "compare":
         return compare(args.summaries, args.output)
     if args.command == "paired":
         return paired_analysis(args.config, args.left, args.right, output=args.output)
+    if args.command == "analyze":
+        return analyze(
+            args.input_specs,
+            args.output,
+            focal_method=args.focal_method,
+            baselines=args.baselines,
+        )
     if args.command == "parity":
         return parity(
             args.config,
