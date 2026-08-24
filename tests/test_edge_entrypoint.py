@@ -132,7 +132,7 @@ class EdgeEntrypointTests(unittest.TestCase):
             with patch.dict(os.environ, {"PYTHON_BIN": wrapper}):
                 configured = edge_module.configure_spawn_executable()
             self.assertEqual(configured, expected_wrapper)
-            self.assertEqual(mp_spawn.get_executable(), expected_wrapper)
+            self.assertEqual(os.fsdecode(mp_spawn.get_executable()), expected_wrapper)
         finally:
             edge_module.mp.set_executable(previous_wrapper)
 
