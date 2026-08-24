@@ -93,6 +93,59 @@ class SpecEdgeClientHostTests(unittest.TestCase):
             plan,
         )
 
+    def test_node2_target_only_plan_exposes_repo_pythonpath_and_preserves_existing(self):
+        config = json.loads(CONFIG.read_text(encoding="utf-8"))
+        execution = config["execution"]
+
+        def fake_layout(current_config, execution=None):
+            resolved = execution or current_config["execution"]
+            node3_root = (
+                PurePosixPath(resolved["node3_repo"])
+                / "exp"
+                / "comparison"
+                / current_config["run_id"]
+            )
+            node2_root = (
+                PurePosixPath(resolved["node2_repo"])
+                / "exp"
+                / "comparison"
+                / current_config["run_id"]
+            )
+            return {
+                "linux_root": node3_root,
+                "node3_root": node3_root,
+                "node2_root": node2_root,
+                "node3_canonical": node3_root / "inputs" / "canonical.jsonl",
+                "node2_canonical": node2_root / "inputs" / "canonical.jsonl",
+                "node3_specedge_config_linux": node3_root / "specedge" / "specedge.yaml",
+                "node2_specedge_config_linux": node2_root / "specedge" / "node2.yaml",
+                "commands": node3_root / "commands.txt",
+                "status": node3_root / "run_status.jsonl",
+            }
+
+        output = io.StringIO()
+        with patch.object(eval_suite, "load_config", return_value=config), patch.object(
+            eval_suite, "output_layout", side_effect=fake_layout
+        ), patch.object(
+            eval_suite,
+            "_read_manifest",
+            return_value={"execution": execution, "workload_hash": "test-hash"},
+        ), patch.object(eval_suite, "_append_command_record"), patch.object(
+            eval_suite, "append_status"
+        ), contextlib.redirect_stdout(output):
+            self.assertEqual(eval_suite.print_plan(str(CONFIG)), 0)
+
+        node2_repo = execution["node2_repo"]
+        expected_pythonpath = (
+            f"PYTHONPATH={shlex.quote(node2_repo)}${{PYTHONPATH:+:$PYTHONPATH}}"
+        )
+        expected_command = (
+            f"cd {shlex.quote(node2_repo)} && {expected_pythonpath} "
+            f"{shlex.quote(execution['node2_target_python'])} "
+            "benchmark/eval_target_only.py"
+        )
+        self.assertIn(expected_command, output.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

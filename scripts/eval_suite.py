@@ -857,7 +857,10 @@ def print_plan(
                 environment=cpu_environment,
             ),
             "\n[node2：target-only greedy oracle（只用于 parity/quality reference，不纳入四方法）]",
-            f"cd {shlex.quote(node2_repo)} && {shlex.quote(node2_target_python)} benchmark/eval_target_only.py --config {shlex.quote(str(config_path))}",
+            f"cd {shlex.quote(node2_repo)} && "
+            f"PYTHONPATH={shlex.quote(node2_repo)}${{PYTHONPATH:+:$PYTHONPATH}} "
+            f"{shlex.quote(node2_target_python)} benchmark/eval_target_only.py "
+            f"--config {shlex.quote(str(config_path))}",
             "\n[网络拓扑说明：默认使用可覆盖的 target_host/port；受限网络可在 node3 建立双段 SSH 本地转发，"
             "让 127.0.0.1:18001 转发到 node2 127.0.0.1:18001。不要把转发命令或凭据写死到仓库。"
             "FastSD/SpecEdge 的请求耗时包含该网络路径，normalize 时保留 TTFT/E2E。]",
