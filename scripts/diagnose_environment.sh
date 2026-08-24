@@ -137,11 +137,22 @@ echo "  CPU核心数: $(nproc 2>/dev/null || echo 'unknown')"
 # the C locale.  The old script printed only Core(s) per socket (24); report
 # the total physical-core count and retain the inputs used to derive it.
 lscpu_value() {
-    LC_ALL=C lscpu 2>/dev/null | awk -F: -v key="$1" \
-        '$1 ~ ("^" key) { gsub(/[[:space:]]/, "", $2); print $2; exit }'
+    LC_ALL=C lscpu 2>/dev/null | awk -F: -v wanted="$1" '
+        {
+            key = $1
+            value = $2
+            sub(/^[[:space:]]+/, "", key)
+            sub(/[[:space:]]+$/, "", key)
+            sub(/^[[:space:]]+/, "", value)
+            sub(/[[:space:]]+$/, "", value)
+            if (key == wanted) {
+                print value
+                exit
+            }
+        }'
 }
-cores_per_socket="$(lscpu_value 'Core\(s\) per socket')"
-sockets="$(lscpu_value 'Socket\(s\)')"
+cores_per_socket="$(lscpu_value 'Core(s) per socket')"
+sockets="$(lscpu_value 'Socket(s)')"
 physical_core_inputs_valid=1
 case "$cores_per_socket" in
     ''|*[!0-9]*) physical_core_inputs_valid=0 ;;
@@ -156,7 +167,8 @@ else
     echo "  物理核心: unknown (lscpu 缺少可验证的 Core(s) per socket/Socket(s))"
 fi
 echo "  Socket数: ${sockets:-unknown}"
-echo "  NUMA节点: $(lscpu_value 'NUMA node\(s\)' || echo 'unknown')"
+numa_nodes="$(lscpu_value 'NUMA node(s)')"
+echo "  NUMA节点: ${numa_nodes:-unknown}"
 echo ""
 
 # 检查内存
