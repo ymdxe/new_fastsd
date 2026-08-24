@@ -740,6 +740,11 @@ def print_plan(
     )
     node2_integration = f"{node2_repo}/baselines/specedge/integration"
     node2_official = f"{node2_repo}/baselines/specedge/official"
+    node3_integration = f"{node3_repo}/baselines/specedge/integration"
+    node3_official = f"{node3_repo}/baselines/specedge/official"
+    node3_pythonpath = ":".join(
+        (node3_repo, node3_integration, f"{node3_official}/src")
+    )
     specedge_raw = f"{layout['node3_root']}/specedge/raw/{run_id}"
     prepare_command = (
         f"cd {shlex.quote(node3_repo)} && {shlex.quote(node3_edge_python)} "
@@ -762,6 +767,7 @@ def print_plan(
             f"# resolved_models={json.dumps(models, ensure_ascii=False, sort_keys=True)}",
             f"# node3_specedge_config={layout['node3_specedge_config_linux']}",
             f"# node2_specedge_config={layout['node2_specedge_config_linux']}",
+            f"# node3_specedge_pythonpath={json.dumps(node3_pythonpath, ensure_ascii=False)}",
             f"# cpu_prefix_raw={json.dumps(raw_cpu_prefix, ensure_ascii=False)}",
             f"# shared_load={str(bool(topology.get('shared_load', True))).lower()} "
             f"fixed_cpuset={json.dumps(str(topology.get('fixed_cpuset', '')), ensure_ascii=False)} "
@@ -818,7 +824,7 @@ def print_plan(
                 command_prefix,
                 f"{shlex.quote(node3_specedge_python)} {node3_repo}/baselines/specedge/integration/client_host.py "
                 f"--config {layout['node3_specedge_config_linux']}",
-                environment=cpu_environment,
+                environment={**cpu_environment, "PYTHONPATH": node3_pythonpath},
             ),
             "\n[node2：停止 FastSD target 后，以 vanilla 调度重启 target（同一端口/bind host）]",
             f"cd {shlex.quote(node2_repo)} && CLOUD_SERVICE_HOST={shlex.quote(target_bind_host)} CLOUD_SERVICE_PORT={target_port} "

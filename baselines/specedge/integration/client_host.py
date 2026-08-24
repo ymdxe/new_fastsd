@@ -12,8 +12,22 @@ from pathlib import Path
 
 import yaml
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(REPO_ROOT))
+
+def _find_repo_root() -> Path:
+    """Find the checkout root when this absolute script is run externally."""
+
+    for candidate in Path(__file__).resolve().parents:
+        if (candidate / "src" / "run_artifacts.py").is_file():
+            return candidate
+    raise RuntimeError(
+        "cannot locate FastSD repository root containing src/run_artifacts.py "
+        f"from {Path(__file__).resolve()}"
+    )
+
+
+REPO_ROOT = _find_repo_root()
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 from src.run_artifacts import append_command, append_status
 
 
