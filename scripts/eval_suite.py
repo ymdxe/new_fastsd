@@ -6,6 +6,7 @@ import argparse
 import csv
 import hashlib
 import json
+import os
 import shlex
 import statistics
 import sys
@@ -339,7 +340,7 @@ def output_layout(
         "node2_specedge_config": local_root / "specedge" / "node2.yaml",
         "linux_specedge_config": node3_root / "specedge" / "specedge.yaml",
         "node3_specedge_config_linux": node3_root / "specedge" / "specedge.yaml",
-        "node2_specedge_config_linux": node2_root / "specedge" / "specedge.yaml",
+        "node2_specedge_config_linux": node2_root / "specedge" / "node2.yaml",
     }
 
 
@@ -456,10 +457,41 @@ def _append_command_record(path: Path, config_path: str | Path, body: str) -> No
     append_command(path, body, config=config_path)
 
 
+def resolve_prepare_context(
+    execution: dict[str, str], current_repo: str | Path | None = None
+) -> dict[str, str]:
+    """Choose the interpreter that actually owns this prepare invocation."""
+
+    actual_repo = os.path.realpath(os.path.abspath(str(current_repo or REPO_ROOT)))
+    actual_repo_key = os.path.normcase(actual_repo)
+
+    def same_path(candidate: str) -> bool:
+        return actual_repo_key == os.path.normcase(
+            os.path.realpath(os.path.abspath(str(candidate)))
+        )
+
+    for role, python_key in (
+        ("node3", "node3_edge_python"),
+        ("node2", "node2_target_python"),
+    ):
+        if same_path(execution[f"{role}_repo"]):
+            return {
+                "host_role": role,
+                "repo": actual_repo,
+                "python": execution[python_key],
+            }
+    return {
+        "host_role": "local/unknown",
+        "repo": actual_repo,
+        "python": sys.executable,
+    }
+
+
 def prepare(config_path: str) -> int:
     config = load_config(config_path)
     validation_notes = validate_experiment_config(config)
     execution = resolve_execution(config)
+    prepare_context = resolve_prepare_context(execution)
     layout = output_layout(config)
     dataset = config["dataset"]
     generation = config["generation"]
@@ -534,6 +566,7 @@ def prepare(config_path: str) -> int:
         "methods": methods,
         "oracle_method": ORACLE_METHOD,
         "execution": execution,
+        "prepare_context": prepare_context,
         "specedge_configs": {
             "node3": str(layout["node3_specedge_config_linux"]),
             "node2": str(layout["node2_specedge_config_linux"]),
@@ -570,8 +603,8 @@ def prepare(config_path: str) -> int:
     }
     write_json_once(layout["manifest"], manifest)
     prepare_command = (
-        f"cd {shlex.quote(execution['node3_repo'])} && "
-        f"{shlex.quote(execution['node3_edge_python'])} scripts/eval_suite.py prepare "
+        f"cd {shlex.quote(prepare_context['repo'])} && "
+        f"{shlex.quote(prepare_context['python'])} scripts/eval_suite.py prepare "
         f"--config {shlex.quote(str(config_path))}"
     )
     _append_command_record(
@@ -579,6 +612,9 @@ def prepare(config_path: str) -> int:
         config_path,
         "\n".join(
             [
+                f"# prepare_host_role={prepare_context['host_role']}",
+                f"# prepare_repo={prepare_context['repo']}",
+                f"# prepare_python={prepare_context['python']}",
                 f"# resolved_execution={json.dumps(execution, ensure_ascii=False, sort_keys=True)}",
                 f"# node3_specedge_config={layout['node3_specedge_config_linux']}",
                 f"# node2_specedge_config={layout['node2_specedge_config_linux']}",
@@ -713,11 +749,11 @@ def print_plan(
         f"cd {shlex.quote(node2_repo)} && {shlex.quote(node2_target_python)} "
         f"scripts/eval_suite.py prepare --config {shlex.quote(str(config_path))}"
     )
-    workload_hash_command = (
-        f"cd {shlex.quote(node3_repo)} && {shlex.quote(node3_edge_python)} "
+    node2_hash_command = (
+        f"cd {shlex.quote(node2_repo)} && {shlex.quote(node2_target_python)} "
         "scripts/eval_suite.py workload-hash "
-        f"--node3-manifest {layout['node3_root']}/run_manifest.json "
-        f"--node2-manifest {layout['node2_root']}/run_manifest.json"
+        f"--manifest {layout['node2_root']}/run_manifest.json "
+        f"--expected {shlex.quote(str(manifest['workload_hash']))}"
     )
     plan = "\n".join(
         [
@@ -736,7 +772,7 @@ def print_plan(
             "\n[node2：prepare（node2 canonical + node2 SpecEdge YAML；不得跳过）]",
             node2_prepare_command,
             "\n[两端 workload_hash 门禁：不一致则停止，不运行正式方法]",
-            workload_hash_command,
+            node2_hash_command,
             "\n[node3：CPU 绑定/背景负载预检（不假设 32 核独占；必须先于正式方法）]",
             f"cd {shlex.quote(node3_repo)} && "
             + prefixed_command(
@@ -1286,22 +1322,43 @@ def validate_models(config_path: str) -> int:
     return int(failed)
 
 
-def workload_hash_gate(node3_manifest: str, node2_manifest: str) -> int:
-    """Require the two host-local prepare manifests to share one workload hash."""
+def workload_hash_gate_values(actual_hash: Any, expected_hash: Any) -> int:
+    """Return nonzero when a host-local hash differs from the expected value."""
 
-    left = json.loads(Path(node3_manifest).read_text(encoding="utf-8"))
-    right = json.loads(Path(node2_manifest).read_text(encoding="utf-8"))
     payload = {
-        "node3_manifest": node3_manifest,
-        "node2_manifest": node2_manifest,
-        "node3_workload_hash": left.get("workload_hash"),
-        "node2_workload_hash": right.get("workload_hash"),
+        "actual_workload_hash": actual_hash,
+        "expected_workload_hash": expected_hash,
     }
-    if payload["node3_workload_hash"] != payload["node2_workload_hash"]:
+    if actual_hash != expected_hash:
         print(json.dumps({**payload, "match": False}, indent=2, ensure_ascii=False))
         return 1
     print(json.dumps({**payload, "match": True}, indent=2, ensure_ascii=False))
     return 0
+
+
+def workload_hash_gate(
+    manifest: str | None = None,
+    expected: str | None = None,
+    *,
+    node3_manifest: str | None = None,
+    node2_manifest: str | None = None,
+) -> int:
+    """Check a node2 manifest against a copied hash, or use legacy dual files."""
+
+    if manifest is not None:
+        if expected is None:
+            raise ValueError("--expected is required with --manifest")
+        actual = json.loads(Path(manifest).read_text(encoding="utf-8"))
+        return workload_hash_gate_values(actual.get("workload_hash"), expected)
+    if node3_manifest is None or node2_manifest is None:
+        raise ValueError(
+            "provide --manifest/--expected for cross-host use, or both legacy manifest paths"
+        )
+    left = json.loads(Path(node3_manifest).read_text(encoding="utf-8"))
+    right = json.loads(Path(node2_manifest).read_text(encoding="utf-8"))
+    return workload_hash_gate_values(
+        right.get("workload_hash"), left.get("workload_hash")
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1312,10 +1369,12 @@ def build_parser() -> argparse.ArgumentParser:
         child.add_argument("--config", required=True)
     hash_parser = subparsers.add_parser(
         "workload-hash",
-        help="fail unless node3/node2 prepare manifests have the same workload hash",
+        help="fail unless a host-local prepare manifest matches an expected workload hash",
     )
-    hash_parser.add_argument("--node3-manifest", required=True)
-    hash_parser.add_argument("--node2-manifest", required=True)
+    hash_parser.add_argument("--manifest", help="host-local manifest, normally on node2")
+    hash_parser.add_argument("--expected", help="workload_hash copied from node3 prepare")
+    hash_parser.add_argument("--node3-manifest", help="legacy shared-filesystem comparison")
+    hash_parser.add_argument("--node2-manifest", help="legacy shared-filesystem comparison")
     planner = subparsers.add_parser("plan")
     planner.add_argument("--config", required=True)
     planner.add_argument(
@@ -1413,7 +1472,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "validate-models":
         return validate_models(args.config)
     if args.command == "workload-hash":
-        return workload_hash_gate(args.node3_manifest, args.node2_manifest)
+        return workload_hash_gate(
+            args.manifest,
+            args.expected,
+            node3_manifest=args.node3_manifest,
+            node2_manifest=args.node2_manifest,
+        )
     if args.command == "validate-config":
         notes = validate_experiment_config(load_config(args.config))
         print(json.dumps({"valid": True, "notes": notes}, indent=2, ensure_ascii=False))

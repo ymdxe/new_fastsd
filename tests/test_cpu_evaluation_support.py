@@ -8,8 +8,11 @@ from scripts.eval_suite import (
     FORMAL_CPU_PREFIX,
     prefixed_command,
     render_specedge_config,
+    output_layout,
+    resolve_prepare_context,
     resolve_execution,
     validate_experiment_config,
+    workload_hash_gate_values,
 )
 from scripts.preflight_cpu import parse_cpu_set
 from src.common_metrics import paired_bootstrap_ci, paired_method_analysis, summarize_requests
@@ -158,15 +161,44 @@ class CpuEvaluationStaticTests(unittest.TestCase):
         self.assertIn('python: "/env/node2-spec/bin/python"', node2_yaml)
         self.assertIn('repo_root: "/srv/node2-fast"', node2_yaml)
         self.assertIn('draft_model: "/m/node2-draft"', node2_yaml)
+        generated_layout = output_layout(config)
+        self.assertTrue(str(generated_layout["node2_specedge_config"]).endswith("node2.yaml"))
+        self.assertTrue(
+            str(generated_layout["node2_specedge_config_linux"]).endswith("node2.yaml")
+        )
         suite_source = (REPO_ROOT / "scripts" / "eval_suite.py").read_text(encoding="utf-8")
         self.assertIn("node2_prepare_command", suite_source)
-        self.assertIn("workload_hash_command", suite_source)
+        self.assertIn("node2_hash_command", suite_source)
+        self.assertIn("--manifest", suite_source)
+        self.assertIn("--expected", suite_source)
         self.assertIn("models['node2_draft']", suite_source)
         self.assertIn("plan execution overrides differ from manifest", suite_source)
         draft_pool_source = (REPO_ROOT / "benchmark" / "eval_draft_pool.py").read_text(
             encoding="utf-8"
         )
         self.assertIn('config["models"].get("node3_draft")', draft_pool_source)
+
+    def test_prepare_context_uses_actual_host_or_marks_unknown(self):
+        execution = {
+            "node3_repo": "/srv/node3-fast",
+            "node2_repo": "/srv/node2-fast",
+            "node3_edge_python": "/env/node3/python",
+            "node3_specedge_python": "/env/node3/specedge",
+            "node2_target_python": "/env/node2/python",
+            "node2_specedge_python": "/env/node2/specedge",
+        }
+        node2_actual_repo = str(Path("/srv/node2-fast").resolve())
+        self.assertEqual(
+            resolve_prepare_context(execution, "/srv/node2-fast"),
+            {
+                "host_role": "node2",
+                "repo": node2_actual_repo,
+                "python": "/env/node2/python",
+            },
+        )
+        unknown = resolve_prepare_context(execution, "/srv/other-fast")
+        self.assertEqual(unknown["host_role"], "local/unknown")
+        self.assertTrue(unknown["python"])
 
     def test_frozen_cpu_binding_and_track_validation(self):
         config = json.loads(
@@ -252,6 +284,9 @@ class CpuEvaluationStaticTests(unittest.TestCase):
 
 
 class ParityAndMetricTests(unittest.TestCase):
+    def test_cross_host_workload_hash_gate_rejects_nonmatching_hash(self):
+        self.assertNotEqual(workload_hash_gate_values("node2-hash", "node3-hash"), 0)
+
     def test_token_parity_is_per_position_and_records_missing_tail(self):
         records = {
             "target_only": [
