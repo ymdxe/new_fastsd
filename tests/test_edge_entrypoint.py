@@ -154,6 +154,34 @@ class EdgeEntrypointTests(unittest.TestCase):
         self.assertIsNone(configured)
         set_executable.assert_not_called()
 
+    def test_edge_warmup_does_not_default_to_ten_task_cap(self):
+        edge_module, _ = _load_edge_with_auto_gptq_blocked()
+        with patch.object(
+            edge_module,
+            "parse_arguments",
+            return_value=types.SimpleNamespace(),
+        ):
+            with patch.object(sys, "argv", ["edge.py", "--warmup_requests", "10"]):
+                args = edge_module.parse_edge_arguments()
+
+        self.assertEqual(args.max_tasks_per_draft, 0)
+
+    def test_edge_explicit_task_cap_remains_available_for_smoke_runs(self):
+        edge_module, _ = _load_edge_with_auto_gptq_blocked()
+        with patch.object(
+            edge_module,
+            "parse_arguments",
+            return_value=types.SimpleNamespace(),
+        ):
+            with patch.object(
+                sys,
+                "argv",
+                ["edge.py", "--warmup_requests", "10", "--max_tasks_per_draft", "3"],
+            ):
+                args = edge_module.parse_edge_arguments()
+
+        self.assertEqual(args.max_tasks_per_draft, 3)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1134,6 +1134,12 @@ def parse_edge_arguments() -> argparse.Namespace:
     edge_parser.add_argument("--request_timeout", type=float, default=30.0)
     edge_parser.add_argument("--edge_gpu_start", type=int, default=0)
     edge_parser.add_argument("--edge_gpus", type=int, default=1)
+    edge_parser.add_argument(
+        "--max_tasks_per_draft",
+        type=int,
+        default=0,
+        help="max tasks per Edge shard; <= 0 processes the full canonical shard",
+    )
 
     edge_args, remaining = edge_parser.parse_known_args()
 
@@ -1148,6 +1154,10 @@ def parse_edge_arguments() -> argparse.Namespace:
     base_args.request_timeout = edge_args.request_timeout
     base_args.edge_gpu_start = edge_args.edge_gpu_start
     base_args.edge_gpus = edge_args.edge_gpus
+    # Edge is the formal canonical-request launcher.  Keep its default
+    # unbounded even though legacy benchmark entrypoints retain their explicit
+    # smoke cap from src.util.parse_arguments().
+    base_args.max_tasks_per_draft = edge_args.max_tasks_per_draft
     return base_args
 
 

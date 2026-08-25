@@ -748,7 +748,7 @@ def print_plan(
         f"--temp {generation['temperature']} --top_k {generation['top_k']} "
         f"--top_p {generation['top_p']} --gamma {generation['gamma']} --seed {generation['seed']} "
         f"--stop_policy {generation.get('stop_policy', 'eos')} "
-        f"--warmup_requests {warmup_requests}"
+        f"--warmup_requests {warmup_requests} --max_tasks_per_draft 0"
     )
     node2_integration = f"{node2_repo}/baselines/specedge/integration"
     node2_official = f"{node2_repo}/baselines/specedge/official"

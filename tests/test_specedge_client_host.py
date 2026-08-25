@@ -99,6 +99,10 @@ class SpecEdgeClientHostTests(unittest.TestCase):
             f"PYTHON_BIN={shlex.quote(execution['node3_edge_python'])}",
             draft_section,
         )
+        fastsd_section = plan.split(
+            "\n[node3：FastSD stateful EdgeClient", 1
+        )[1].split("\n[node2：SpecEdge target server", 1)[0]
+        self.assertIn("--warmup_requests 10 --max_tasks_per_draft 0", fastsd_section)
 
     def test_node2_target_only_plan_exposes_repo_pythonpath_and_preserves_existing(self):
         config = json.loads(CONFIG.read_text(encoding="utf-8"))
