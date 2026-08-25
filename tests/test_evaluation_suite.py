@@ -13,6 +13,7 @@ from scripts.eval_suite import (
     _analysis_macro_pair,
     _analysis_pair_records,
     analyze,
+    build_parser,
     build_analysis_report,
     normalize_fastsd,
     normalize_specedge,
@@ -643,6 +644,32 @@ Average:   56     1.00  0.00  1.00 0.00    0.00 0.00   0.00 0.00 0.00 75.00
                     path.unlink()
                 except FileNotFoundError:
                     pass
+
+    def test_nvidia_cli_accepts_node3_compact_csv_and_normalizes_index(self):
+        args = build_parser().parse_args(
+            [
+                "resources",
+                "--method-dir",
+                "method",
+                "--gpu-nvidia-csv",
+                "samples.csv",
+                "--gpu-index",
+                "1",
+            ]
+        )
+        self.assertIsInstance(args.gpu_index, int)
+
+        compact_gpu_text = (
+            "2026/08/25 08:54:53.992, 1, NVIDIA RTX A6000, 0, 15911, 19.51\n"
+        )
+        gpu = parse_nvidia_smi_csv_resource(compact_gpu_text, gpu_index="1")
+        self.assertEqual(gpu["gpu_index"], 1)
+        self.assertEqual(gpu["sample_count"], 1)
+        self.assertAlmostEqual(gpu["utilization_gpu_pct"]["avg"], 0.0)
+        self.assertAlmostEqual(gpu["memory_used_mib"]["avg"], 15911.0)
+        self.assertAlmostEqual(gpu["power_draw_w"]["avg"], 19.51)
+        self.assertIsNone(gpu["utilization_memory_pct"])
+        self.assertIsNone(gpu["memory_free_mib"])
 
     def test_micro_resource_aggregation_weights_sidecar_samples_and_keeps_p95_na(self):
         entries = {

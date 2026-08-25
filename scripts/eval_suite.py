@@ -1239,27 +1239,43 @@ def parse_mpstat_cpu_resource(
 
 
 def parse_nvidia_smi_csv_resource(
-    text: str, *, gpu_index: int, gpu_uuid: str | None = None
+    text: str, *, gpu_index: int | str, gpu_uuid: str | None = None
 ) -> dict[str, Any]:
-    """Parse headerless ``nvidia-smi --format=csv,noheader`` samples."""
+    """Parse headerless ``nvidia-smi --format=csv,noheader`` samples.
 
-    metric_names = (
+    Support both the full eight-column audit query and the compact six-column
+    query used on node3: ``timestamp,index,name,utilization.gpu,memory.used,
+    power.draw``.  The CLI parses ``--gpu-index`` as an integer, but normalize
+    direct callers too so index filtering cannot fail on a string/int mismatch.
+    """
+
+    requested_gpu_index = int(gpu_index)
+    full_metric_names = (
         ("utilization_gpu_pct", 3),
         ("utilization_memory_pct", 4),
         ("memory_used_mib", 5),
         ("memory_free_mib", 6),
         ("power_draw_w", 7),
     )
+    compact_metric_names = (
+        ("utilization_gpu_pct", 3),
+        ("memory_used_mib", 4),
+        ("power_draw_w", 5),
+    )
+    metric_names = full_metric_names
     values: dict[str, list[float]] = {name: [] for name, _ in metric_names}
     matched_rows = 0
     selected_uuid: str | None = None
     for row in csv.reader(text.splitlines()):
-        if len(row) < 8:
+        if len(row) < 6:
             continue
+        metric_names = full_metric_names if len(row) >= 8 else compact_metric_names
+        for name, _ in metric_names:
+            values.setdefault(name, [])
         index = _resource_float(row[1])
-        if index is None or int(index) != gpu_index:
+        if index is None or int(index) != requested_gpu_index:
             continue
-        row_uuid = row[2].strip()
+        row_uuid = row[2].strip() if len(row) >= 8 else None
         if gpu_uuid and row_uuid != gpu_uuid:
             continue
         selected_uuid = selected_uuid or row_uuid
@@ -1269,10 +1285,12 @@ def parse_nvidia_smi_csv_resource(
             if number is not None:
                 values[name].append(number)
     if matched_rows == 0:
-        raise ValueError(f"no nvidia-smi rows matched gpu index {gpu_index}")
+        raise ValueError(
+            f"no nvidia-smi rows matched gpu index {requested_gpu_index}"
+        )
     return {
         "source": "nvidia-smi",
-        "gpu_index": gpu_index,
+        "gpu_index": requested_gpu_index,
         "gpu_uuid": selected_uuid,
         "sample_count": matched_rows,
         **{name: _resource_stats(items) for name, items in values.items()},
