@@ -1144,6 +1144,114 @@ def _resource_stats(values: list[float]) -> dict[str, Any] | None:
     }
 
 
+NVIDIA_SMI_CSV_SCHEMA_COLUMNS: dict[str, tuple[str, ...]] = {
+    "full8": (
+        "timestamp",
+        "index",
+        "name",
+        "utilization.gpu",
+        "utilization.memory",
+        "memory.used",
+        "memory.free",
+        "power.draw",
+    ),
+    "compact-name6": (
+        "timestamp",
+        "index",
+        "name",
+        "utilization.gpu",
+        "memory.used",
+        "power.draw",
+    ),
+    "compact-no-name6": (
+        "timestamp",
+        "index",
+        "utilization.gpu",
+        "memory.used",
+        "power.draw",
+        "temperature.gpu",
+    ),
+}
+NVIDIA_SMI_CSV_SCHEMA_CHOICES = tuple(NVIDIA_SMI_CSV_SCHEMA_COLUMNS)
+NVIDIA_SMI_CSV_SCHEMA_METRICS: dict[str, tuple[tuple[str, str], ...]] = {
+    "full8": (
+        ("utilization_gpu_pct", "utilization.gpu"),
+        ("utilization_memory_pct", "utilization.memory"),
+        ("memory_used_mib", "memory.used"),
+        ("memory_free_mib", "memory.free"),
+        ("power_draw_w", "power.draw"),
+    ),
+    "compact-name6": (
+        ("utilization_gpu_pct", "utilization.gpu"),
+        ("memory_used_mib", "memory.used"),
+        ("power_draw_w", "power.draw"),
+    ),
+    "compact-no-name6": (
+        ("utilization_gpu_pct", "utilization.gpu"),
+        ("memory_used_mib", "memory.used"),
+        ("power_draw_w", "power.draw"),
+        ("temperature_gpu_c", "temperature.gpu"),
+    ),
+}
+NVIDIA_SMI_RESOURCE_METRIC_NAMES = (
+    "utilization_gpu_pct",
+    "utilization_memory_pct",
+    "memory_used_mib",
+    "memory_free_mib",
+    "power_draw_w",
+    "temperature_gpu_c",
+)
+
+
+def _resolve_nvidia_smi_csv_schema(
+    rows: list[tuple[int, list[str]]], requested_schema: str | None
+) -> tuple[str, tuple[str, ...]]:
+    if requested_schema is not None:
+        schema_name = requested_schema.strip()
+        if schema_name not in NVIDIA_SMI_CSV_SCHEMA_COLUMNS:
+            choices = ", ".join(NVIDIA_SMI_CSV_SCHEMA_CHOICES)
+            raise ValueError(
+                f"unknown nvidia-smi CSV schema {requested_schema!r}; "
+                f"choose one of: {choices}"
+            )
+        columns = NVIDIA_SMI_CSV_SCHEMA_COLUMNS[schema_name]
+        expected_count = len(columns)
+        for line_number, row in rows:
+            if len(row) != expected_count:
+                raise ValueError(
+                    f"nvidia-smi CSV schema {schema_name!r} expects "
+                    f"{expected_count} columns, but line {line_number} has "
+                    f"{len(row)}"
+                )
+        return schema_name, columns
+
+    if not rows:
+        raise ValueError(
+            "nvidia-smi CSV is empty; pass --gpu-csv-schema when the "
+            "sample layout is not full8"
+        )
+    observed_counts = {len(row) for _, row in rows}
+    if observed_counts == {8}:
+        return "full8", NVIDIA_SMI_CSV_SCHEMA_COLUMNS["full8"]
+    if 6 in observed_counts:
+        if observed_counts == {6}:
+            raise ValueError(
+                "ambiguous six-column nvidia-smi CSV; pass "
+                "--gpu-csv-schema compact-name6 or "
+                "--gpu-csv-schema compact-no-name6"
+            )
+        raise ValueError(
+            "inconsistent nvidia-smi CSV column counts including six-column "
+            "rows; pass an explicit --gpu-csv-schema"
+        )
+    counts = ", ".join(str(count) for count in sorted(observed_counts))
+    raise ValueError(
+        "cannot infer nvidia-smi CSV schema from column counts "
+        f"({counts}); only an unambiguous full8 sample may omit "
+        "--gpu-csv-schema"
+    )
+
+
 def _parse_resource_core_filter(value: str | None) -> set[int] | None:
     if not value:
         return None
@@ -1239,49 +1347,55 @@ def parse_mpstat_cpu_resource(
 
 
 def parse_nvidia_smi_csv_resource(
-    text: str, *, gpu_index: int | str, gpu_uuid: str | None = None
+    text: str,
+    *,
+    gpu_index: int | str,
+    gpu_uuid: str | None = None,
+    gpu_csv_schema: str | None = None,
 ) -> dict[str, Any]:
     """Parse headerless ``nvidia-smi --format=csv,noheader`` samples.
 
-    Support both the full eight-column audit query and the compact six-column
-    query used on node3: ``timestamp,index,name,utilization.gpu,memory.used,
-    power.draw``.  The CLI parses ``--gpu-index`` as an integer, but normalize
-    direct callers too so index filtering cannot fail on a string/int mismatch.
+    The full eight-column query is unambiguous and may omit ``gpu_csv_schema``.
+    Either six-column layout must name its schema explicitly because the
+    third column is either ``name`` or ``utilization.gpu``.  The CLI parses
+    ``--gpu-index`` as an integer, but normalize direct callers too so index
+    filtering cannot fail on a string/int mismatch.
     """
 
     requested_gpu_index = int(gpu_index)
-    full_metric_names = (
-        ("utilization_gpu_pct", 3),
-        ("utilization_memory_pct", 4),
-        ("memory_used_mib", 5),
-        ("memory_free_mib", 6),
-        ("power_draw_w", 7),
-    )
-    compact_metric_names = (
-        ("utilization_gpu_pct", 3),
-        ("memory_used_mib", 4),
-        ("power_draw_w", 5),
-    )
-    metric_names = full_metric_names
-    values: dict[str, list[float]] = {name: [] for name, _ in metric_names}
+    rows = [
+        (line_number, row)
+        for line_number, row in enumerate(csv.reader(text.splitlines()), start=1)
+        if any(cell.strip() for cell in row)
+    ]
+    schema_name, columns = _resolve_nvidia_smi_csv_schema(rows, gpu_csv_schema)
+    column_positions = {name: position for position, name in enumerate(columns)}
+    metric_columns = NVIDIA_SMI_CSV_SCHEMA_METRICS[schema_name]
+    values: dict[str, list[float]] = {
+        name: [] for name in NVIDIA_SMI_RESOURCE_METRIC_NAMES
+    }
     matched_rows = 0
     selected_uuid: str | None = None
-    for row in csv.reader(text.splitlines()):
-        if len(row) < 6:
-            continue
-        metric_names = full_metric_names if len(row) >= 8 else compact_metric_names
-        for name, _ in metric_names:
-            values.setdefault(name, [])
-        index = _resource_float(row[1])
+    if gpu_uuid and "name" not in column_positions:
+        raise ValueError(
+            f"nvidia-smi CSV schema {schema_name!r} has no name column; "
+            "--gpu-uuid cannot be used with this schema"
+        )
+    for _, row in rows:
+        index = _resource_float(row[column_positions["index"]])
         if index is None or int(index) != requested_gpu_index:
             continue
-        row_uuid = row[2].strip() if len(row) >= 8 else None
+        row_uuid = (
+            row[column_positions["name"]].strip()
+            if "name" in column_positions
+            else None
+        )
         if gpu_uuid and row_uuid != gpu_uuid:
             continue
         selected_uuid = selected_uuid or row_uuid
         matched_rows += 1
-        for name, position in metric_names:
-            number = _resource_float(row[position])
+        for name, column_name in metric_columns:
+            number = _resource_float(row[column_positions[column_name]])
             if number is not None:
                 values[name].append(number)
     if matched_rows == 0:
@@ -1292,6 +1406,9 @@ def parse_nvidia_smi_csv_resource(
         "source": "nvidia-smi",
         "gpu_index": requested_gpu_index,
         "gpu_uuid": selected_uuid,
+        "schema": schema_name,
+        "columns": list(columns),
+        "column_count": len(columns),
         "sample_count": matched_rows,
         **{name: _resource_stats(items) for name, items in values.items()},
     }
@@ -1305,6 +1422,7 @@ def resources(
     gpu_nvidia_csv: str | None = None,
     gpu_index: int | None = None,
     gpu_uuid: str | None = None,
+    gpu_csv_schema: str | None = None,
     output: str | None = None,
 ) -> int:
     """Create an auditable resource sidecar without modifying ``summary.json``."""
@@ -1326,6 +1444,7 @@ def resources(
             Path(gpu_nvidia_csv).read_text(encoding="utf-8", errors="replace"),
             gpu_index=gpu_index,
             gpu_uuid=gpu_uuid,
+            gpu_csv_schema=gpu_csv_schema,
         )
     output_path = Path(output) if output else method_path / "resource_metrics.json"
     write_json_once(output_path, payload)
@@ -2669,6 +2788,14 @@ def build_parser() -> argparse.ArgumentParser:
     resources_parser.add_argument("--gpu-nvidia-csv")
     resources_parser.add_argument("--gpu-index", type=int)
     resources_parser.add_argument("--gpu-uuid")
+    resources_parser.add_argument(
+        "--gpu-csv-schema",
+        choices=NVIDIA_SMI_CSV_SCHEMA_CHOICES,
+        help=(
+            "explicit nvidia-smi CSV layout; omit only for unambiguous full8. "
+            "Required for six-column input."
+        ),
+    )
     resources_parser.add_argument("--output")
     comparator = subparsers.add_parser("compare")
     comparator.add_argument("summaries", nargs="+")
@@ -2751,6 +2878,7 @@ def main(argv: list[str] | None = None) -> int:
             gpu_nvidia_csv=args.gpu_nvidia_csv,
             gpu_index=args.gpu_index,
             gpu_uuid=args.gpu_uuid,
+            gpu_csv_schema=args.gpu_csv_schema,
             output=args.output,
         )
     if args.command == "compare":

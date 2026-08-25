@@ -152,6 +152,25 @@ SpecEdge 端口同样按现场拓扑决定是否转发到 node3 的 `127.0.0.1:1
 `pidstat`、`nvidia-smi` 以及 run 前后 load 快照。仓库不新增监控脚本；这些命令由正式
 运行记录执行并保留原始日志，且不假设固定 CPU 集合被独占。
 
+GPU sidecar 必须记录实际 CSV 列布局。node2/node3 当前的无 GPU name 六列格式使用
+`compact-no-name6`，不要依靠数值范围猜测列含义：
+
+```bash
+nvidia-smi \
+  --query-gpu=timestamp,index,utilization.gpu,memory.used,power.draw,temperature.gpu \
+  --format=csv,noheader,nounits > "$RUN/<method>/nvidia-smi.csv"
+python scripts/eval_suite.py resources \
+  --method-dir "$RUN/<method>" \
+  --gpu-nvidia-csv "$RUN/<method>/nvidia-smi.csv" \
+  --gpu-index 1 \
+  --gpu-csv-schema compact-no-name6
+```
+
+`full8`（含 `name`、GPU 与显存利用率、已用/空闲显存和功耗）可以省略 schema；
+两种六列格式都必须显式传入 `--gpu-csv-schema compact-name6` 或
+`--gpu-csv-schema compact-no-name6`。生成的 `resource_metrics.json` 会保留 schema
+名称和列定义，便于审计原始 sidecar 与解析结果是否匹配。
+
 四种方法应顺序运行，避免互相抢 GPU。FastSD 与 standard SD 共用 8001 端口，但需要
 分别以 `fastsd` 和 `vanilla` 调度模式启动 target。若 node2 的 8000 已被占用，SpecEdge
 使用 `baselines/specedge/integration/server.py --host 127.0.0.1 --port 18000`；它只替换

@@ -598,11 +598,19 @@ Average:   56     1.00  0.00  1.00 0.00    0.00 0.00   0.00 0.00 0.00 75.00
 2026/08/25 12:00:02.000, 0, GPU-other, 99 %, 20 %, 200 MiB, 800 MiB, 90.0 W
 2026/08/25 12:00:03.000, 1, GPU-test, 70 %, 30 %, 120 MiB, 880 MiB, 100.0 W
 """
-        gpu = parse_nvidia_smi_csv_resource(gpu_text, gpu_index=1)
+        gpu = parse_nvidia_smi_csv_resource(
+            gpu_text, gpu_index=1, gpu_csv_schema="full8"
+        )
         self.assertAlmostEqual(gpu["utilization_gpu_pct"]["avg"], 60.0)
         self.assertAlmostEqual(gpu["utilization_gpu_pct"]["p95"], 69.0)
         self.assertEqual(gpu["utilization_gpu_pct"]["sample_count"], 2)
         self.assertEqual(gpu["sample_count"], 2)
+        self.assertEqual(gpu["schema"], "full8")
+        self.assertEqual(gpu["columns"][2], "name")
+
+        inferred_gpu = parse_nvidia_smi_csv_resource(gpu_text, gpu_index=1)
+        self.assertEqual(inferred_gpu["schema"], "full8")
+        self.assertEqual(inferred_gpu["columns"], gpu["columns"])
 
         root = Path(__file__).resolve().parents[1]
         temporary_paths = []
@@ -626,6 +634,7 @@ Average:   56     1.00  0.00  1.00 0.00    0.00 0.00   0.00 0.00 0.00 75.00
                     cpu_cores="56,57",
                     gpu_nvidia_csv=str(gpu_path),
                     gpu_index=1,
+                    gpu_csv_schema="full8",
                     output=str(output_path),
                 ),
                 0,
@@ -635,6 +644,8 @@ Average:   56     1.00  0.00  1.00 0.00    0.00 0.00   0.00 0.00 0.00 75.00
             self.assertEqual(payload["cpu"]["core_count"], 2)
             self.assertAlmostEqual(payload["cpu"]["p95"], 38.5)
             self.assertEqual(payload["gpu"]["gpu_index"], 1)
+            self.assertEqual(payload["gpu"]["schema"], "full8")
+            self.assertEqual(payload["gpu"]["column_count"], 8)
             self.assertAlmostEqual(
                 payload["gpu"]["utilization_gpu_pct"]["p95"], 69.0
             )
@@ -655,19 +666,69 @@ Average:   56     1.00  0.00  1.00 0.00    0.00 0.00   0.00 0.00 0.00 75.00
                 "samples.csv",
                 "--gpu-index",
                 "1",
+                "--gpu-csv-schema",
+                "compact-name6",
             ]
         )
         self.assertIsInstance(args.gpu_index, int)
+        self.assertEqual(args.gpu_csv_schema, "compact-name6")
 
         compact_gpu_text = (
             "2026/08/25 08:54:53.992, 1, NVIDIA RTX A6000, 0, 15911, 19.51\n"
         )
-        gpu = parse_nvidia_smi_csv_resource(compact_gpu_text, gpu_index="1")
+        gpu = parse_nvidia_smi_csv_resource(
+            compact_gpu_text,
+            gpu_index="1",
+            gpu_csv_schema="compact-name6",
+        )
         self.assertEqual(gpu["gpu_index"], 1)
         self.assertEqual(gpu["sample_count"], 1)
+        self.assertEqual(gpu["schema"], "compact-name6")
+        self.assertEqual(gpu["columns"], [
+            "timestamp",
+            "index",
+            "name",
+            "utilization.gpu",
+            "memory.used",
+            "power.draw",
+        ])
         self.assertAlmostEqual(gpu["utilization_gpu_pct"]["avg"], 0.0)
         self.assertAlmostEqual(gpu["memory_used_mib"]["avg"], 15911.0)
         self.assertAlmostEqual(gpu["power_draw_w"]["avg"], 19.51)
+        self.assertIsNone(gpu["utilization_memory_pct"])
+        self.assertIsNone(gpu["memory_free_mib"])
+
+    def test_nvidia_compact_no_name6_requires_schema_and_parses_temperature(self):
+        compact_no_name_gpu_text = (
+            "2026/08/25 08:54:53.992, 1, 12, 15911, 19.51, 43\n"
+            "2026/08/25 08:54:54.992, 0, 88, 200, 90.50, 55\n"
+        )
+        with self.assertRaisesRegex(ValueError, "ambiguous six-column"):
+            parse_nvidia_smi_csv_resource(compact_no_name_gpu_text, gpu_index=1)
+
+        gpu = parse_nvidia_smi_csv_resource(
+            compact_no_name_gpu_text,
+            gpu_index="1",
+            gpu_csv_schema="compact-no-name6",
+        )
+        self.assertEqual(gpu["gpu_index"], 1)
+        self.assertEqual(gpu["sample_count"], 1)
+        self.assertEqual(gpu["schema"], "compact-no-name6")
+        self.assertEqual(
+            gpu["columns"],
+            [
+                "timestamp",
+                "index",
+                "utilization.gpu",
+                "memory.used",
+                "power.draw",
+                "temperature.gpu",
+            ],
+        )
+        self.assertAlmostEqual(gpu["utilization_gpu_pct"]["avg"], 12.0)
+        self.assertAlmostEqual(gpu["memory_used_mib"]["avg"], 15911.0)
+        self.assertAlmostEqual(gpu["power_draw_w"]["avg"], 19.51)
+        self.assertAlmostEqual(gpu["temperature_gpu_c"]["avg"], 43.0)
         self.assertIsNone(gpu["utilization_memory_pct"])
         self.assertIsNone(gpu["memory_free_mib"])
 
