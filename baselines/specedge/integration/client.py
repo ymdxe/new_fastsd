@@ -35,6 +35,7 @@ from cpu_adapter import (
     CPUCompatibleTiming,
     cpu_timing_adapter,
 )
+from tree_order import order_tree_compaction_indices
 from wire_codec import ExplicitSpecEdgeGrpcClient
 
 
@@ -53,6 +54,32 @@ class IntegratedSpecExecClient(SpecExecClient):
         )
         self.measurement_start = None
         self.first_token_time = None
+
+    def _trim_by_budget(self):
+        """Compact selected nodes without breaking the official tree topology.
+
+        The official selection uses ``sorted=False`` because candidate ranking
+        is unrelated to storage order.  ``Tree.gather`` is topology-sensitive,
+        however: it remaps parents using the source/destination pairing.  Keep
+        the selected set unchanged but restore the append order before that
+        remap, so official path validation remains lossless and path-ordered.
+        """
+
+        src_indices = (
+            self._tree.logprobs[self._tree.prefix_len : self._tree.end]
+            .topk(k=self._max_budget, sorted=False)
+            .indices
+            + self._tree.prefix_len
+        )
+        src_indices = order_tree_compaction_indices(src_indices)
+        dest_indices = torch.arange(
+            self._tree.prefix_len,
+            self._tree.prefix_len + src_indices.size(-1),
+            device=self._device,
+        )
+
+        self._tree.gather(src_indices, dest_indices)
+        self._engine.gather(src_indices, dest_indices)
 
     async def _cycle(self, req_idx: int, step_idx: int, prefill=False):
         if self._device.type == "cpu":

@@ -7,6 +7,7 @@ import json
 import multiprocessing as mp
 import os
 import shlex
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -29,6 +30,35 @@ from src.evaluation import load_canonical_jsonl
 from src.run_artifacts import append_command, append_status, write_text_once
 from src.runtime import configure_torch_threads, resolve_dtype, synchronize
 from src.util import norm_logits, sample, seed_everything
+
+
+def configure_spawn_executable() -> str | None:
+    """Use an explicitly configured launcher for ``spawn`` children.
+
+    A glibc-compatible wrapper can ``exec`` a Python binary, leaving
+    ``sys.executable`` pointed at the incompatible binary.  The spawn context
+    otherwise reuses that value, so opt in to the wrapper through ``PYTHON_BIN``
+    (an executable path or a command name).
+    With no override, preserve multiprocessing's normal interpreter selection.
+    """
+
+    configured = os.environ.get("PYTHON_BIN")
+    if configured is None:
+        return None
+    if not configured:
+        raise ValueError("PYTHON_BIN is set but empty; provide an executable Python wrapper")
+
+    configured = os.path.expanduser(configured)
+    executable = os.path.abspath(shutil.which(configured) or configured)
+    if not os.path.isfile(executable):
+        raise FileNotFoundError(
+            f"PYTHON_BIN does not point to a regular file: {executable}"
+        )
+    if not os.access(executable, os.X_OK):
+        raise PermissionError(f"PYTHON_BIN is not executable: {executable}")
+
+    mp.set_executable(executable)
+    return executable
 
 
 def _encode_prompt(tokenizer, prompt: str, dataset: str) -> torch.Tensor:
@@ -231,6 +261,7 @@ def run(config_path: str) -> int:
         or config["models"]["draft"]
     )
 
+    configure_spawn_executable()
     ctx = mp.get_context("spawn")
     barrier = ctx.Barrier(len(devices))
     start_epoch = ctx.Value("d", 0.0)

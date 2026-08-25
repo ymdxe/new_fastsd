@@ -866,7 +866,7 @@ def print_plan(
             + prefixed_command(
                 command_prefix,
                 f"{shlex.quote(node3_edge_python)} benchmark/eval_draft_pool.py --config {shlex.quote(str(config_path))}",
-                environment=cpu_environment,
+                environment={**cpu_environment, "PYTHON_BIN": node3_edge_python},
             ),
             "\n[node2：target-only greedy oracle（只用于 parity/quality reference，不纳入四方法）]",
             f"cd {shlex.quote(node2_repo)} && "

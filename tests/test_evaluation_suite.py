@@ -107,6 +107,8 @@ class DraftOnlyPromptTests(unittest.TestCase):
         self.assertIn("enable_thinking=False", source)
         self.assertIn('arrival_distribution == "poisson"', source)
         self.assertIn("actual_arrival = 0.0", source)
+        self.assertIn("configure_spawn_executable()", source)
+        self.assertIn("mp.set_executable(executable)", source)
 
 
 class SpecEdgeAdapterTests(unittest.TestCase):

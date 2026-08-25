@@ -92,6 +92,13 @@ class SpecEdgeClientHostTests(unittest.TestCase):
             f"{execution['node3_repo']}/baselines/specedge/integration/client_host.py",
             plan,
         )
+        draft_section = plan.split(
+            "\n[node3：Draft-only（同一 CPU runtime；不访问 target）]", 1
+        )[1].split("\n[node2：target-only", 1)[0]
+        self.assertIn(
+            f"PYTHON_BIN={shlex.quote(execution['node3_edge_python'])}",
+            draft_section,
+        )
 
     def test_node2_target_only_plan_exposes_repo_pythonpath_and_preserves_existing(self):
         config = json.loads(CONFIG.read_text(encoding="utf-8"))
