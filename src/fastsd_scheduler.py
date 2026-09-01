@@ -95,10 +95,11 @@ def compute_priority_score(req, accept_stats, now=None, lamda=0.01):
     if now is None:
         now = 0.0
     elapsed = max(0.0, float(now) - float(req.get("current_time", 0.0)))
+    # TODO: 修改prefill任务的优先级，应当和draft模型类似
     wait_term = math.exp(lamda * elapsed)
     if req["task_type"] == "prefill":
         return wait_term
-
+    # TODO: 通信时间
     pid = req["proc_id"]
     accepted_sum, total_sum = accept_stats.get(pid, (0, 0))
     if total_sum <= 0:
