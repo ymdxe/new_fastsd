@@ -7,8 +7,9 @@ import os
 import re
 import statistics
 import sys
+import threading
 import time
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List
 
 import requests
 import torch
@@ -20,8 +21,229 @@ from src.arrival import poisson_arrival_offsets, shard_samples
 from src.engine import Decoding
 from src.kvcache import KVCacheModel
 from src.metrics import elapsed_ms, tpot_ms
-from src.runtime import configure_torch_threads, resolve_dtype
+try:
+    from src.runtime import configure_torch_threads, resolve_dtype, synchronize
+except ImportError:  # lightweight entrypoint tests may stub old runtime helpers
+    from src.runtime import configure_torch_threads, resolve_dtype
+
+    def synchronize(device: Any) -> None:
+        del device
 from src.util import parse_arguments, seed_everything
+
+
+def _validate_prefill_response(response: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate the state-establishing RPC before a verify can be submitted."""
+
+    if not isinstance(response, dict) or response.get("status") != "prefill_ok":
+        raise RuntimeError(f"prefill failed: {response}")
+    return response
+
+
+def _shutdown_executor(executor: concurrent.futures.Executor, *, wait: bool = True) -> None:
+    """Shutdown an HTTP executor across Python versions with cancel support."""
+
+    try:
+        executor.shutdown(wait=wait, cancel_futures=True)
+    except TypeError:
+        # ``cancel_futures`` was added in Python 3.9.
+        executor.shutdown(wait=wait)
+
+
+def _submit_http_call(
+    executor: concurrent.futures.Executor, function: Callable[..., Any], *args, **kwargs
+) -> concurrent.futures.Future:
+    """Submit one HTTP call and close the executor if that call fails."""
+
+    future = executor.submit(function, *args, **kwargs)
+
+    def close_after_failure(done_future: concurrent.futures.Future) -> None:
+        if done_future.cancelled():
+            return
+        try:
+            failed = done_future.exception() is not None
+        except BaseException:
+            failed = True
+        if failed:
+            # ``wait=False`` is intentional here: this callback can execute on
+            # the executor's worker thread.  The caller still joins it in the
+            # normal/failure path via ``_shutdown_executor(..., wait=True)``.
+            _shutdown_executor(executor, wait=False)
+
+    future.add_done_callback(close_after_failure)
+    return future
+
+
+def _run_first_draft_with_prefill(
+    executor: concurrent.futures.Executor,
+    prefill_call: Callable[[], Dict[str, Any]],
+    draft_call: Callable[[], Any],
+    *,
+    overlap: bool,
+    timeout: float | None = None,
+    clock: Callable[[], float] = time.monotonic,
+    timing_call: Callable[[Dict[str, float]], Dict[str, Any]] | None = None,
+    cancel_call: Callable[[], Any] | None = None,
+) -> tuple[Any, Dict[str, Any], Dict[str, float]]:
+    """Run the first draft once, optionally while the cloud Prefill is in flight.
+
+    The returned timestamps are monotonic and describe the two operations' actual
+    intervals.  Prefill validation happens before this helper returns, which gives
+    the caller a hard gate before it submits the first Verify.  ``draft_call`` is
+    deliberately invoked exactly once so the resulting KV/probability state can be
+    reused by the normal decoding loop.
+    """
+
+    # A timing-required Prefill is a long poll that cannot complete until the
+    # timing update arrives.  Treat the presence of ``timing_call`` as an
+    # explicit requirement to overlap, even if an older caller omitted the
+    # overlap flag.
+    overlap = bool(overlap or timing_call is not None)
+    prefill_started_at = clock()
+    prefill_future = None
+
+    def run_prefill() -> tuple[Dict[str, Any], float]:
+        response = prefill_call()
+        completed_at = clock()
+        _validate_prefill_response(response)
+        return response, completed_at
+
+    def unpack_draft_result(result: Any) -> tuple[Any, Dict[str, Any]]:
+        # The timing-aware Edge generator may return ``(tokens, timing_dict)``;
+        # retain the original plain-output contract for existing callers/tests.
+        if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], dict):
+            return result[0], result[1]
+        return result, {}
+
+    def upload_timing(local_timing: Dict[str, Any], first_draft_ms: float):
+        if timing_call is None:
+            return None
+        response = timing_call(
+            {
+                "local_prefill_s": float(
+                    local_timing.get("local_prefill_s", first_draft_ms / 1000.0)
+                ),
+                "local_decode_per_token_s": float(
+                    local_timing.get("local_decode_per_token_s", first_draft_ms / 1000.0)
+                ),
+            }
+        )
+        if not isinstance(response, dict) or response.get("status") != "timing_ready":
+            raise RuntimeError(f"prefill timing update failed: {response}")
+        return response
+
+    try:
+        if overlap:
+            prefill_future = _submit_http_call(executor, run_prefill)
+            draft_started_at = clock()
+            draft_result = draft_call()
+            draft_completed_at = clock()
+            draft_output, local_timing = unpack_draft_result(draft_result)
+            # This call must happen before waiting for the long-poll Prefill.
+            # Otherwise the cloud cannot mark its WorkItem timing-ready and the
+            # future would wait forever.
+            timing_response = upload_timing(
+                local_timing,
+                max(0.0, (draft_completed_at - draft_started_at) * 1000.0),
+            )
+
+            wait_timeout = None
+            if timeout is not None:
+                wait_timeout = max(0.0, timeout - (clock() - prefill_started_at))
+            try:
+                prefill_response, prefill_completed_at = prefill_future.result(
+                    timeout=wait_timeout
+                )
+            except concurrent.futures.TimeoutError as exc:
+                raise TimeoutError("prefill timed out before first verify") from exc
+        else:
+            prefill_response, prefill_completed_at = run_prefill()
+            draft_started_at = clock()
+            draft_result = draft_call()
+            draft_completed_at = clock()
+            draft_output, local_timing = unpack_draft_result(draft_result)
+            timing_response = upload_timing(
+                local_timing,
+                max(0.0, (draft_completed_at - draft_started_at) * 1000.0),
+            )
+    except BaseException:
+        # No Verify may be queued after a Prefill/draft/timing failure.  Also
+        # release a cloud long-poll before joining the executor; otherwise a
+        # local draft exception would leave the timing-gated Prefill blocked.
+        if prefill_future is not None and not prefill_future.done() and cancel_call is not None:
+            try:
+                cancel_call()
+            except BaseException:
+                # Preserve the original local error; the cloud endpoint has
+                # its own timeout/worker-death cleanup path.
+                pass
+        _shutdown_executor(executor, wait=True)
+        raise
+
+    timings = {
+        "prefill_started_at": float(prefill_started_at),
+        "prefill_completed_at": float(prefill_completed_at),
+        "draft_started_at": float(draft_started_at),
+        "draft_completed_at": float(draft_completed_at),
+        "prefill_ms": max(0.0, (prefill_completed_at - prefill_started_at) * 1000.0),
+        "first_draft_ms": max(0.0, (draft_completed_at - draft_started_at) * 1000.0),
+    }
+    for field in ("local_prefill_s", "local_decode_per_token_s", "local_prefill_ms", "local_decode_per_token_ms"):
+        if field in local_timing:
+            timings[field] = float(local_timing[field])
+    if isinstance(timing_response, dict):
+        for field in ("push_s", "push_ms", "timing_upload_s", "timing_upload_ms"):
+            if field in timing_response:
+                timings[field] = float(timing_response[field])
+    timings["prefill_first_draft_overlap_ms"] = max(
+        0.0,
+        (
+            min(prefill_completed_at, draft_completed_at)
+            - max(prefill_started_at, draft_started_at)
+        )
+        * 1000.0,
+    ) if overlap else 0.0
+    timings["prefill_wait_after_first_draft_ms"] = (
+        max(0.0, (prefill_completed_at - draft_completed_at) * 1000.0)
+        if overlap
+        else 0.0
+    )
+    return draft_output, prefill_response, timings
+
+
+def _timed_local_draft_generate(approx_model_cache: Any, prefix: Any, gamma: int):
+    """Generate one first Prefill token plus ``gamma-1`` Decode tokens.
+
+    ``KVCacheModel.generate(prefix, gamma)`` performs exactly this sequence,
+    but does not expose the first full-prefix forward separately.  Splitting
+    the loop preserves sampling/KV semantics while making the two terms in the
+    priority formula directly measurable.  CUDA synchronization brackets each
+    forward so asynchronous kernel launches cannot under-report latency.
+    """
+
+    gamma = int(gamma)
+    if gamma <= 0:
+        return prefix, {"local_prefill_s": 0.0, "local_decode_per_token_s": 0.0}
+    device = getattr(getattr(approx_model_cache, "_model", None), "device", "cpu")
+    synchronize(device)
+    started = time.monotonic_ns()
+    output = approx_model_cache.generate(prefix, 1)
+    synchronize(device)
+    prefill_s = max(0.0, (time.monotonic_ns() - started) / 1_000_000_000.0)
+    decode_s = 0.0
+    if gamma > 1:
+        synchronize(device)
+        decode_started = time.monotonic_ns()
+        for _ in range(gamma - 1):
+            output = approx_model_cache.generate(output, 1)
+            synchronize(device)
+        decode_s = max(0.0, (time.monotonic_ns() - decode_started) / 1_000_000_000.0)
+        decode_s /= float(gamma - 1)
+    return output, {
+        "local_prefill_s": prefill_s,
+        "local_decode_per_token_s": decode_s,
+        "local_prefill_ms": prefill_s * 1000.0,
+        "local_decode_per_token_ms": decode_s * 1000.0,
+    }
 
 
 def configure_spawn_executable() -> str | None:
@@ -55,12 +277,25 @@ def configure_spawn_executable() -> str | None:
 class EdgeClient:
     """边缘端 HTTP 客户端，负责与云端 target 服务通信。"""
 
-    def __init__(self, server_url: str, timeout: float = 30.0):
+    def __init__(
+        self,
+        server_url: str,
+        timeout: float = 30.0,
+        timing_priority: bool = False,
+    ):
         self.server_url = server_url.rstrip("/")
         self.timeout = timeout
+        self.timing_priority = bool(timing_priority)
         self.session = requests.Session()
+        # Timing updates must not share the in-flight /prefill connection.
+        self.timing_session = requests.Session()
         # 避免 127.0.0.1 请求被环境变量代理劫持到其他服务。
         self.session.trust_env = False
+        self.timing_session.trust_env = False
+        # Defined as cloud_epoch - edge_epoch, measured by NTP-style probes.
+        self.clock_offset_ns = 0
+        self.clock_uncertainty_ns = 0
+        self._stats_lock = threading.Lock()
         self._request_bytes = 0
         self._response_bytes = 0
         self._rpc_count = 0
@@ -90,23 +325,79 @@ class EdgeClient:
             headers={"Content-Type": "application/json"},
             timeout=self.timeout,
         )
-        self._request_bytes += len(body)
-        self._response_bytes += len(response.content)
-        self._rpc_count += 1
+        with self._stats_lock:
+            self._request_bytes += len(body)
+            self._response_bytes += len(response.content)
+            self._rpc_count += 1
         response.raise_for_status()
         return response.json()
 
     def health(self) -> Dict[str, Any]:
         url = f"{self.server_url}/health"
         response = self.session.get(url, timeout=self.timeout)
-        self._response_bytes += len(response.content)
-        self._rpc_count += 1
+        with self._stats_lock:
+            self._response_bytes += len(response.content)
+            self._rpc_count += 1
         response.raise_for_status()
         return response.json()
 
     def init_session(self) -> str:
         resp = self._post("/session/init", {})
         return resp["session_id"]
+
+    def synchronize_clock(self, samples: int = 5) -> dict[str, int]:
+        """Calibrate cloud-edge epoch offset with NTP-style probes.
+
+        The minimum-RTT sample is used as the least-contended offset estimate;
+        no RTT/2 value is ever used as an application upload/pull duration.
+        """
+
+        measurements = []
+        for _ in range(max(1, int(samples))):
+            edge_before = time.time_ns()
+            response = self.session.get(
+                f"{self.server_url}/clock/sync", timeout=self.timeout
+            )
+            edge_after = time.time_ns()
+            response.raise_for_status()
+            cloud_time = int(response.json()["cloud_time_ns"])
+            midpoint = (edge_before + edge_after) // 2
+            measurements.append(
+                (edge_after - edge_before, cloud_time - midpoint)
+            )
+        rtt_ns, offset_ns = min(measurements, key=lambda item: item[0])
+        self.clock_offset_ns = int(offset_ns)
+        self.clock_uncertainty_ns = max(0, int(rtt_ns // 2))
+        return {
+            "clock_offset_ns": self.clock_offset_ns,
+            "clock_uncertainty_ns": self.clock_uncertainty_ns,
+            "samples": len(measurements),
+        }
+
+    def _attach_pull(self, response: Dict[str, Any], edge_receive_time_ns: int) -> Dict[str, Any]:
+        """Attach a synchronized cloud-to-edge duration to an RPC response."""
+
+        cloud_send = response.get("cloud_send_time_ns")
+        if cloud_send is None:
+            response.setdefault("pull_s", 0.0)
+            return response
+        try:
+            pull_ns = int(edge_receive_time_ns) - (
+                int(cloud_send) - int(self.clock_offset_ns)
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RuntimeError("invalid cloud_send_time_ns in timing response") from exc
+        if pull_ns < 0:
+            raise RuntimeError(
+                "synchronized clocks produced a negative pull duration; retry clock calibration"
+            )
+        response["pull_s"] = pull_ns / 1_000_000_000.0
+        response["pull_ms"] = response["pull_s"] * 1000.0
+        return response
+
+    def close(self) -> None:
+        self.session.close()
+        self.timing_session.close()
 
     def prefill(
         self,
@@ -116,7 +407,12 @@ class EdgeClient:
         prefix_len: int,
         lag: float,
         current_time: float,
+        gamma: int = 0,
+        timing_required: bool = False,
+        edge_send_time_ns: int | None = None,
     ) -> Dict[str, Any]:
+        if edge_send_time_ns is None:
+            edge_send_time_ns = time.time_ns()
         payload = {
             "session_id": session_id,
             "task_id": task_id,
@@ -124,8 +420,86 @@ class EdgeClient:
             "prefix_len": prefix_len,
             "lag": lag,
             "current_time": current_time,
+            "gamma": int(gamma),
+            "prefill_gamma": int(gamma),
+            "timing_required": bool(timing_required),
+            "timing_priority": self.timing_priority,
+            "edge_send_time_ns": int(edge_send_time_ns),
+            "clock_offset_ns": int(self.clock_offset_ns),
         }
-        return self._post("/prefill", payload)
+        response = self._post("/prefill", payload)
+        return self._attach_pull(response, time.time_ns())
+
+    def prefill_timing(
+        self,
+        session_id: str,
+        task_id: str,
+        gamma: int,
+        local_prefill_s: float,
+        local_decode_per_token_s: float,
+    ) -> Dict[str, Any]:
+        """Upload local first-token/Decode measurements and unlock Prefill."""
+
+        edge_send_time_ns = time.time_ns()
+        payload = {
+            "session_id": session_id,
+            "task_id": task_id,
+            "gamma": int(gamma),
+            "local_prefill_s": float(local_prefill_s),
+            "local_decode_per_token_s": float(local_decode_per_token_s),
+            "T_i_p": float(local_prefill_s),
+            "T_i_d": float(local_decode_per_token_s),
+            "edge_send_time_ns": edge_send_time_ns,
+            "clock_offset_ns": int(self.clock_offset_ns),
+        }
+        # This call intentionally uses a different Session from /prefill.
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        upload_started = time.monotonic()
+        response = self.timing_session.post(
+            f"{self.server_url}/prefill/timing",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            timeout=self.timeout,
+        )
+        with self._stats_lock:
+            self._request_bytes += len(body)
+            self._response_bytes += len(response.content)
+            self._rpc_count += 1
+        response.raise_for_status()
+        result = response.json()
+        if result.get("status") != "timing_ready":
+            raise RuntimeError(f"prefill timing update failed: {result}")
+        result["timing_upload_s"] = max(0.0, time.monotonic() - upload_started)
+        result["timing_upload_ms"] = result["timing_upload_s"] * 1000.0
+        return result
+
+    def prefill_cancel(self, session_id: str, task_id: str) -> Dict[str, Any]:
+        """Release a timing-gated cloud Prefill after a local failure.
+
+        This uses the independent control connection so it can run while the
+        original ``/prefill`` request is blocked in its long poll.
+        """
+
+        payload = {
+            "session_id": session_id,
+            "task_id": task_id,
+        }
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        response = self.timing_session.post(
+            f"{self.server_url}/prefill/cancel",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            timeout=self.timeout,
+        )
+        with self._stats_lock:
+            self._request_bytes += len(body)
+            self._response_bytes += len(response.content)
+            self._rpc_count += 1
+        response.raise_for_status()
+        result = response.json()
+        if result.get("status") != "cancelled":
+            raise RuntimeError(f"prefill cancel failed: {result}")
+        return result
 
     def verify(
         self,
@@ -139,7 +513,12 @@ class EdgeClient:
         transport_rtt: float = 0.0,
         tail_only: bool = False,
         has_bridge_token: bool = False,
+        local_decode_per_token_s: float | None = None,
+        last_pull_s: float | None = None,
+        edge_send_time_ns: int | None = None,
     ) -> tuple[Dict[str, Any], float]:
+        if edge_send_time_ns is None:
+            edge_send_time_ns = time.time_ns()
         payload = {
             "session_id": session_id,
             "task_id": task_id,
@@ -151,10 +530,19 @@ class EdgeClient:
             "transport_rtt": transport_rtt,
             "tail_only": tail_only,
             "has_bridge_token": has_bridge_token,
+            "timing_priority": self.timing_priority,
+            "local_decode_per_token_s": local_decode_per_token_s,
+            "last_pull_s": last_pull_s,
+            "T_i_d": local_decode_per_token_s,
+            "T_i_pull": last_pull_s,
+            "edge_send_time_ns": int(edge_send_time_ns),
+            "clock_offset_ns": int(self.clock_offset_ns),
         }
-        transport_start = time.time()
+        transport_start = time.monotonic()
         resp = self._post("/verify", payload)
-        measured_http_total = max(0.0, time.time() - transport_start)
+        edge_receive_time_ns = time.time_ns()
+        measured_http_total = max(0.0, time.monotonic() - transport_start)
+        self._attach_pull(resp, edge_receive_time_ns)
         return resp, measured_http_total
 
 
@@ -523,6 +911,23 @@ class EdgeRunner(Decoding):
             if int(r.get("generated_tokens", 0)) > 1 and r.get("tpot_ms") is not None
         ]
         arrival_lag = [float(r.get("arrival_lag_ms", 0.0)) for r in records]
+        overlap_prefill_first_draft = [
+            float(bool(r.get("overlap_prefill_first_draft", False))) for r in records
+        ]
+        prefill_ms = [float(r.get("prefill_ms", 0.0)) for r in records]
+        first_draft_ms = [float(r.get("first_draft_ms", 0.0)) for r in records]
+        local_prefill_ms = [float(r.get("local_prefill_ms", 0.0)) for r in records]
+        local_decode_per_token_ms = [
+            float(r.get("local_decode_per_token_ms", 0.0)) for r in records
+        ]
+        push_ms = [float(r.get("avg_push_ms", 0.0)) for r in records]
+        pull_ms = [float(r.get("avg_pull_ms", 0.0)) for r in records]
+        prefill_first_draft_overlap_ms = [
+            float(r.get("prefill_first_draft_overlap_ms", 0.0)) for r in records
+        ]
+        prefill_wait_after_first_draft_ms = [
+            float(r.get("prefill_wait_after_first_draft_ms", 0.0)) for r in records
+        ]
         total_tokens = sum(int(r.get("generated_tokens", 0)) for r in records)
         max_generated_tokens_observed = max(
             (int(r.get("generated_tokens", 0)) for r in records),
@@ -549,6 +954,12 @@ class EdgeRunner(Decoding):
             "server_sched_mode": self.args.server_sched_mode,
             "enable_pipeline": bool(getattr(self.args, "enable_pipeline", True)),
             "enable_proactive_draft": bool(getattr(self.args, "enable_proactive_draft", True)),
+            "overlap_prefill_first_draft": bool(
+                getattr(self.args, "overlap_prefill_first_draft", False)
+            ),
+            "enable_latency_priority": bool(
+                getattr(self.args, "enable_latency_priority", False)
+            ),
             "num_drafts": int(self.args.num_drafts),
             "warmup_requests_per_process": int(getattr(self.args, "warmup_requests", 0)),
             "warmup_included_in_metrics": False,
@@ -604,6 +1015,35 @@ class EdgeRunner(Decoding):
             "tpot_ms_p99": self._percentile(tpot, 0.99),
             "arrival_lag_ms_avg": float(statistics.mean(arrival_lag)) if arrival_lag else 0.0,
             "arrival_lag_ms_p95": self._percentile(arrival_lag, 0.95),
+            "overlap_prefill_first_draft_avg": (
+                float(statistics.mean(overlap_prefill_first_draft))
+                if overlap_prefill_first_draft
+                else 0.0
+            ),
+            "prefill_ms_avg": float(statistics.mean(prefill_ms)) if prefill_ms else 0.0,
+            "first_draft_ms_avg": (
+                float(statistics.mean(first_draft_ms)) if first_draft_ms else 0.0
+            ),
+            "local_prefill_ms_avg": (
+                float(statistics.mean(local_prefill_ms)) if local_prefill_ms else 0.0
+            ),
+            "local_decode_per_token_ms_avg": (
+                float(statistics.mean(local_decode_per_token_ms))
+                if local_decode_per_token_ms
+                else 0.0
+            ),
+            "push_ms_avg": float(statistics.mean(push_ms)) if push_ms else 0.0,
+            "pull_ms_avg": float(statistics.mean(pull_ms)) if pull_ms else 0.0,
+            "prefill_first_draft_overlap_ms_avg": (
+                float(statistics.mean(prefill_first_draft_overlap_ms))
+                if prefill_first_draft_overlap_ms
+                else 0.0
+            ),
+            "prefill_wait_after_first_draft_ms_avg": (
+                float(statistics.mean(prefill_wait_after_first_draft_ms))
+                if prefill_wait_after_first_draft_ms
+                else 0.0
+            ),
         }
         summary_path = os.path.join(self.args.exp_name, "edge_metrics_summary.json")
         with open(summary_path, "w") as f:
@@ -625,7 +1065,7 @@ class EdgeRunner(Decoding):
             )
 
         # 启动多个边缘 draft 进程，每个进程独立 session_id
-        wallclock_start = time.time()
+        wallclock_start = time.monotonic()
         processes = []
         arrival_barrier = None
         arrival_start_time = None
@@ -644,7 +1084,7 @@ class EdgeRunner(Decoding):
         for proc in processes:
             proc.join()
 
-        self._write_summary(max(0.0, time.time() - wallclock_start))
+        self._write_summary(max(0.0, time.monotonic() - wallclock_start))
         failed = [proc.exitcode for proc in processes if proc.exitcode != 0]
         if failed:
             raise RuntimeError(f"{len(failed)} draft process(es) failed with exit codes {failed}")
@@ -675,6 +1115,30 @@ class EdgeRunner(Decoding):
         arrival_barrier=None,
         arrival_start_time=None,
     ):
+        """Run one draft worker and always close each task's HTTP executor."""
+
+        executor_holder: Dict[str, Any] = {}
+        try:
+            return self._run_draft_process_http_impl(
+                tokenizer,
+                proc_id,
+                arrival_barrier,
+                arrival_start_time,
+                executor_holder,
+            )
+        finally:
+            executor = executor_holder.get("executor")
+            if executor is not None:
+                _shutdown_executor(executor, wait=True)
+
+    def _run_draft_process_http_impl(
+        self,
+        tokenizer,
+        proc_id: int,
+        arrival_barrier=None,
+        arrival_start_time=None,
+        executor_holder: Dict[str, Any] | None = None,
+    ):
         # Support CPU device for draft workers
         use_cpu = getattr(self.args, "edge_use_cpu", False)
         if use_cpu:
@@ -688,10 +1152,31 @@ class EdgeRunner(Decoding):
 
         draft_model = self._load_draft_model(self.args.draft_model, device)
 
-        client = EdgeClient(self.args.server_url, timeout=self.args.request_timeout)
+        client = EdgeClient(
+            self.args.server_url,
+            timeout=self.args.request_timeout,
+            timing_priority=bool(
+                getattr(self.args, "enable_latency_priority", False)
+                and self.args.server_sched_mode == "fastsd"
+            ),
+        )
         health = client.health()
         if health.get("status") not in {"ok", "healthy"}:
             raise RuntimeError(f"Cloud service health check failed: {health}")
+        timing_protocol = bool(
+            getattr(self.args, "enable_latency_priority", False)
+            and self.args.server_sched_mode == "fastsd"
+        )
+        if timing_protocol:
+            clock_info = client.synchronize_clock(samples=5)
+            max_uncertainty_ms = float(
+                getattr(self.args, "timing_max_clock_uncertainty_ms", 10.0)
+            )
+            if max_uncertainty_ms > 0 and clock_info["clock_uncertainty_ns"] > max_uncertainty_ms * 1_000_000:
+                raise RuntimeError(
+                    "clock calibration uncertainty exceeds configured limit: "
+                    f"{clock_info['clock_uncertainty_ns'] / 1_000_000:.3f}ms > {max_uncertainty_ms:.3f}ms"
+                )
 
         data_file = self._resolve_data_file()
         with open(data_file, "r") as f:
@@ -750,29 +1235,131 @@ class EdgeRunner(Decoding):
             input_ids = self._encode_input_ids(tokenizer, input_text).to(draft_model.device)
             prefix = input_ids.clone()
             max_len = input_ids.shape[1] + self.args.max_tokens
-
-            prefill_start = time.monotonic()
-            prefill_resp = client.prefill(
+            first_token_time = None
+            pipeline_enabled = bool(getattr(self.args, "enable_pipeline", True))
+            proactive_enabled = bool(getattr(self.args, "enable_proactive_draft", True))
+            overlap_prefill_first_draft = bool(
+                getattr(self.args, "overlap_prefill_first_draft", False)
+            )
+            final_token = None
+            reused_pending_tokens: List[int] = []
+            current_gamma = int(self.args.gamma)
+            verify_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            if executor_holder is not None:
+                executor_holder["executor"] = verify_executor
+            # ``current_time`` is a cloud scheduler protocol field (epoch time);
+            # all local duration/ordering measurements use ``monotonic``.
+            prefill_current_time = time.time()
+            prefill_send_time_ns = time.time_ns()
+            prefill_call = lambda: client.prefill(
                 session_id=session_id,
                 task_id=task_id,
                 draft_output=prefix[0].tolist(),
                 prefix_len=prefix.shape[1],
                 lag=0.0,
-                current_time=time.time(),
+                current_time=prefill_current_time,
+                gamma=current_gamma,
+                timing_required=timing_protocol,
+                edge_send_time_ns=prefill_send_time_ns,
             )
-            if prefill_resp.get("status") != "prefill_ok":
-                raise RuntimeError(f"prefill failed: {prefill_resp}")
-            prefill_ms = max(0.0, (time.monotonic() - prefill_start) * 1000.0)
+            timing_call = None
+            if timing_protocol:
+                def timing_call(local_timing):
+                    return client.prefill_timing(
+                        session_id=session_id,
+                        task_id=task_id,
+                        gamma=current_gamma,
+                        local_prefill_s=local_timing["local_prefill_s"],
+                        local_decode_per_token_s=local_timing["local_decode_per_token_s"],
+                    )
 
-            task_start = time.monotonic()
-            first_token_time = None
-            pipeline_enabled = bool(getattr(self.args, "enable_pipeline", True))
-            proactive_enabled = bool(getattr(self.args, "enable_proactive_draft", True))
-            final_token = None
-            reused_pending_tokens: List[int] = []
-            current_gamma = int(self.args.gamma)
-            verify_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            # The first draft is generated exactly once.  In the FastSD profile
+            # the cloud Prefill occupies the single HTTP worker while this call
+            # runs on the edge thread; first Verify is gated on the validated
+            # Prefill result returned by the helper.
+            first_round_x = None
+            first_round_draft_ms = 0.0
+            prefill_ms = 0.0
+            prefill_first_draft_overlap_ms = 0.0
+            prefill_wait_after_first_draft_ms = 0.0
+            task_start = None
+            first_round_draft_started_at = None
+            first_round_timings = {}
+            if prefix.shape[1] < max_len:
+                first_round_x, prefill_resp, first_round_timings = _run_first_draft_with_prefill(
+                    verify_executor,
+                    prefill_call,
+                    lambda: _timed_local_draft_generate(
+                        approx_model_cache, prefix, current_gamma
+                    ) if timing_protocol else approx_model_cache.generate(prefix, current_gamma),
+                    # A timing-aware Prefill is intentionally a long-poll;
+                    # local first-round generation must run before the timing
+                    # update can release cloud execution.
+                    overlap=overlap_prefill_first_draft or timing_protocol,
+                    timeout=float(getattr(self.args, "request_timeout", 0.0)),
+                    timing_call=timing_call,
+                    cancel_call=(lambda: client.prefill_cancel(session_id, task_id))
+                    if timing_protocol
+                    else None,
+                )
+                if timing_protocol and "cloud_send_time_ns" not in prefill_resp:
+                    raise RuntimeError("FastSD Prefill response omitted cloud_send_time_ns")
+                prefill_ms = first_round_timings["prefill_ms"]
+                first_round_draft_ms = first_round_timings["first_draft_ms"]
+                prefill_first_draft_overlap_ms = first_round_timings[
+                    "prefill_first_draft_overlap_ms"
+                ]
+                prefill_wait_after_first_draft_ms = first_round_timings[
+                    "prefill_wait_after_first_draft_ms"
+                ]
+                first_round_draft_started_at = first_round_timings["draft_started_at"]
+                task_start = first_round_timings["prefill_completed_at"]
+            else:
+                # Keep the session protocol valid even when no decode round is
+                # requested.  This branch normally does not occur in benchmark
+                # runs (max_tokens is positive), but it avoids an unnecessary
+                # local draft call for a zero-length output.
+                if timing_protocol:
+                    # Even with no output slot, timing-required cloud Prefill
+                    # must be unlocked; a synchronous call here would wait on
+                    # a timing update that Edge never sends.
+                    _, prefill_resp, first_round_timings = _run_first_draft_with_prefill(
+                        verify_executor,
+                        prefill_call,
+                        lambda: (
+                            prefix,
+                            {
+                                "local_prefill_s": 0.0,
+                                "local_decode_per_token_s": 0.0,
+                            },
+                        ),
+                        overlap=True,
+                        timeout=float(getattr(self.args, "request_timeout", 0.0)),
+                        timing_call=timing_call,
+                        cancel_call=lambda: client.prefill_cancel(session_id, task_id),
+                    )
+                    if "cloud_send_time_ns" not in prefill_resp:
+                        raise RuntimeError("FastSD Prefill response omitted cloud_send_time_ns")
+                    prefill_ms = first_round_timings["prefill_ms"]
+                    task_start = first_round_timings["prefill_completed_at"]
+                else:
+                    prefill_start = time.monotonic()
+                    try:
+                        prefill_resp = _validate_prefill_response(prefill_call())
+                    except BaseException:
+                        _shutdown_executor(verify_executor, wait=True)
+                        raise
+                    prefill_completed_at = time.monotonic()
+                    prefill_ms = max(0.0, (prefill_completed_at - prefill_start) * 1000.0)
+                    task_start = prefill_completed_at
             last_transport_rtt = 0.0
+            last_pull_s = float(prefill_resp.get("pull_s", 0.0))
+            first_prefill_pull_s = last_pull_s
+            first_prefill_push_s = float(
+                first_round_timings.get("push_s", prefill_resp.get("push_s", 0.0))
+                if isinstance(first_round_timings, dict)
+                else prefill_resp.get("push_s", 0.0)
+            )
             reuse_hit_rounds = 0
             reuse_miss_rounds = 0
             reuse_miss_not_full_accept_rounds = 0
@@ -783,16 +1370,34 @@ class EdgeRunner(Decoding):
             sum_cloud_total_ms = 0.0
             sum_verify_ms = 0.0
             sum_transport_rtt_ms = 0.0
+            sum_push_ms = 0.0
+            sum_pull_ms = 0.0
             accepted_total = 0
             drafted_total = 0
             rounds = 0
+            first_round_pending = first_round_x is not None
             while prefix.shape[1] < max_len:
                 prefix_len = prefix.shape[1]
-                round_start = time.time()
+                round_start = time.monotonic()
                 req_gamma = current_gamma if pipeline_enabled else int(self.args.gamma)
+                local_decode_per_token_s = None
 
                 # 若上一轮复用 token 不足 gamma，这里补齐到 gamma 后再发起验证。
-                if reused_pending_tokens:
+                if first_round_pending:
+                    # The helper already produced this exact first-round state;
+                    # never regenerate it after waiting for Prefill.
+                    x = first_round_x
+                    first_round_pending = False
+                    round_start = float(first_round_draft_started_at)
+                    draft_elapsed = first_round_draft_ms / 1000.0
+                    local_decode_per_token_s = float(
+                        first_round_timings.get(
+                            "local_decode_per_token_s",
+                            draft_elapsed / max(1, req_gamma),
+                        )
+                    )
+                elif reused_pending_tokens:
+                    draft_started = time.monotonic()
                     reuse_count = min(len(reused_pending_tokens), req_gamma)
                     reuse_tensor = torch.tensor(
                         [reused_pending_tokens[:reuse_count]],
@@ -802,8 +1407,14 @@ class EdgeRunner(Decoding):
                     x = torch.cat((prefix, reuse_tensor), dim=1)
                     if reuse_count < req_gamma:
                         x = approx_model_cache.generate(x, req_gamma - reuse_count)
+                    draft_elapsed = max(0.0, time.monotonic() - draft_started)
+                    local_decode_per_token_s = draft_elapsed / max(1, req_gamma - reuse_count)
                 else:
+                    draft_started = time.monotonic()
                     x = approx_model_cache.generate(prefix, req_gamma)
+                    synchronize(getattr(draft_model, "device", "cpu"))
+                    draft_elapsed = max(0.0, time.monotonic() - draft_started)
+                    local_decode_per_token_s = draft_elapsed / max(1, req_gamma)
 
                 has_bridge_token = pipeline_enabled and (final_token is not None)
                 if pipeline_enabled:
@@ -826,20 +1437,28 @@ class EdgeRunner(Decoding):
                         3,
                     )
 
-                verify_future = verify_executor.submit(
+                verify_future = _submit_http_call(
+                    verify_executor,
                     client.verify,
                     session_id=session_id,
                     task_id=task_id,
                     draft_output=payload_tokens,
                     prefix_len=prefix_len,
-                    lag=time.time() - round_start,
+                    # For the overlapped first round, this is draft compute only;
+                    # any wait for Prefill happened before Verify submission.
+                    lag=draft_elapsed if first_round_draft_ms > 0 and rounds == 0 else max(
+                        0.0, time.monotonic() - round_start
+                    ),
                     current_time=time.time(),
                     gamma=req_gamma,
                     transport_rtt=last_transport_rtt,
                     tail_only=pipeline_enabled,
                     has_bridge_token=has_bridge_token,
+                    local_decode_per_token_s=local_decode_per_token_s,
+                    last_pull_s=last_pull_s,
                 )
-                draft_elapsed = max(0.0, time.time() - round_start)
+                if rounds > 0 or first_round_draft_ms <= 0:
+                    draft_elapsed = max(0.0, time.monotonic() - round_start)
                 if getattr(self.args, "debug_pipeline", False):
                     self.color_print(
                         f"[PIPELINE-EDGE][pid={proc_id}][session={session_id}] "
@@ -853,7 +1472,7 @@ class EdgeRunner(Decoding):
                 overlap_tokens: List[int] = []
                 overlap_prefix = x
                 max_overlap_tokens = req_gamma + 1
-                wait_start = time.time()
+                wait_start = time.monotonic()
                 wait_draft_steps = 0
                 if getattr(self.args, "debug_verify_tokens", False):
                     self.color_print(
@@ -882,7 +1501,7 @@ class EdgeRunner(Decoding):
                         time.sleep(0.0005)
 
                 if getattr(self.args, "debug_verify_tokens", False):
-                    wait_ms = (time.time() - wait_start) * 1000.0
+                    wait_ms = (time.monotonic() - wait_start) * 1000.0
                     debug_tail = 8
                     self.color_print(
                         f"[VERIFY-EDGE-WAIT-END][pid={proc_id}][session={session_id}] "
@@ -892,12 +1511,18 @@ class EdgeRunner(Decoding):
                     )
 
                 verify_resp, measured_http_total = verify_future.result()
+                if timing_protocol and "cloud_send_time_ns" not in verify_resp:
+                    raise RuntimeError("FastSD Verify response omitted cloud_send_time_ns")
+                if "pull_s" in verify_resp:
+                    last_pull_s = float(verify_resp["pull_s"])
                 verify_ms = float(verify_resp.get("verify_ms", 0.0))
                 cloud_total_ms = float(verify_resp.get("cloud_total_ms", 0.0))
+                push_s = float(verify_resp.get("push_s", 0.0))
+                pull_s = float(verify_resp.get("pull_s", last_pull_s))
                 # A purer transport estimate: subtract cloud-side service time from end-to-end HTTP time.
                 last_transport_rtt = max(0.0, measured_http_total - cloud_total_ms / 1000.0)
-                round_elapsed = max(0.0, time.time() - round_start)
-                wait_elapsed_ms = max(0.0, (time.time() - wait_start) * 1000.0)
+                round_elapsed = max(0.0, time.monotonic() - round_start)
+                wait_elapsed_ms = max(0.0, (time.monotonic() - wait_start) * 1000.0)
                 sum_round_ms += round_elapsed * 1000.0
                 sum_draft_ms += draft_elapsed * 1000.0
                 sum_wait_ms += wait_elapsed_ms
@@ -905,6 +1530,8 @@ class EdgeRunner(Decoding):
                 sum_cloud_total_ms += cloud_total_ms
                 sum_verify_ms += verify_ms
                 sum_transport_rtt_ms += last_transport_rtt * 1000.0
+                sum_push_ms += push_s * 1000.0
+                sum_pull_ms += pull_s * 1000.0
                 rounds += 1
 
                 accepted = int(verify_resp["accepted"])
@@ -1023,7 +1650,9 @@ class EdgeRunner(Decoding):
                         )
                         break
 
-            verify_executor.shutdown(wait=True)
+            _shutdown_executor(verify_executor, wait=True)
+            if executor_holder is not None:
+                executor_holder["executor"] = None
             completion_time = time.monotonic()
             transport_after = client.snapshot_transport_stats()
             transport_delta = {
@@ -1079,12 +1708,30 @@ class EdgeRunner(Decoding):
                 "server_sched_mode": self.args.server_sched_mode,
                 "enable_pipeline": pipeline_enabled,
                 "enable_proactive_draft": proactive_enabled,
+                "enable_latency_priority": timing_protocol,
                 "generated_tokens": generated_tokens,
                 "global_sample_index": int(global_idx),
                 "scheduled_arrival_s": scheduled_arrival_s,
                 "actual_arrival_s": actual_arrival_s,
                 "arrival_lag_ms": arrival_lag_ms,
                 "prefill_ms": prefill_ms,
+                "local_prefill_s": float(first_round_timings.get("local_prefill_s", 0.0)),
+                "local_prefill_ms": float(first_round_timings.get("local_prefill_ms", 0.0)),
+                "local_decode_per_token_s": float(
+                    first_round_timings.get("local_decode_per_token_s", 0.0)
+                ),
+                "local_decode_per_token_ms": float(
+                    first_round_timings.get("local_decode_per_token_ms", 0.0)
+                ),
+                "prefill_push_ms": first_prefill_push_s * 1000.0,
+                "prefill_timing_upload_ms": float(
+                    first_round_timings.get("timing_upload_ms", 0.0)
+                ),
+                "prefill_pull_ms": first_prefill_pull_s * 1000.0,
+                "overlap_prefill_first_draft": overlap_prefill_first_draft,
+                "first_draft_ms": first_round_draft_ms,
+                "prefill_first_draft_overlap_ms": prefill_first_draft_overlap_ms,
+                "prefill_wait_after_first_draft_ms": prefill_wait_after_first_draft_ms,
                 "request_e2e_ms": request_e2e_ms,
                 "ttft_ms": ttft_value,
                 "decode_ttft_ms": decode_ttft_value,
@@ -1100,6 +1747,8 @@ class EdgeRunner(Decoding):
                 "avg_cloud_total_ms": float(sum_cloud_total_ms / rounds) if rounds > 0 else 0.0,
                 "avg_verify_ms": float(sum_verify_ms / rounds) if rounds > 0 else 0.0,
                 "avg_transport_rtt_ms": float(sum_transport_rtt_ms / rounds) if rounds > 0 else 0.0,
+                "avg_push_ms": float(sum_push_ms / rounds) if rounds > 0 else 0.0,
+                "avg_pull_ms": float(sum_pull_ms / rounds) if rounds > 0 else 0.0,
                 "accepted_total": int(accepted_total),
                 "drafted_total": int(drafted_total),
                 "accept_rate": float(accepted_total / drafted_total) if drafted_total > 0 else 0.0,

@@ -24,6 +24,69 @@ FASTSD_VERIFY_WRR_ORDER = (
 FASTSD_QUEUE_ORDER = ("SV", "SP", "MV", "MP", "LV", "LP")
 
 
+def _finite_nonnegative(value: Any, field: str) -> float:
+    """Return a finite duration in seconds or reject an invalid sample."""
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{field} must be a finite non-negative number") from exc
+    if not math.isfinite(number) or number < 0.0:
+        raise ValueError(f"{field} must be a finite non-negative number")
+    return number
+
+
+def _timing_value(req: Mapping[str, Any], *names: str, default: float = 0.0) -> float:
+    """Read one canonical seconds field, accepting migration aliases.
+
+    The aliases keep old experiment manifests readable while all new wire
+    requests use the explicit ``*_s`` names.  Millisecond aliases are only
+    accepted when their name explicitly ends in ``_ms``.
+    """
+
+    for name in names:
+        if name not in req or req[name] is None:
+            continue
+        value = _finite_nonnegative(req[name], name)
+        return value / 1000.0 if name.endswith("_ms") else value
+    return float(default)
+
+
+def _has_explicit_latency_timing(req: Mapping[str, Any]) -> bool:
+    # Presence of optional fields with ``None`` is common on the cloud HTTP
+    # model and must not opt a legacy request into the new formula.  A caller
+    # can still explicitly opt in before all measurements are available.
+    if req.get("timing_priority", False) or req.get("latency_priority_enabled", False):
+        return True
+    return any(
+        name in req and req[name] is not None
+        for name in (
+            "local_prefill_s", "local_prefill_ms", "prefill_first_token_s",
+            "local_decode_per_token_s", "local_decode_per_token_ms",
+            "push_s", "push_ms", "pull_s", "pull_ms", "last_pull_s",
+            "T_i_p", "T_i_d", "T_i_push", "T_i_pull", "Tp", "Td",
+        )
+    )
+
+
+def _wait_seconds(req: Mapping[str, Any], now: float) -> float:
+    """Compute W from one clock domain, preferring cloud monotonic enqueue time."""
+
+    if "W_i" in req:
+        return _finite_nonnegative(req["W_i"], "W_i")
+    if "wait_s" in req:
+        return _finite_nonnegative(req["wait_s"], "wait_s")
+    if "server_enqueue_monotonic" in req:
+        start = _finite_nonnegative(req["server_enqueue_monotonic"], "server_enqueue_monotonic")
+    elif "queue_wait_start_s" in req:
+        start = _finite_nonnegative(req["queue_wait_start_s"], "queue_wait_start_s")
+    else:
+        # Legacy requests use epoch ``current_time`` and tests pass a matching
+        # synthetic ``now``.  The engine always writes the monotonic field.
+        start = _finite_nonnegative(req.get("current_time", 0.0), "current_time")
+    return max(0.0, float(now) - start)
+
+
 def full_prefix_bridge_tokens(prefix_len: int, cached_len: int) -> int:
     """Return the uncached correction-token count for a full-prefix verify.
 
@@ -94,12 +157,34 @@ def length_category(prefix_len: int, r1: int, r2: int) -> str:
 def compute_priority_score(req, accept_stats, now=None, lamda=0.01):
     if now is None:
         now = 0.0
-    elapsed = max(0.0, float(now) - float(req.get("current_time", 0.0)))
-    # TODO: 修改prefill任务的优先级，应当和draft模型类似
-    wait_term = math.exp(lamda * elapsed)
+    elapsed = _wait_seconds(req, float(now))
+    wait_term = math.exp(float(lamda) * elapsed)
+    # A timing-required Prefill remains queued, but cannot be selected before
+    # the Edge timing update atomically marks it ready.  The planner also
+    # filters this state; -inf makes direct score callers obey the same rule.
+    if req.get("task_type") == "prefill" and req.get("timing_required", False) and not req.get("timing_ready", False):
+        return -math.inf
     if req["task_type"] == "prefill":
+        if _has_explicit_latency_timing(req):
+            m_i = max(
+                1,
+                int(req.get("m_i", req.get("prefill_gamma", req.get("gamma", 1))) or 1),
+            )
+            local_prefill = _timing_value(
+                req, "local_prefill_s", "prefill_first_token_s", "local_prefill_ms",
+                "T_i_p", "Tp",
+            )
+            decode_per_token = _timing_value(
+                req, "local_decode_per_token_s", "local_decode_per_token_ms",
+                "T_i_d", "Td",
+            )
+            push = _timing_value(req, "push_s", "push_ms", "T_i_push", default=0.0)
+            # Prefill has no acceptance probability yet; per the protocol its
+            # P_n is fixed at one and cannot be overridden by request data.
+            return -(local_prefill + decode_per_token * (m_i - 1) + push) + wait_term
+        # Legacy vanilla/pipeline requests had no local timing update.
         return wait_term
-    # TODO: 通信时间
+
     pid = req["proc_id"]
     accepted_sum, total_sum = accept_stats.get(pid, (0, 0))
     if total_sum <= 0:
@@ -107,11 +192,26 @@ def compute_priority_score(req, accept_stats, now=None, lamda=0.01):
     else:
         acc_prob = (accepted_sum + 1.0) / (total_sum + 1.0)
     acc_prob = max(acc_prob, 1e-6)
-    draft_len = max(1, int(req.get("gamma", 1) or 1))
-    draft_total_time = float(req.get("lag", 0.0))
+    draft_len = max(1, int(req.get("m_i", req.get("gamma", 1)) or 1))
+    if _has_explicit_latency_timing(req):
+        decode_per_token = _timing_value(
+            req, "local_decode_per_token_s", "local_decode_per_token_ms", "T_i_d", "Td",
+        )
+        push = _timing_value(req, "push_s", "push_ms", "T_i_push", default=0.0)
+        pull = _timing_value(
+            req, "pull_s", "last_pull_s", "pull_ms", "T_i_pull", default=0.0,
+        )
+        denominator = _timing_value(req, "P_n", "p_n", default=acc_prob)
+        if denominator <= 0.0:
+            raise ValueError("P_n must be positive")
+        return -((decode_per_token * draft_len + push + pull) / denominator) + wait_term
+
+    # Legacy request compatibility: do not reinterpret historical RTT fields
+    # for baseline runs that have not opted into latency-aware scoring.
+    draft_total_time = _timing_value(req, "lag", default=0.0)
     if draft_total_time <= 0.0 and "draft_time_per_token" in req:
-        draft_total_time = draft_len * max(0.0, float(req["draft_time_per_token"]))
-    transport_rtt = max(0.0, float(req.get("transport_rtt", req.get("edge_rtt", 0.0))))
+        draft_total_time = draft_len * _finite_nonnegative(req["draft_time_per_token"], "draft_time_per_token")
+    transport_rtt = _timing_value(req, "transport_rtt", "edge_rtt", default=0.0)
     return -((draft_total_time + transport_rtt) / acc_prob) + wait_term
 
 
@@ -143,6 +243,16 @@ class WorkItem:
     state: str = "ready"  # ready -> reserved -> running -> ready/finished
 
     @property
+    def timing_ready(self) -> bool:
+        """Whether a timing-required Prefill may enter a forward plan."""
+
+        return bool(
+            self.task_type != "prefill"
+            or not self.request.get("timing_required", False)
+            or self.request.get("timing_ready", False)
+        )
+
+    @property
     def remaining_tokens(self) -> int:
         return max(0, int(self.total_tokens) - int(self.cursor))
 
@@ -158,7 +268,7 @@ class WorkItem:
             if prompt_len is None:
                 prompt_len = request["draft_output"].shape[1]
             total = int(prompt_len)
-            gamma = 0
+            gamma = int(request.get("prefill_gamma", request.get("gamma", 0)) or 0)
         else:
             total = int(request.get("gamma", 0) or 0)
             gamma = total
@@ -272,6 +382,8 @@ def _candidate_for_category(
         for item in state[task_type][category]:
             if item.work_id in selected or item.work_id in reserved or item.finished or item.remaining_tokens <= 0:
                 continue
+            if task_type == "prefill" and not item.timing_ready:
+                continue
             if task_type == "verify":
                 # A bridge token is an external pipeline token carried only
                 # by the first slice of a logical verify round.  The executor
@@ -301,7 +413,7 @@ def _all_candidates(state, selected, reserved):
     for task_type in ("verify", "prefill"):
         for category in ("short", "mid", "long"):
             for item in state[task_type][category]:
-                if item.work_id not in selected and item.work_id not in reserved and not item.finished and item.remaining_tokens > 0:
+                if item.work_id not in selected and item.work_id not in reserved and not item.finished and item.remaining_tokens > 0 and item.timing_ready:
                     yield item
 
 

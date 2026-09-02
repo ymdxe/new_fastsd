@@ -719,6 +719,8 @@ class Decoding(ABC):
             "verify": {"short": queue.Queue(), "mid": queue.Queue(), "long": queue.Queue()},
         }
         work_items = {}
+        pending_prefill_timing = {}
+        pending_prefill_cancel = set()
         accept_stats = defaultdict(lambda: [0, 1])  # {proc_id: [accepted_sum, total_sum]}
         committed_prefix_tokens = {}  # {proc_id: List[int]} for debug context display
         verify_time_ema = {}
@@ -756,6 +758,121 @@ class Decoding(ABC):
             if not math.isfinite(f) or abs(f) > 1e12:
                 return int(default)
             return int(f)
+
+        def _strict_duration(value, field: str) -> float:
+            """Validate timing control values; never turn bad telemetry into RTT/2."""
+
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(f"{field} must be finite and non-negative") from exc
+            if not math.isfinite(parsed) or parsed < 0.0:
+                raise ValueError(f"{field} must be finite and non-negative")
+            return parsed
+
+        def apply_prefill_timing(control: dict) -> bool:
+            """Atomically unlock the queued Prefill for one session."""
+
+            pid = control.get("proc_id")
+            local_prefill_s = _strict_duration(control.get("local_prefill_s"), "local_prefill_s")
+            local_decode_s = _strict_duration(
+                control.get("local_decode_per_token_s"), "local_decode_per_token_s"
+            )
+            gamma = _safe_int(control.get("prefill_gamma", control.get("m_i", 0)), default=0)
+            if gamma <= 0 or gamma > int(getattr(self.args, "max_tokens", 400) or 400):
+                raise ValueError("prefill timing gamma must be positive and within max_tokens")
+            push_s = _strict_duration(control.get("push_s"), "push_s")
+            update = {
+                "local_prefill_s": local_prefill_s,
+                "local_decode_per_token_s": local_decode_s,
+                "prefill_gamma": gamma,
+                "m_i": gamma,
+                "push_s": push_s,
+                "timing_ready": True,
+                "timing_required": True,
+            }
+            target = next(
+                (
+                    item
+                    for item in work_items.values()
+                    if item.proc_id == pid and item.task_type == "prefill" and not item.finished
+                ),
+                None,
+            )
+            if target is None:
+                # Queue FIFO normally means the initial request is already
+                # present.  Keep an update that races ingress so it is applied
+                # exactly once when that WorkItem is created.
+                pending_prefill_timing[pid] = update
+                scheduler_metrics["timing_updates"] += 1
+                return False
+            updated_request = dict(target.request)
+            updated_request.update(update)
+            target.request = updated_request
+            scheduler_metrics["timing_updates"] += 1
+            return True
+
+        def apply_prefill_cancel(control: dict) -> bool:
+            """Discard one failed timing-gated Prefill before it can execute."""
+
+            pid = control.get("proc_id")
+            task_id = str(control.get("task_id", ""))
+            pending_prefill_timing.pop(pid, None)
+            removed_ids = set()
+            for work_id, item in list(work_items.items()):
+                if item.proc_id != pid or item.task_type != "prefill":
+                    continue
+                item_task_id = str(item.request.get("task_id", ""))
+                if task_id and item_task_id != task_id:
+                    continue
+                item.finished = True
+                item.state = "finished"
+                removed_ids.add(work_id)
+                work_items.pop(work_id, None)
+
+            # A WorkItem can already have been placed in a category queue while
+            # the cancel control is being delivered.  Remove only the matching
+            # request, preserving every unrelated queued request.
+            for task_type in ("prefill", "verify"):
+                for category_queue in task_queues[task_type].values():
+                    with category_queue.mutex:
+                        kept = []
+                        removed_from_queue = 0
+                        for item in category_queue.queue:
+                            if (
+                                getattr(item, "proc_id", None) == pid
+                                and getattr(item, "task_type", None) == "prefill"
+                                and (
+                                    not task_id
+                                    or str(item.request.get("task_id", "")) == task_id
+                                )
+                            ):
+                                removed_from_queue += 1
+                                removed_ids.add(item.work_id)
+                                item.finished = True
+                                item.state = "finished"
+                            else:
+                                kept.append(item)
+                        if removed_from_queue:
+                            category_queue.queue.clear()
+                            category_queue.queue.extend(kept)
+                            # Queue.join() is not used by the scheduler, but
+                            # keep its bookkeeping internally consistent.
+                            category_queue.unfinished_tasks = max(
+                                0, category_queue.unfinished_tasks - removed_from_queue
+                            )
+            for work_id in removed_ids:
+                work_items.pop(work_id, None)
+            if removed_ids:
+                scheduler_metrics["prefill_cancels"] += len(removed_ids)
+                return True
+
+            # The cancel can race ahead of initial request ingress.  Remember
+            # it once, and the ingress path below will drop exactly that
+            # matching Prefill rather than creating an unexecutable WorkItem.
+            pending_prefill_cancel.add(pid)
+            scheduler_metrics["prefill_cancels"] += 1
+            return False
 
         def update_ema(store: dict, pid, value: float) -> float:
             alpha = float(getattr(self.args, "pipeline_ema_alpha", 0.2))
@@ -1206,7 +1323,8 @@ class Decoding(ABC):
             return collected_responses if return_responses else None
 
         def sort_task_queues():
-            now = time.time()
+            # WorkItem waiting time is measured on the cloud monotonic clock.
+            now = time.monotonic()
             for ttype in ["verify", "prefill"]:
                 for cat in task_queues[ttype]:
                     items = []
@@ -1348,6 +1466,9 @@ class Decoding(ABC):
             "prefetch_async_completed": 0,
             "prefetch_async_moved": 0,
             "prefetch_async_failed": 0,
+            "timing_updates": 0,
+            "timing_ready_prefill_forwards": 0,
+            "prefill_cancels": 0,
         }
 
         def _plan_queues():
@@ -1389,7 +1510,7 @@ class Decoding(ABC):
                 min_prefill_chunk_tokens=int(self.args.min_prefill_chunk_tokens),
                 prefill_chunk_quantum=int(self.args.prefill_chunk_quantum),
                 accept_stats=accept_stats,
-                now=time.time(),
+                now=time.monotonic(),
                 reserved_work_ids=reserved_work_ids,
             )
             desired = set(next_plan.verify_proc_ids)
@@ -1484,7 +1605,7 @@ class Decoding(ABC):
                 min_prefill_chunk_tokens=int(self.args.min_prefill_chunk_tokens),
                 prefill_chunk_quantum=int(self.args.prefill_chunk_quantum),
                 accept_stats=accept_stats,
-                now=time.time(),
+                now=time.monotonic(),
                 reserved_work_ids=reserved_work_ids,
             )
 
@@ -1555,6 +1676,7 @@ class Decoding(ABC):
                 for sl in plan.prefill_slices:
                     item = item_by_id[sl.work_id]
                     item.cursor = sl.offset + sl.draft_token_count
+                    scheduler_metrics["timing_ready_prefill_forwards"] += 1
                     if item.cursor >= item.total_tokens:
                         item.finished = True
                         completed.add(item.work_id)
@@ -1631,6 +1753,10 @@ class Decoding(ABC):
                         req = request_queue.get(timeout=0.01)
                         if req is None:
                             return
+                        if isinstance(req, dict) and req.get("control_type") == "prefill_timing":
+                            # A timing update is meaningful only to FastSD;
+                            # baselines never send this control message.
+                            continue
                         req = canonicalize_ingress(req)
                         if req is None:
                             continue
@@ -1653,6 +1779,30 @@ class Decoding(ABC):
                         req = request_queue.get(timeout=0.01)
                         if req is None:  # 终止信号
                             return
+                        if isinstance(req, dict) and req.get("control_type") == "prefill_timing":
+                            try:
+                                apply_prefill_timing(req)
+                            except (TypeError, ValueError, KeyError) as exc:
+                                self.color_print(f"[TIMING-REJECTED] {exc}", 2)
+                            drained += 1
+                            continue
+                        if isinstance(req, dict) and req.get("control_type") == "prefill_cancel":
+                            try:
+                                apply_prefill_cancel(req)
+                            except (TypeError, ValueError, KeyError) as exc:
+                                self.color_print(f"[PREFILL-CANCEL-REJECTED] {exc}", 2)
+                            drained += 1
+                            continue
+                        if (
+                            isinstance(req, dict)
+                            and req.get("task_type") == "prefill"
+                            and req.get("proc_id") in pending_prefill_cancel
+                        ):
+                            # A cancel control may arrive before the initial
+                            # /prefill request reaches worker ingress.
+                            pending_prefill_cancel.discard(req.get("proc_id"))
+                            drained += 1
+                            continue
                         req = canonicalize_ingress(req)
                         if req is None:
                             continue
@@ -1675,6 +1825,11 @@ class Decoding(ABC):
                                 req["prefix_len"], cached_len
                             )
                         item = WorkItem.from_request(req, category=cat, cycle=scheduler_state["current_cycle"], work_id=work_id)
+                        update = pending_prefill_timing.pop(req["proc_id"], None)
+                        if update is not None:
+                            req = dict(req)
+                            req.update(update)
+                            item.request = req
                         work_items[work_id] = item
                         task_queues[req["task_type"]][cat].put(item)
                         drained += 1

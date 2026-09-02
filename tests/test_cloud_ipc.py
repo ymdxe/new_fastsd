@@ -27,6 +27,16 @@ class CloudIPCPayloadTests(unittest.TestCase):
         py_compile.compile(str(cloud_path), doraise=True)
         py_compile.compile(str(engine_path), doraise=True)
 
+    def test_timing_prefill_cancel_has_cloud_and_worker_handlers(self):
+        repo = Path(__file__).resolve().parents[1]
+        cloud_text = (repo / "cloud" / "cloud_service.py").read_text(encoding="utf-8")
+        engine_text = (repo / "src" / "engine.py").read_text(encoding="utf-8")
+
+        self.assertIn('@app.post("/prefill/cancel")', cloud_text)
+        self.assertIn('"control_type": "prefill_cancel"', cloud_text)
+        self.assertIn('req.get("control_type") == "prefill_cancel"', engine_text)
+        self.assertIn("pending_prefill_cancel", engine_text)
+
 
 if __name__ == "__main__":
     unittest.main()

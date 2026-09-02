@@ -27,15 +27,57 @@ request_queue: Optional[mp.Queue] = None
 response_queue: Optional[mp.Queue] = None
 worker_proc: Optional[mp.Process] = None
 _request_max_tokens: int = 400
+_server_sched_mode: str = "fastsd"
+_enable_latency_priority: bool = True
 
 # FastAPI 请求等待表
 _pending: Dict[str, asyncio.Future] = {}
 _pending_sessions: Dict[str, str] = {}
 _pending_meta: Dict[str, str] = {}
+_pending_task_ids: Dict[str, str] = {}
 _pending_lock = threading.Lock()
+_prefill_timing_updates: Dict[str, dict] = {}
 _cloud_time_lock = threading.Lock()
 _cloud_total_ms_sum: float = 0.0
 _cloud_total_ms_count: int = 0
+
+
+def _finite_nonnegative(value: float, field: str) -> float:
+    """Validate a duration without hiding invalid telemetry as zero."""
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise HTTPException(status_code=422, detail=f"{field} must be finite and non-negative") from exc
+    if not number == number or number in (float("inf"), float("-inf")) or number < 0.0:
+        raise HTTPException(status_code=422, detail=f"{field} must be finite and non-negative")
+    return number
+
+
+def _compute_upload_seconds(edge_send_time_ns: int, clock_offset_ns: int, cloud_receive_time_ns: int) -> float:
+    """Compute cloud-received minus Edge-sent using synchronized epoch clocks.
+
+    ``clock_offset_ns`` is defined as cloud_time - edge_time.  A negative
+    corrected duration is a protocol error; it is never replaced with RTT/2.
+    """
+
+    try:
+        edge_send = int(edge_send_time_ns)
+        offset = int(clock_offset_ns)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise HTTPException(status_code=422, detail="invalid synchronized timing timestamp") from exc
+    if edge_send <= 0:
+        raise HTTPException(status_code=422, detail="edge_send_time_ns must be positive")
+    duration_ns = int(cloud_receive_time_ns) - (edge_send + offset)
+    if duration_ns < 0:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "synchronized clocks produced a negative upload duration; "
+                "retry clock calibration"
+            ),
+        )
+    return duration_ns / 1_000_000_000.0
 
 
 def _get_avg_cloud_total_ms() -> float:
@@ -59,6 +101,33 @@ class PrefillRequest(BaseModel):
     prefix_len: int
     lag: float
     current_time: float
+    gamma: int = 0
+    prefill_gamma: int = 0
+    timing_required: bool = False
+    timing_priority: bool = False
+    edge_send_time_ns: int = 0
+    clock_offset_ns: int = 0
+
+
+class PrefillTimingRequest(BaseModel):
+    session_id: str
+    task_id: str
+    gamma: int
+    local_prefill_s: Optional[float] = None
+    local_prefill_ms: Optional[float] = None
+    local_decode_per_token_s: Optional[float] = None
+    local_decode_per_token_ms: Optional[float] = None
+    # Formula-name aliases accepted for replaying timing traces.
+    T_i_p: Optional[float] = None
+    T_i_d: Optional[float] = None
+    T_i_push: Optional[float] = None
+    edge_send_time_ns: int
+    clock_offset_ns: int = 0
+
+
+class PrefillCancelRequest(BaseModel):
+    session_id: str
+    task_id: str
 
 
 class VerifyRequest(BaseModel):
@@ -72,6 +141,15 @@ class VerifyRequest(BaseModel):
     transport_rtt: float = 0.0
     tail_only: bool = False
     has_bridge_token: bool = False
+    timing_priority: bool = False
+    local_decode_per_token_s: Optional[float] = None
+    local_decode_per_token_ms: Optional[float] = None
+    T_i_d: Optional[float] = None
+    T_i_pull: Optional[float] = None
+    last_pull_s: Optional[float] = None
+    pull_s: Optional[float] = None
+    edge_send_time_ns: int = 0
+    clock_offset_ns: int = 0
 
 
 class CloudTargetWorker(Decoding):
@@ -153,6 +231,8 @@ def _start_result_dispatcher(loop: asyncio.AbstractEventLoop) -> None:
                         _pending.clear()
                         _pending_meta.clear()
                         _pending_sessions.clear()
+                        _pending_task_ids.clear()
+                        _prefill_timing_updates.clear()
                     for fut in pending:
                         if not fut.done():
                             loop.call_soon_threadsafe(
@@ -165,6 +245,8 @@ def _start_result_dispatcher(loop: asyncio.AbstractEventLoop) -> None:
             with _pending_lock:
                 fut = _pending.pop(req_id, None)
                 session_id = _pending_meta.pop(req_id, None)
+                if session_id is not None:
+                    _pending_task_ids.pop(session_id, None)
                 if session_id is not None and _pending_sessions.get(session_id) == req_id:
                     _pending_sessions.pop(session_id, None)
             if fut is not None and not fut.done():
@@ -199,6 +281,13 @@ def health() -> dict:
     }
 
 
+@app.get("/clock/sync")
+def clock_sync() -> dict:
+    """Return an epoch timestamp for the Edge NTP-style clock calibration."""
+
+    return {"cloud_time_ns": time.time_ns()}
+
+
 @app.post("/session/init")
 def session_init() -> dict:
     """
@@ -223,6 +312,7 @@ async def _enqueue_and_wait(request_dict: dict, req_id: str) -> dict:
         _pending[response_key] = fut
         _pending_sessions[req_id] = response_key
         _pending_meta[response_key] = req_id
+        _pending_task_ids[req_id] = str(request_dict.get("task_id", ""))
     request_dict["response_key"] = response_key
     request_dict["proc_id"] = req_id
     try:
@@ -232,6 +322,7 @@ async def _enqueue_and_wait(request_dict: dict, req_id: str) -> dict:
         with _pending_lock:
             _pending.pop(response_key, None)
             _pending_meta.pop(response_key, None)
+            _pending_task_ids.pop(req_id, None)
             if _pending_sessions.get(req_id) == response_key:
                 _pending_sessions.pop(req_id, None)
         raise
@@ -239,6 +330,7 @@ async def _enqueue_and_wait(request_dict: dict, req_id: str) -> dict:
         with _pending_lock:
             _pending.pop(response_key, None)
             _pending_meta.pop(response_key, None)
+            _pending_task_ids.pop(req_id, None)
             if _pending_sessions.get(req_id) == response_key:
                 _pending_sessions.pop(req_id, None)
         raise
@@ -262,6 +354,14 @@ async def prefill(req: PrefillRequest) -> dict:
         "proc_id": req_id,
         "lag": req.lag,
         "current_time": req.current_time,
+        "prefill_gamma": int(req.prefill_gamma or req.gamma or 0),
+        "timing_required": bool(req.timing_required),
+        "timing_priority": bool(req.timing_priority),
+        # The initial request is deliberately not executable until the
+        # independent /prefill/timing control message arrives.
+        "timing_ready": not bool(req.timing_required),
+        "edge_send_time_ns": int(req.edge_send_time_ns or 0),
+        "clock_offset_ns": int(req.clock_offset_ns or 0),
         "task_type": "prefill",
     }
     try:
@@ -272,17 +372,155 @@ async def prefill(req: PrefillRequest) -> dict:
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    resp = await _enqueue_and_wait(request_dict, req_id)
+    if request_dict.get("timing_required") and (
+        _server_sched_mode != "fastsd" or not _enable_latency_priority
+    ):
+        raise HTTPException(status_code=422, detail="timing-aware Prefill is FastSD-only")
+    try:
+        resp = await _enqueue_and_wait(request_dict, req_id)
+    except BaseException:
+        # Timing updates are request-scoped telemetry, not a session cache.
+        # Always release them when the long poll fails or is cancelled.
+        _prefill_timing_updates.pop(req_id, None)
+        raise
     if "error" in resp:
+        _prefill_timing_updates.pop(req_id, None)
         raise HTTPException(status_code=422, detail=str(resp["error"]))
     if "status" in resp:
-        return {"session_id": req_id, "status": resp["status"]}
-    return {"session_id": req_id, "status": "prefill_ok"}
+        out = {"session_id": req_id, "status": resp["status"]}
+    else:
+        out = {"session_id": req_id, "status": "prefill_ok"}
+    timing = _prefill_timing_updates.pop(req_id, {})
+    out["cloud_send_time_ns"] = time.time_ns()
+    if "push_s" in timing:
+        out["push_s"] = float(timing["push_s"])
+    out["timing_ready"] = True
+    return out
+
+
+@app.post("/prefill/timing")
+async def prefill_timing(req: PrefillTimingRequest) -> dict:
+    """Unlock one queued Prefill after the Edge's first local draft round.
+
+    This endpoint intentionally uses a separate HTTP connection/session on the
+    Edge.  It only sends a control message; the original /prefill long poll
+    remains responsible for returning the eventual state-establishing result.
+    """
+
+    if request_queue is None:
+        return {"error": "queues_not_initialized"}
+    if _server_sched_mode != "fastsd" or not _enable_latency_priority:
+        raise HTTPException(status_code=422, detail="/prefill/timing is FastSD-only")
+    local_prefill_s = req.local_prefill_s
+    if local_prefill_s is None and req.T_i_p is not None:
+        local_prefill_s = req.T_i_p
+    if local_prefill_s is None and req.local_prefill_ms is not None:
+        local_prefill_s = float(req.local_prefill_ms) / 1000.0
+    local_decode_s = req.local_decode_per_token_s
+    if local_decode_s is None and req.T_i_d is not None:
+        local_decode_s = req.T_i_d
+    if local_decode_s is None and req.local_decode_per_token_ms is not None:
+        local_decode_s = float(req.local_decode_per_token_ms) / 1000.0
+    if local_prefill_s is None or local_decode_s is None:
+        raise HTTPException(status_code=422, detail="timing update requires local Prefill and Decode durations")
+    local_prefill_s = _finite_nonnegative(local_prefill_s, "local_prefill_s")
+    local_decode_s = _finite_nonnegative(local_decode_s, "local_decode_per_token_s")
+    if int(req.gamma) <= 0 or int(req.gamma) > _request_max_tokens:
+        raise HTTPException(status_code=422, detail="gamma must be positive and within max_tokens")
+
+    with _pending_lock:
+        response_key = _pending_sessions.get(req.session_id)
+        pending_task = _pending_task_ids.get(req.session_id)
+    if response_key is None:
+        raise HTTPException(status_code=409, detail="no in-flight Prefill for session")
+    if pending_task is not None and pending_task != str(req.task_id):
+        raise HTTPException(status_code=409, detail="timing task_id does not match Prefill")
+
+    cloud_receive_time_ns = time.time_ns()
+    push_s = _compute_upload_seconds(
+        req.edge_send_time_ns,
+        req.clock_offset_ns,
+        cloud_receive_time_ns,
+    )
+    update = {
+        "control_type": "prefill_timing",
+        "task_type": "prefill_timing",
+        "proc_id": req.session_id,
+        "task_id": req.task_id,
+        "response_key": response_key,
+        "local_prefill_s": local_prefill_s,
+        "local_decode_per_token_s": local_decode_s,
+        "prefill_gamma": int(req.gamma),
+        "m_i": int(req.gamma),
+        "push_s": push_s,
+        "T_i_p": local_prefill_s,
+        "T_i_d": local_decode_s,
+        "T_i_push": push_s,
+        "timing_ready": True,
+        "timing_cloud_receive_time_ns": cloud_receive_time_ns,
+    }
+    previous = _prefill_timing_updates.get(req.session_id)
+    if previous is not None:
+        comparable = (previous.get("local_prefill_s"), previous.get("local_decode_per_token_s"), previous.get("m_i"))
+        current = (update["local_prefill_s"], update["local_decode_per_token_s"], update["m_i"])
+        if comparable != current:
+            raise HTTPException(status_code=409, detail="conflicting duplicate Prefill timing update")
+        return {"session_id": req.session_id, "status": "timing_ready", "push_s": previous["push_s"]}
+    _prefill_timing_updates[req.session_id] = update
+    try:
+        request_queue.put(update)
+    except BaseException:
+        _prefill_timing_updates.pop(req.session_id, None)
+        raise
+    return {"session_id": req.session_id, "status": "timing_ready", "push_s": push_s}
+
+
+@app.post("/prefill/cancel")
+async def prefill_cancel(req: PrefillCancelRequest) -> dict:
+    """Cancel a timing-gated Prefill whose Edge draft failed or timed out.
+
+    The Edge cannot join its HTTP executor while the original Prefill long poll
+    is waiting for ``prefill_timing``.  Removing the pending future and
+    completing it with an error lets that request unwind, while the worker
+    receives a matching control message and discards a queued WorkItem (or
+    remembers the cancellation if ingress has not happened yet).
+    """
+
+    if request_queue is None:
+        return {"error": "queues_not_initialized"}
+    with _pending_lock:
+        response_key = _pending_sessions.get(req.session_id)
+        pending_task = _pending_task_ids.get(req.session_id)
+        fut = _pending.get(response_key) if response_key is not None else None
+        if response_key is None:
+            raise HTTPException(status_code=409, detail="no in-flight Prefill for session")
+        if pending_task is not None and pending_task != str(req.task_id):
+            raise HTTPException(status_code=409, detail="cancel task_id does not match Prefill")
+        _pending.pop(response_key, None)
+        _pending_meta.pop(response_key, None)
+        _pending_task_ids.pop(req.session_id, None)
+        if _pending_sessions.get(req.session_id) == response_key:
+            _pending_sessions.pop(req.session_id, None)
+    _prefill_timing_updates.pop(req.session_id, None)
+    if fut is not None and not fut.done():
+        # A normal result keeps the cancellation as an expected HTTP 422 from
+        # /prefill, rather than creating an unobserved Future exception.
+        fut.set_result({"error": "prefill cancelled by Edge"})
+    request_queue.put(
+        {
+            "control_type": "prefill_cancel",
+            "task_type": "prefill_cancel",
+            "proc_id": req.session_id,
+            "task_id": req.task_id,
+        }
+    )
+    return {"session_id": req.session_id, "status": "cancelled"}
 
 
 @app.post("/verify")
 async def verify(req: VerifyRequest) -> dict:
     api_start = time.time()
+    cloud_receive_time_ns = time.time_ns()
     if request_queue is None:
         return {"error": "queues_not_initialized"}
 
@@ -303,7 +541,28 @@ async def verify(req: VerifyRequest) -> dict:
         "task_type": "verify",
         "tail_only": req.tail_only,
         "has_bridge_token": req.has_bridge_token,
+        "local_decode_per_token_s": req.local_decode_per_token_s,
+        "local_decode_per_token_ms": req.local_decode_per_token_ms,
+        "T_i_d": req.T_i_d,
+        "T_i_pull": req.T_i_pull,
+        "last_pull_s": req.last_pull_s,
+        "pull_s": req.pull_s,
+        "edge_send_time_ns": int(req.edge_send_time_ns or 0),
+        "clock_offset_ns": int(req.clock_offset_ns or 0),
     }
+    if _server_sched_mode == "fastsd" and req.timing_priority and _enable_latency_priority:
+        # FastSD requests must carry an auditable upload timestamp.  Legacy
+        # baseline requests keep their historical RTT path untouched.
+        if request_dict["edge_send_time_ns"] <= 0:
+            raise HTTPException(status_code=422, detail="FastSD Verify requires edge_send_time_ns")
+        request_dict["push_s"] = _compute_upload_seconds(
+            request_dict["edge_send_time_ns"],
+            request_dict["clock_offset_ns"],
+            cloud_receive_time_ns,
+        )
+    for field in ("local_decode_per_token_s", "local_decode_per_token_ms", "last_pull_s", "pull_s"):
+        if request_dict.get(field) is not None:
+            request_dict[field] = _finite_nonnegative(request_dict[field], field)
     try:
         request_dict = canonicalize_request(
             request_dict,
@@ -326,6 +585,9 @@ async def verify(req: VerifyRequest) -> dict:
         out["verify_ms"] = float(resp["verify_ms"])
     if "suggested_gamma" in resp:
         out["suggested_gamma"] = int(resp["suggested_gamma"])
+    out["cloud_send_time_ns"] = time.time_ns()
+    if "push_s" in request_dict:
+        out["push_s"] = float(request_dict["push_s"])
     # Cloud-side end-to-end service time for this HTTP verify request.
     out["cloud_total_ms"] = (time.time() - api_start) * 1000.0
     _record_cloud_total_ms(out["cloud_total_ms"])
@@ -341,9 +603,11 @@ def exit_worker() -> dict:
 
 
 def main() -> None:
-    global request_queue, response_queue, worker_proc, _request_max_tokens
+    global request_queue, response_queue, worker_proc, _request_max_tokens, _server_sched_mode, _enable_latency_priority
     args = parse_arguments()
     _request_max_tokens = int(args.max_tokens)
+    _server_sched_mode = str(getattr(args, "server_sched_mode", "fastsd"))
+    _enable_latency_priority = bool(getattr(args, "enable_latency_priority", False))
 
     ctx = mp.get_context("spawn")
     request_queue = ctx.Queue()

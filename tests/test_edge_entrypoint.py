@@ -1,9 +1,12 @@
+import concurrent.futures
 import importlib.util
 import multiprocessing.spawn as mp_spawn
 import os
 import py_compile
 from pathlib import Path
 import sys
+import threading
+import time
 import types
 import unittest
 from unittest.mock import patch
@@ -181,6 +184,280 @@ class EdgeEntrypointTests(unittest.TestCase):
                 args = edge_module.parse_edge_arguments()
 
         self.assertEqual(args.max_tasks_per_draft, 3)
+
+    def test_first_draft_overlaps_prefill_and_gates_verify_on_prefill(self):
+        edge_module, _ = _load_edge_with_auto_gptq_blocked()
+        prefill_started = threading.Event()
+        release_prefill = threading.Event()
+        prefill_returned = threading.Event()
+        release_prefill_finish = threading.Event()
+        events = []
+        counts = {"prefill": 0, "draft": 0, "verify": 0}
+
+        def prefill():
+            counts["prefill"] += 1
+            events.append("prefill_started")
+            prefill_started.set()
+            self.assertTrue(release_prefill.wait(timeout=2))
+            events.append("prefill_returned")
+            prefill_returned.set()
+            self.assertTrue(release_prefill_finish.wait(timeout=2))
+            return {"status": "prefill_ok", "session_id": "s"}
+
+        def draft():
+            self.assertTrue(prefill_started.wait(timeout=2))
+            counts["draft"] += 1
+            events.append("draft")
+            release_prefill.set()
+            self.assertTrue(prefill_returned.wait(timeout=2))
+            release_prefill_finish.set()
+            return [11, 12]
+
+        def verify():
+            counts["verify"] += 1
+            events.append("verify")
+            return {"accepted": 2, "final_token": 13}
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            draft_output, response, timings = edge_module._run_first_draft_with_prefill(
+                executor,
+                prefill,
+                draft,
+                overlap=True,
+                timeout=2,
+                clock=time.perf_counter,
+            )
+            verify_future = executor.submit(verify)
+            verify_future.result(timeout=2)
+        finally:
+            executor.shutdown(wait=True)
+
+        self.assertEqual(counts, {"prefill": 1, "draft": 1, "verify": 1})
+        self.assertEqual(draft_output, [11, 12])
+        self.assertEqual(response["status"], "prefill_ok")
+        self.assertLess(events.index("prefill_returned"), events.index("verify"))
+        self.assertGreaterEqual(timings["prefill_ms"], 0.0)
+        self.assertGreaterEqual(timings["first_draft_ms"], 0.0)
+        self.assertGreater(
+            timings["prefill_first_draft_overlap_ms"],
+            0.0,
+            msg=f"timings={timings!r}, events={events!r}",
+        )
+
+    def test_timing_update_precedes_long_poll_prefill_completion(self):
+        edge_module, _ = _load_edge_with_auto_gptq_blocked()
+        prefill_started = threading.Event()
+        timing_updated = threading.Event()
+        events = []
+
+        def prefill():
+            events.append("prefill_started")
+            prefill_started.set()
+            self.assertTrue(timing_updated.wait(timeout=2))
+            events.append("prefill_returned")
+            return {"status": "prefill_ok"}
+
+        def draft():
+            self.assertTrue(prefill_started.wait(timeout=2))
+            events.append("draft")
+            return [11, 12], {
+                "local_prefill_s": 0.2,
+                "local_decode_per_token_s": 0.03,
+            }
+
+        def timing_update(local_timing):
+            self.assertEqual(local_timing["local_prefill_s"], 0.2)
+            self.assertEqual(local_timing["local_decode_per_token_s"], 0.03)
+            events.append("timing_update")
+            timing_updated.set()
+            return {"status": "timing_ready", "push_s": 0.01}
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            draft_output, response, timings = edge_module._run_first_draft_with_prefill(
+                executor,
+                prefill,
+                draft,
+                overlap=True,
+                timeout=2,
+                clock=time.perf_counter,
+                timing_call=timing_update,
+            )
+            events.append("verify")
+        finally:
+            executor.shutdown(wait=True)
+
+        self.assertEqual(draft_output, [11, 12])
+        self.assertEqual(response["status"], "prefill_ok")
+        self.assertEqual(
+            events,
+            ["prefill_started", "draft", "timing_update", "prefill_returned", "verify"],
+        )
+        self.assertEqual(timings["push_s"], 0.01)
+
+    def test_task_executor_is_closed_when_task_impl_raises(self):
+        edge_module, _ = _load_edge_with_auto_gptq_blocked()
+
+        class RecordingExecutor(concurrent.futures.ThreadPoolExecutor):
+            def __init__(self):
+                self.shutdown_calls = []
+                super().__init__(max_workers=1)
+
+            def shutdown(self, *args, **kwargs):
+                self.shutdown_calls.append((args, kwargs))
+                return super().shutdown(*args, **kwargs)
+
+        executor = RecordingExecutor()
+        runner = object.__new__(edge_module.EdgeRunner)
+
+        def failing_impl(*args):
+            args[-1]["executor"] = executor
+            raise RuntimeError("local draft failure")
+
+        runner._run_draft_process_http_impl = failing_impl
+        try:
+            with self.assertRaisesRegex(RuntimeError, "local draft failure"):
+                runner.run_draft_process_http(None, 0)
+            self.assertTrue(
+                any(call_kwargs.get("wait") is True for _, call_kwargs in executor.shutdown_calls)
+            )
+        finally:
+            executor.shutdown(wait=True)
+
+    def test_prefill_failure_does_not_submit_verify(self):
+        edge_module, _ = _load_edge_with_auto_gptq_blocked()
+        draft_calls = []
+        verify_calls = []
+
+        def prefill():
+            return {"status": "prefill_failed"}
+
+        def draft():
+            draft_calls.append(1)
+            return [11]
+
+        def verify():
+            verify_calls.append(1)
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "prefill failed"):
+                edge_module._run_first_draft_with_prefill(
+                    executor,
+                    prefill,
+                    draft,
+                    overlap=True,
+                    timeout=2,
+                )
+            self.assertEqual(len(draft_calls), 1)
+            # A failed state-establishing RPC is a hard gate: callers must not
+            # enqueue Verify after the helper raises.
+            self.assertEqual(len(verify_calls), 0)
+        finally:
+            executor.shutdown(wait=True)
+
+    def test_timing_draft_failure_cancels_blocked_prefill(self):
+        edge_module, _ = _load_edge_with_auto_gptq_blocked()
+        prefill_started = threading.Event()
+        cancel_received = threading.Event()
+        events = []
+        verify_calls = []
+
+        def prefill():
+            events.append("prefill_started")
+            prefill_started.set()
+            self.assertTrue(cancel_received.wait(timeout=2))
+            events.append("prefill_returned")
+            return {"status": "prefill_ok"}
+
+        def draft():
+            self.assertTrue(prefill_started.wait(timeout=2))
+            events.append("draft")
+            raise RuntimeError("local draft failed")
+
+        def cancel():
+            events.append("cancel")
+            cancel_received.set()
+            return {"status": "cancelled"}
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "local draft failed"):
+                edge_module._run_first_draft_with_prefill(
+                    executor,
+                    prefill,
+                    draft,
+                    overlap=True,
+                    timeout=2,
+                    cancel_call=cancel,
+                )
+            self.assertEqual(events, ["prefill_started", "draft", "cancel", "prefill_returned"])
+            self.assertEqual(verify_calls, [])
+        finally:
+            executor.shutdown(wait=True)
+
+    def test_timing_update_failure_cancels_prefill_and_blocks_verify(self):
+        edge_module, _ = _load_edge_with_auto_gptq_blocked()
+        prefill_started = threading.Event()
+        cancel_received = threading.Event()
+        events = []
+
+        def prefill():
+            events.append("prefill_started")
+            prefill_started.set()
+            self.assertTrue(cancel_received.wait(timeout=2))
+            events.append("prefill_returned")
+            return {"status": "prefill_ok"}
+
+        def draft():
+            self.assertTrue(prefill_started.wait(timeout=2))
+            events.append("draft")
+            return [11], {
+                "local_prefill_s": 0.2,
+                "local_decode_per_token_s": 0.03,
+            }
+
+        def timing_update(_local_timing):
+            events.append("timing_update")
+            return {"status": "rejected"}
+
+        def cancel():
+            events.append("cancel")
+            cancel_received.set()
+            return {"status": "cancelled"}
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "timing update failed"):
+                edge_module._run_first_draft_with_prefill(
+                    executor,
+                    prefill,
+                    draft,
+                    overlap=True,
+                    timeout=2,
+                    timing_call=timing_update,
+                    cancel_call=cancel,
+                )
+            self.assertEqual(
+                events,
+                ["prefill_started", "draft", "timing_update", "cancel", "prefill_returned"],
+            )
+        finally:
+            executor.shutdown(wait=True)
+
+    def test_fast_sd_only_script_enables_first_draft_overlap(self):
+        fastsd_script = (REPO_ROOT / "scripts" / "run_fastsd_profile.sh").read_text(
+            encoding="utf-8"
+        )
+        vanilla_script = (REPO_ROOT / "scripts" / "run_vanilla_profile.sh").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("--overlap_prefill_first_draft", fastsd_script)
+        self.assertIn("--enable_latency_priority", fastsd_script)
+        self.assertNotIn("--overlap_prefill_first_draft", vanilla_script)
+        self.assertNotIn("--enable_latency_priority", vanilla_script)
 
 
 if __name__ == "__main__":

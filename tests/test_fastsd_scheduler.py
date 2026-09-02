@@ -80,6 +80,41 @@ class FastSDSchedulerTests(unittest.TestCase):
         expected = -0.5 + math.exp(0.01)
         self.assertAlmostEqual(score, expected, places=6)
 
+    def test_none_latency_fields_do_not_opt_legacy_verify_into_new_formula(self):
+        req = {
+            "proc_id": "draft-legacy",
+            "task_type": "verify",
+            "lag": 0.4,
+            "transport_rtt": 0.1,
+            "current_time": 95.0,
+            "local_decode_per_token_s": None,
+            "last_pull_s": None,
+            "push_s": None,
+        }
+        score = compute_priority_score(req, {"draft-legacy": [8, 10]}, now=100.0, lamda=0.01)
+        acceptance = (8 + 1) / (10 + 1)
+        expected = -((0.4 + 0.1) / acceptance) + math.exp(0.05)
+        self.assertAlmostEqual(score, expected, places=6)
+
+    def test_prefill_pn_field_cannot_override_fixed_denominator(self):
+        base = {
+            "proc_id": "draft-1",
+            "task_type": "prefill",
+            "timing_required": True,
+            "timing_ready": True,
+            "local_prefill_s": 0.2,
+            "local_decode_per_token_s": 0.03,
+            "prefill_gamma": 4,
+            "push_s": 0.01,
+            "server_enqueue_monotonic": 95.0,
+        }
+        with_pn = dict(base, P_n=100.0)
+        self.assertAlmostEqual(
+            compute_priority_score(base, {}, now=100.0),
+            compute_priority_score(with_pn, {}, now=100.0),
+            places=6,
+        )
+
     def test_prefill_priority_only_uses_wait_time(self):
         req = {
             "proc_id": "draft-1",
@@ -90,6 +125,60 @@ class FastSDSchedulerTests(unittest.TestCase):
         }
         score = compute_priority_score(req, {"draft-1": [0, 1]}, now=100.0, lamda=0.01)
         self.assertAlmostEqual(score, math.exp(0.01), places=6)
+
+    def test_latency_aware_prefill_priority_uses_tp_td_and_push(self):
+        req = {
+            "proc_id": "draft-1",
+            "task_type": "prefill",
+            "timing_required": True,
+            "timing_ready": True,
+            "local_prefill_s": 0.20,
+            "local_decode_per_token_s": 0.03,
+            "prefill_gamma": 4,
+            "push_s": 0.01,
+            "server_enqueue_monotonic": 95.0,
+        }
+        score = compute_priority_score(req, {}, now=100.0, lamda=0.01)
+        expected = -(0.20 + 0.03 * 3 + 0.01) + math.exp(0.05)
+        self.assertAlmostEqual(score, expected, places=6)
+
+    def test_latency_aware_verify_priority_uses_previous_pull(self):
+        req = {
+            "proc_id": "draft-1",
+            "task_type": "verify",
+            "gamma": 4,
+            "local_decode_per_token_s": 0.03,
+            "push_s": 0.01,
+            "last_pull_s": 0.02,
+            "server_enqueue_monotonic": 95.0,
+        }
+        score = compute_priority_score(req, {"draft-1": [3, 4]}, now=100.0, lamda=0.01)
+        acceptance = (3 + 1) / (4 + 1)
+        expected = -((0.03 * 4 + 0.01 + 0.02) / acceptance) + math.exp(0.05)
+        self.assertAlmostEqual(score, expected, places=6)
+
+    def test_timing_required_prefill_is_not_admitted_before_update(self):
+        item = WorkItem(
+            work_id="p1",
+            proc_id="p1",
+            task_type="prefill",
+            category="short",
+            request={
+                "proc_id": "p1",
+                "task_type": "prefill",
+                "timing_required": True,
+                "timing_ready": False,
+                "current_time": 0.0,
+                "prefill_gamma": 4,
+            },
+            total_tokens=20,
+        )
+        plan = plan_iteration(
+            {"prefill": {"short": [item], "mid": [], "long": []}, "verify": {"short": [], "mid": [], "long": []}},
+            token_budget=8,
+            min_prefill_chunk_tokens=8,
+        )
+        self.assertEqual(plan.selected_work_ids, [])
 
     def test_predict_next_verify_proc_ids_looks_across_future_slots(self):
         order = ["short", "mid", "long"]

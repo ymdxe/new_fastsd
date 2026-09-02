@@ -145,6 +145,24 @@ def parse_arguments():
         help='run the stateful EdgeClient draft loop on CPU',
     )
     parser.add_argument(
+        '--overlap_prefill_first_draft',
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help='overlap cloud Prefill with the first local Draft on the Edge',
+    )
+    parser.add_argument(
+        '--enable_latency_priority',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help='enable FastSD timing-ready protocol and latency-aware priority scoring',
+    )
+    parser.add_argument(
+        '--timing_max_clock_uncertainty_ms',
+        type=float,
+        default=10.0,
+        help='reject timing-aware runs when NTP-style clock uncertainty exceeds this value; <=0 disables the gate',
+    )
+    parser.add_argument(
         '--edge_threads',
         type=int,
         default=1,
@@ -329,6 +347,12 @@ def parse_arguments():
         parser.error("--pipeline_gamma_max must be >= --pipeline_gamma_min")
     if args.pipeline_gamma_step <= 0:
         parser.error("--pipeline_gamma_step must be positive")
+    if args.timing_max_clock_uncertainty_ms < 0:
+        parser.error("--timing_max_clock_uncertainty_ms must be non-negative")
+    if args.enable_latency_priority is None:
+        args.enable_latency_priority = args.server_sched_mode == "fastsd"
+    if args.enable_latency_priority and args.server_sched_mode != "fastsd":
+        parser.error("--enable_latency_priority is FastSD-only")
     if args.profile != "custom":
         # Baseline profiles must not be mixed with FastSD scheduler.
         if args.server_sched_mode == "fastsd":

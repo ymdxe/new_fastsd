@@ -16,6 +16,57 @@ MAX_REQUEST_PREFIX_LEN = 131_072
 DEFAULT_MAX_TOKENS = 400
 
 
+_TIMING_SECONDS_FIELDS = (
+    "local_prefill_s",
+    "local_decode_per_token_s",
+    "push_s",
+    "pull_s",
+    "last_pull_s",
+    "local_prefill_ms",
+    "local_decode_per_token_ms",
+    "push_ms",
+    "pull_ms",
+)
+
+
+def _validate_timing_fields(out: dict, *, require_prefill: bool = False) -> None:
+    """Validate latency telemetry before it can influence scheduling.
+
+    Timing-aware requests carry durations in seconds (``*_s``); millisecond
+    aliases are accepted only for migration of old experiment records.  No
+    malformed value is converted into an RTT/2 estimate.
+    """
+
+    if require_prefill and out.get("timing_ready", True) and "local_prefill_s" not in out and "prefill_first_token_s" not in out:
+        raise ValueError("timing-required prefill must report local_prefill_s")
+    for field in _TIMING_SECONDS_FIELDS + ("prefill_first_token_s",):
+        if field not in out or out[field] is None:
+            continue
+        try:
+            value = float(out[field])
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"{field} must be a finite non-negative number") from exc
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"{field} must be a finite non-negative number")
+    if "prefill_gamma" in out or require_prefill:
+        gamma_value = out.get("prefill_gamma", out.get("gamma"))
+        gamma = _integer(gamma_value, "prefill_gamma")
+        if gamma < 1 or gamma > int(out.get("max_tokens", DEFAULT_MAX_TOKENS)):
+            # ``max_tokens`` is normally supplied by the caller; the explicit
+            # bound is repeated here so a malformed timing packet cannot alter
+            # m_i in the scheduler.
+            raise ValueError("prefill_gamma must be positive and within max_tokens")
+        out["prefill_gamma"] = gamma
+    if "edge_send_time_ns" in out:
+        send_ns = _integer(out["edge_send_time_ns"], "edge_send_time_ns")
+        if send_ns <= 0:
+            raise ValueError("edge_send_time_ns must be positive")
+        out["edge_send_time_ns"] = send_ns
+    if "clock_offset_ns" in out:
+        # Clock offset may be negative, but it must be integral and finite.
+        out["clock_offset_ns"] = _integer(out["clock_offset_ns"], "clock_offset_ns")
+
+
 def _integer(value, field: str) -> int:
     if isinstance(value, bool):
         raise ValueError(f"{field} must be an integer")
@@ -75,6 +126,17 @@ def canonicalize_request(
     if task_type == "prefill":
         if token_count < prefix_len:
             raise ValueError("prefill prefix_len exceeds draft_output length")
+        requested_gamma = out.get("prefill_gamma", out.get("gamma"))
+        if out.get("timing_required", False):
+            if requested_gamma is None:
+                raise ValueError("timing-required prefill must include gamma")
+            out["max_tokens"] = max_tokens
+            _validate_timing_fields(out, require_prefill=True)
+        elif requested_gamma is not None and requested_gamma not in (0, "0"):
+            # Preserve the first-round gamma separately from the historical
+            # canonical ``gamma=0`` Prefill field.
+            out["max_tokens"] = max_tokens
+            _validate_timing_fields(out, require_prefill=False)
         gamma = 0
     else:
         gamma = _integer(out.get("gamma"), "gamma")
@@ -89,6 +151,8 @@ def canonicalize_request(
             raise ValueError(
                 f"draft_output has {token_count} tokens, requires at least {required_tokens}"
             )
+        if any(field in out for field in _TIMING_SECONDS_FIELDS + ("prefill_first_token_s",)):
+            _validate_timing_fields(out)
 
     out["task_type"] = task_type
     out["prefix_len"] = prefix_len

@@ -69,7 +69,34 @@ class RequestValidationTests(unittest.TestCase):
                             "prefix_len": prefix_len,
                             "draft_output": [1, 2, 3],
                         }
-                    )
+                        )
+
+    def test_timing_required_prefill_waits_for_update_but_preserves_gamma(self):
+        request = canonicalize_request(
+            {
+                "task_type": "prefill",
+                "prefix_len": 3,
+                "draft_output": [11, 12, 13],
+                "gamma": 4,
+                "timing_required": True,
+                "timing_ready": False,
+            },
+            max_tokens=8,
+        )
+        self.assertEqual(request["gamma"], 0)
+        self.assertEqual(request["prefill_gamma"], 4)
+
+    def test_invalid_latency_telemetry_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "finite non-negative"):
+            canonicalize_request(
+                {
+                    "task_type": "verify",
+                    "prefix_len": 3,
+                    "draft_output": [11, 12, 13, 14],
+                    "gamma": 1,
+                    "local_decode_per_token_s": float("nan"),
+                }
+            )
 
 
 if __name__ == "__main__":
