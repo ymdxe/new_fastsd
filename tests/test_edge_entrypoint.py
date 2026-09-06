@@ -296,6 +296,46 @@ class EdgeEntrypointTests(unittest.TestCase):
         )
         self.assertEqual(timings["push_s"], 0.01)
 
+    def test_arrival_protocol_uploads_tokens_only_after_local_round(self):
+        edge_module, _ = _load_edge_with_auto_gptq_blocked()
+        events = []
+        uploaded = []
+
+        def arrival():
+            events.append("arrival")
+            return {"status": "arrival_recorded", "cloud_arrival_time_ns": 1}
+
+        def draft():
+            events.append("draft")
+            return [11, 12, 13], {
+                "local_prefill_s": 0.2,
+                "local_decode_per_token_s": 0.03,
+            }
+
+        def upload(tokens):
+            events.append("upload")
+            uploaded.append(tokens)
+            return {"status": "prefill_ok", "cloud_send_time_ns": 2}
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            draft_output, response, timings = edge_module._run_first_draft_after_arrival(
+                executor,
+                arrival,
+                draft,
+                upload,
+                timeout=2,
+                clock=time.perf_counter,
+            )
+        finally:
+            executor.shutdown(wait=True)
+
+        self.assertEqual(draft_output, [11, 12, 13])
+        self.assertEqual(uploaded, [[11, 12, 13]])
+        self.assertEqual(response["status"], "prefill_ok")
+        self.assertLess(events.index("draft"), events.index("upload"))
+        self.assertEqual(timings["prefill_first_draft_overlap_ms"], 0.0)
+
     def test_task_executor_is_closed_when_task_impl_raises(self):
         edge_module, _ = _load_edge_with_auto_gptq_blocked()
 

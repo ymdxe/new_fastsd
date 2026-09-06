@@ -36,6 +36,7 @@ _pending_sessions: Dict[str, str] = {}
 _pending_meta: Dict[str, str] = {}
 _pending_task_ids: Dict[str, str] = {}
 _pending_lock = threading.Lock()
+_prefill_arrivals: Dict[str, dict] = {}
 _prefill_timing_updates: Dict[str, dict] = {}
 _cloud_time_lock = threading.Lock()
 _cloud_total_ms_sum: float = 0.0
@@ -101,10 +102,18 @@ class PrefillRequest(BaseModel):
     prefix_len: int
     lag: float
     current_time: float
+    prompt_len: Optional[int] = None
     gamma: int = 0
     prefill_gamma: int = 0
     timing_required: bool = False
     timing_priority: bool = False
+    edge_send_time_ns: int = 0
+    clock_offset_ns: int = 0
+
+
+class PrefillArrivalRequest(BaseModel):
+    session_id: str
+    task_id: str
     edge_send_time_ns: int = 0
     clock_offset_ns: int = 0
 
@@ -232,6 +241,7 @@ def _start_result_dispatcher(loop: asyncio.AbstractEventLoop) -> None:
                         _pending_meta.clear()
                         _pending_sessions.clear()
                         _pending_task_ids.clear()
+                        _prefill_arrivals.clear()
                         _prefill_timing_updates.clear()
                     for fut in pending:
                         if not fut.done():
@@ -336,12 +346,60 @@ async def _enqueue_and_wait(request_dict: dict, req_id: str) -> dict:
         raise
 
 
+@app.post("/prefill/arrival")
+async def prefill_arrival(req: PrefillArrivalRequest) -> dict:
+    """Record a Prefill arrival without sending work to the target worker.
+
+    The target worker must not see a Prefill until the Edge uploads its first
+    local draft round.  The monotonic timestamp is kept in the cloud process
+    and copied into the later token upload so scheduler wait time starts here,
+    rather than when the upload reaches the worker.
+    """
+
+    if request_queue is None:
+        return {"error": "queues_not_initialized"}
+
+    cloud_arrival_time_ns = time.time_ns()
+    cloud_arrival_monotonic_s = time.monotonic()
+    with _pending_lock:
+        pending_response = _pending_sessions.get(req.session_id)
+        if pending_response is not None:
+            raise HTTPException(status_code=409, detail="session has an in-flight request")
+        previous = _prefill_arrivals.get(req.session_id)
+        if previous is not None:
+            if previous.get("task_id") != str(req.task_id):
+                raise HTTPException(status_code=409, detail="session already has a different Prefill arrival")
+            return {
+                "session_id": req.session_id,
+                "task_id": req.task_id,
+                "status": "arrival_recorded",
+                "cloud_arrival_time_ns": int(previous["cloud_arrival_time_ns"]),
+            }
+        _prefill_arrivals[req.session_id] = {
+            "task_id": str(req.task_id),
+            "cloud_arrival_time_ns": int(cloud_arrival_time_ns),
+            "cloud_arrival_monotonic_s": float(cloud_arrival_monotonic_s),
+        }
+    return {
+        "session_id": req.session_id,
+        "task_id": req.task_id,
+        "status": "arrival_recorded",
+        "cloud_arrival_time_ns": int(cloud_arrival_time_ns),
+    }
+
+
 @app.post("/prefill")
 async def prefill(req: PrefillRequest) -> dict:
     if request_queue is None:
         return {"error": "queues_not_initialized"}
 
     req_id = req.session_id
+    with _pending_lock:
+        arrival = dict(_prefill_arrivals.get(req_id) or {})
+    if arrival and arrival.get("task_id") != str(req.task_id):
+        raise HTTPException(status_code=409, detail="Prefill task_id does not match recorded arrival")
+    arrival_recorded = bool(arrival)
+    timing_required = bool(req.timing_required) and not arrival_recorded
 
     request_dict = {
         "task_id": req.task_id,
@@ -351,19 +409,30 @@ async def prefill(req: PrefillRequest) -> dict:
         # ancdata".  The target worker tensorizes this plain list on ingress.
         "draft_output": [int(token) for token in req.draft_output],
         "prefix_len": req.prefix_len,
+        "prompt_len": int(req.prompt_len or req.prefix_len),
         "proc_id": req_id,
         "lag": req.lag,
         "current_time": req.current_time,
         "prefill_gamma": int(req.prefill_gamma or req.gamma or 0),
-        "timing_required": bool(req.timing_required),
+        "timing_required": timing_required,
         "timing_priority": bool(req.timing_priority),
-        # The initial request is deliberately not executable until the
-        # independent /prefill/timing control message arrives.
-        "timing_ready": not bool(req.timing_required),
+        # Arrival-gated requests are executable only after this token upload;
+        # legacy timing-gated requests retain the old control-message path.
+        "timing_ready": not timing_required,
         "edge_send_time_ns": int(req.edge_send_time_ns or 0),
         "clock_offset_ns": int(req.clock_offset_ns or 0),
         "task_type": "prefill",
     }
+    if arrival_recorded:
+        request_dict.update(
+            {
+                "arrival_time_ns": int(arrival["cloud_arrival_time_ns"]),
+                "arrival_monotonic_s": float(arrival["cloud_arrival_monotonic_s"]),
+                "cloud_arrival_time_ns": int(arrival["cloud_arrival_time_ns"]),
+                "cloud_arrival_monotonic_s": float(arrival["cloud_arrival_monotonic_s"]),
+                "arrival_recorded": True,
+            }
+        )
     try:
         request_dict = canonicalize_request(
             request_dict,
@@ -379,19 +448,29 @@ async def prefill(req: PrefillRequest) -> dict:
     try:
         resp = await _enqueue_and_wait(request_dict, req_id)
     except BaseException:
-        # Timing updates are request-scoped telemetry, not a session cache.
-        # Always release them when the long poll fails or is cancelled.
+        # Release request-scoped timing/arrival state when the long poll fails.
         _prefill_timing_updates.pop(req_id, None)
+        if arrival_recorded:
+            with _pending_lock:
+                _prefill_arrivals.pop(req_id, None)
         raise
     if "error" in resp:
         _prefill_timing_updates.pop(req_id, None)
+        if arrival_recorded:
+            with _pending_lock:
+                _prefill_arrivals.pop(req_id, None)
         raise HTTPException(status_code=422, detail=str(resp["error"]))
     if "status" in resp:
         out = {"session_id": req_id, "status": resp["status"]}
     else:
         out = {"session_id": req_id, "status": "prefill_ok"}
     timing = _prefill_timing_updates.pop(req_id, {})
+    if arrival_recorded:
+        with _pending_lock:
+            _prefill_arrivals.pop(req_id, None)
     out["cloud_send_time_ns"] = time.time_ns()
+    if arrival_recorded:
+        out["cloud_arrival_time_ns"] = int(arrival["cloud_arrival_time_ns"])
     if "push_s" in timing:
         out["push_s"] = float(timing["push_s"])
     out["timing_ready"] = True
@@ -400,11 +479,11 @@ async def prefill(req: PrefillRequest) -> dict:
 
 @app.post("/prefill/timing")
 async def prefill_timing(req: PrefillTimingRequest) -> dict:
-    """Unlock one queued Prefill after the Edge's first local draft round.
+    """Legacy timing-control endpoint kept for older clients.
 
     This endpoint intentionally uses a separate HTTP connection/session on the
-    Edge.  It only sends a control message; the original /prefill long poll
-    remains responsible for returning the eventual state-establishing result.
+    Edge.  The arrival-plus-token-upload FastSD path does not call it; it only
+    sends a control message for older timing-gated requests.
     """
 
     if request_queue is None:
@@ -492,28 +571,34 @@ async def prefill_cancel(req: PrefillCancelRequest) -> dict:
         response_key = _pending_sessions.get(req.session_id)
         pending_task = _pending_task_ids.get(req.session_id)
         fut = _pending.get(response_key) if response_key is not None else None
-        if response_key is None:
+        arrival = _prefill_arrivals.get(req.session_id)
+        if response_key is None and arrival is None:
             raise HTTPException(status_code=409, detail="no in-flight Prefill for session")
         if pending_task is not None and pending_task != str(req.task_id):
             raise HTTPException(status_code=409, detail="cancel task_id does not match Prefill")
-        _pending.pop(response_key, None)
-        _pending_meta.pop(response_key, None)
-        _pending_task_ids.pop(req.session_id, None)
-        if _pending_sessions.get(req.session_id) == response_key:
-            _pending_sessions.pop(req.session_id, None)
+        if arrival is not None and arrival.get("task_id") != str(req.task_id):
+            raise HTTPException(status_code=409, detail="cancel task_id does not match recorded arrival")
+        _prefill_arrivals.pop(req.session_id, None)
+        if response_key is not None:
+            _pending.pop(response_key, None)
+            _pending_meta.pop(response_key, None)
+            _pending_task_ids.pop(req.session_id, None)
+            if _pending_sessions.get(req.session_id) == response_key:
+                _pending_sessions.pop(req.session_id, None)
     _prefill_timing_updates.pop(req.session_id, None)
     if fut is not None and not fut.done():
         # A normal result keeps the cancellation as an expected HTTP 422 from
         # /prefill, rather than creating an unobserved Future exception.
         fut.set_result({"error": "prefill cancelled by Edge"})
-    request_queue.put(
-        {
-            "control_type": "prefill_cancel",
-            "task_type": "prefill_cancel",
-            "proc_id": req.session_id,
-            "task_id": req.task_id,
-        }
-    )
+    if response_key is not None:
+        request_queue.put(
+            {
+                "control_type": "prefill_cancel",
+                "task_type": "prefill_cancel",
+                "proc_id": req.session_id,
+                "task_id": req.task_id,
+            }
+        )
     return {"session_id": req.session_id, "status": "cancelled"}
 
 

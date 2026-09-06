@@ -1823,7 +1823,18 @@ class Decoding(ABC):
                         work_id = str(req.get("work_id", f"{req['proc_id']}:{time.monotonic_ns()}"))
                         req["work_id"] = work_id
                         req["response_key"] = req.get("response_key", req["proc_id"])
-                        req["server_enqueue_monotonic"] = time.monotonic()
+                        # FastSD arrival-gated Prefill records its cloud arrival
+                        # before the token upload.  Keep that timestamp as the
+                        # scheduler wait origin; falling back to worker ingress
+                        # preserves the legacy request path.
+                        arrival_monotonic = req.get("arrival_monotonic_s")
+                        try:
+                            arrival_monotonic = float(arrival_monotonic)
+                        except (TypeError, ValueError, OverflowError):
+                            arrival_monotonic = None
+                        if arrival_monotonic is None or not math.isfinite(arrival_monotonic):
+                            arrival_monotonic = time.monotonic()
+                        req["server_enqueue_monotonic"] = arrival_monotonic
                         # Priority scores use wall-clock ``current_time``;
                         # keep the monotonic timestamp separately for queue
                         # latency diagnostics.

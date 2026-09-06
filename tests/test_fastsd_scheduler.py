@@ -126,6 +126,16 @@ class FastSDSchedulerTests(unittest.TestCase):
         score = compute_priority_score(req, {"draft-1": [0, 1]}, now=100.0, lamda=0.01)
         self.assertAlmostEqual(score, math.exp(0.01), places=6)
 
+    def test_prefill_priority_uses_cloud_arrival_time_before_token_upload(self):
+        req = {
+            "proc_id": "draft-arrival",
+            "task_type": "prefill",
+            "arrival_monotonic_s": 95.0,
+            "current_time": 0.0,
+        }
+        score = compute_priority_score(req, {}, now=100.0, lamda=0.01)
+        self.assertAlmostEqual(score, math.exp(0.05), places=6)
+
     def test_latency_aware_prefill_priority_uses_tp_td_and_push(self):
         req = {
             "proc_id": "draft-1",

@@ -39,6 +39,14 @@ def _validate_prefill_response(response: Dict[str, Any]) -> Dict[str, Any]:
     return response
 
 
+def _validate_prefill_arrival_response(response: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate the lightweight arrival acknowledgement."""
+
+    if not isinstance(response, dict) or response.get("status") != "arrival_recorded":
+        raise RuntimeError(f"prefill arrival failed: {response}")
+    return response
+
+
 def _shutdown_executor(executor: concurrent.futures.Executor, *, wait: bool = True) -> None:
     """Shutdown an HTTP executor across Python versions with cancel support."""
 
@@ -84,7 +92,7 @@ def _run_first_draft_with_prefill(
     timing_call: Callable[[Dict[str, float]], Dict[str, Any]] | None = None,
     cancel_call: Callable[[], Any] | None = None,
 ) -> tuple[Any, Dict[str, Any], Dict[str, float]]:
-    """Run the first draft once, optionally while the cloud Prefill is in flight.
+    """Legacy helper for clients that send Prefill before local drafting.
 
     The returned timestamps are monotonic and describe the two operations' actual
     intervals.  Prefill validation happens before this helper returns, which gives
@@ -207,6 +215,85 @@ def _run_first_draft_with_prefill(
         if overlap
         else 0.0
     )
+    return draft_output, prefill_response, timings
+
+
+def _run_first_draft_after_arrival(
+    executor: concurrent.futures.Executor,
+    arrival_call: Callable[[], Dict[str, Any]],
+    draft_call: Callable[[], Any],
+    prefill_upload_call: Callable[[Any], Dict[str, Any]],
+    *,
+    timeout: float | None = None,
+    clock: Callable[[], float] = time.monotonic,
+    cancel_call: Callable[[], Any] | None = None,
+) -> tuple[Any, Dict[str, Any], Dict[str, float]]:
+    """Record arrival, draft locally, then upload tokens to start Prefill.
+
+    The arrival RPC carries no prompt or draft tokens.  It is issued in the
+    background so local first-round generation can proceed while the cloud is
+    idle.  Only after that round completes are the generated tokens uploaded;
+    the upload response is the state-establishing Prefill response.
+    """
+
+    arrival_started_at = clock()
+    arrival_future = _submit_http_call(executor, arrival_call)
+
+    def unpack_draft_result(result: Any) -> tuple[Any, Dict[str, Any]]:
+        if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], dict):
+            return result[0], result[1]
+        return result, {}
+
+    try:
+        draft_started_at = clock()
+        draft_result = draft_call()
+        draft_completed_at = clock()
+        draft_output, local_timing = unpack_draft_result(draft_result)
+
+        wait_timeout = None
+        if timeout is not None:
+            wait_timeout = max(0.0, timeout - (clock() - arrival_started_at))
+        try:
+            arrival_response = arrival_future.result(timeout=wait_timeout)
+        except concurrent.futures.TimeoutError as exc:
+            raise TimeoutError("prefill arrival acknowledgement timed out") from exc
+        arrival_completed_at = clock()
+        _validate_prefill_arrival_response(arrival_response)
+
+        upload_started_at = clock()
+        prefill_response = prefill_upload_call(draft_output)
+        prefill_completed_at = clock()
+        _validate_prefill_response(prefill_response)
+    except BaseException:
+        if cancel_call is not None:
+            try:
+                cancel_call()
+            except BaseException:
+                pass
+        _shutdown_executor(executor, wait=True)
+        raise
+
+    timings = {
+        "arrival_started_at": float(arrival_started_at),
+        "arrival_completed_at": float(arrival_completed_at),
+        "prefill_started_at": float(upload_started_at),
+        "prefill_completed_at": float(prefill_completed_at),
+        "draft_started_at": float(draft_started_at),
+        "draft_completed_at": float(draft_completed_at),
+        "prefill_ms": max(0.0, (prefill_completed_at - upload_started_at) * 1000.0),
+        "first_draft_ms": max(0.0, (draft_completed_at - draft_started_at) * 1000.0),
+        # The cloud Prefill starts only after the local round has been sent.
+        "prefill_first_draft_overlap_ms": 0.0,
+        "prefill_wait_after_first_draft_ms": 0.0,
+    }
+    for field in (
+        "local_prefill_s",
+        "local_decode_per_token_s",
+        "local_prefill_ms",
+        "local_decode_per_token_ms",
+    ):
+        if field in local_timing:
+            timings[field] = float(local_timing[field])
     return draft_output, prefill_response, timings
 
 
@@ -399,6 +486,29 @@ class EdgeClient:
         self.session.close()
         self.timing_session.close()
 
+    def prefill_arrival(
+        self,
+        session_id: str,
+        task_id: str,
+        edge_send_time_ns: int | None = None,
+    ) -> Dict[str, Any]:
+        """Tell the cloud that a Prefill task has arrived.
+
+        This request intentionally contains no prompt or draft token payload.
+        The cloud records its own arrival timestamps and keeps the task pending
+        until the first local draft round is uploaded.
+        """
+
+        if edge_send_time_ns is None:
+            edge_send_time_ns = time.time_ns()
+        payload = {
+            "session_id": session_id,
+            "task_id": task_id,
+            "edge_send_time_ns": int(edge_send_time_ns),
+            "clock_offset_ns": int(self.clock_offset_ns),
+        }
+        return self._post("/prefill/arrival", payload)
+
     def prefill(
         self,
         session_id: str,
@@ -410,6 +520,7 @@ class EdgeClient:
         gamma: int = 0,
         timing_required: bool = False,
         edge_send_time_ns: int | None = None,
+        prompt_len: int | None = None,
     ) -> Dict[str, Any]:
         if edge_send_time_ns is None:
             edge_send_time_ns = time.time_ns()
@@ -418,12 +529,16 @@ class EdgeClient:
             "task_id": task_id,
             "draft_output": draft_output,
             "prefix_len": prefix_len,
+            "prompt_len": int(prompt_len if prompt_len is not None else prefix_len),
             "lag": lag,
             "current_time": current_time,
             "gamma": int(gamma),
             "prefill_gamma": int(gamma),
             "timing_required": bool(timing_required),
-            "timing_priority": self.timing_priority,
+            # Arrival-gated token uploads are prioritized by the cloud arrival
+            # timestamp; only the legacy timing-gated path opts into telemetry
+            # based scoring.
+            "timing_priority": bool(self.timing_priority and timing_required),
             "edge_send_time_ns": int(edge_send_time_ns),
             "clock_offset_ns": int(self.clock_offset_ns),
         }
@@ -1262,21 +1377,43 @@ class EdgeRunner(Decoding):
                 timing_required=timing_protocol,
                 edge_send_time_ns=prefill_send_time_ns,
             )
-            timing_call = None
+            arrival_call = None
+            prefill_upload_call = None
             if timing_protocol:
-                def timing_call(local_timing):
-                    return client.prefill_timing(
+                arrival_call = lambda: client.prefill_arrival(
+                    session_id=session_id,
+                    task_id=task_id,
+                    edge_send_time_ns=time.time_ns(),
+                )
+
+                def prefill_upload_call(draft_output):
+                    if getattr(torch, "is_tensor", lambda value: False)(draft_output):
+                        upload_tokens = draft_output[0].detach().cpu().tolist()
+                    elif (
+                        isinstance(draft_output, (list, tuple))
+                        and draft_output
+                        and isinstance(draft_output[0], (list, tuple))
+                    ):
+                        upload_tokens = list(draft_output[0])
+                    else:
+                        upload_tokens = list(draft_output)
+                    return client.prefill(
                         session_id=session_id,
                         task_id=task_id,
+                        draft_output=[int(token) for token in upload_tokens],
+                        prefix_len=prefix.shape[1],
+                        prompt_len=prefix.shape[1],
+                        lag=0.0,
+                        current_time=time.time(),
                         gamma=current_gamma,
-                        local_prefill_s=local_timing["local_prefill_s"],
-                        local_decode_per_token_s=local_timing["local_decode_per_token_s"],
+                        timing_required=False,
+                        edge_send_time_ns=time.time_ns(),
                     )
 
-            # The first draft is generated exactly once.  In the FastSD profile
-            # the cloud Prefill occupies the single HTTP worker while this call
-            # runs on the edge thread; first Verify is gated on the validated
-            # Prefill result returned by the helper.
+            # The first draft is generated exactly once.  In the timing-aware
+            # FastSD profile the cloud only records arrival while this call
+            # runs; the generated tokens are uploaded before Prefill/Verify
+            # state is established.
             first_round_x = None
             first_round_draft_ms = 0.0
             prefill_ms = 0.0
@@ -1286,22 +1423,25 @@ class EdgeRunner(Decoding):
             first_round_draft_started_at = None
             first_round_timings = {}
             if prefix.shape[1] < max_len:
-                first_round_x, prefill_resp, first_round_timings = _run_first_draft_with_prefill(
-                    verify_executor,
-                    prefill_call,
-                    lambda: _timed_local_draft_generate(
-                        approx_model_cache, prefix, current_gamma
-                    ) if timing_protocol else approx_model_cache.generate(prefix, current_gamma),
-                    # A timing-aware Prefill is intentionally a long-poll;
-                    # local first-round generation must run before the timing
-                    # update can release cloud execution.
-                    overlap=overlap_prefill_first_draft or timing_protocol,
-                    timeout=float(getattr(self.args, "request_timeout", 0.0)),
-                    timing_call=timing_call,
-                    cancel_call=(lambda: client.prefill_cancel(session_id, task_id))
-                    if timing_protocol
-                    else None,
-                )
+                if timing_protocol:
+                    first_round_x, prefill_resp, first_round_timings = _run_first_draft_after_arrival(
+                        verify_executor,
+                        arrival_call,
+                        lambda: _timed_local_draft_generate(
+                            approx_model_cache, prefix, current_gamma
+                        ),
+                        prefill_upload_call,
+                        timeout=float(getattr(self.args, "request_timeout", 0.0)),
+                        cancel_call=lambda: client.prefill_cancel(session_id, task_id),
+                    )
+                else:
+                    first_round_x, prefill_resp, first_round_timings = _run_first_draft_with_prefill(
+                        verify_executor,
+                        prefill_call,
+                        lambda: approx_model_cache.generate(prefix, current_gamma),
+                        overlap=overlap_prefill_first_draft,
+                        timeout=float(getattr(self.args, "request_timeout", 0.0)),
+                    )
                 if timing_protocol and "cloud_send_time_ns" not in prefill_resp:
                     raise RuntimeError("FastSD Prefill response omitted cloud_send_time_ns")
                 prefill_ms = first_round_timings["prefill_ms"]
@@ -1320,12 +1460,9 @@ class EdgeRunner(Decoding):
                 # runs (max_tokens is positive), but it avoids an unnecessary
                 # local draft call for a zero-length output.
                 if timing_protocol:
-                    # Even with no output slot, timing-required cloud Prefill
-                    # must be unlocked; a synchronous call here would wait on
-                    # a timing update that Edge never sends.
-                    _, prefill_resp, first_round_timings = _run_first_draft_with_prefill(
+                    _, prefill_resp, first_round_timings = _run_first_draft_after_arrival(
                         verify_executor,
-                        prefill_call,
+                        arrival_call,
                         lambda: (
                             prefix,
                             {
@@ -1333,9 +1470,8 @@ class EdgeRunner(Decoding):
                                 "local_decode_per_token_s": 0.0,
                             },
                         ),
-                        overlap=True,
+                        prefill_upload_call,
                         timeout=float(getattr(self.args, "request_timeout", 0.0)),
-                        timing_call=timing_call,
                         cancel_call=lambda: client.prefill_cancel(session_id, task_id),
                     )
                     if "cloud_send_time_ns" not in prefill_resp:

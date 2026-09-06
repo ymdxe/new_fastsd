@@ -70,13 +70,17 @@ def _has_explicit_latency_timing(req: Mapping[str, Any]) -> bool:
 
 
 def _wait_seconds(req: Mapping[str, Any], now: float) -> float:
-    """Compute W from one clock domain, preferring cloud monotonic enqueue time."""
+    """Compute W from one clock domain, preferring recorded cloud arrival."""
 
     if "W_i" in req:
         return _finite_nonnegative(req["W_i"], "W_i")
     if "wait_s" in req:
         return _finite_nonnegative(req["wait_s"], "wait_s")
-    if "server_enqueue_monotonic" in req:
+    if "arrival_monotonic_s" in req:
+        start = _finite_nonnegative(req["arrival_monotonic_s"], "arrival_monotonic_s")
+    elif "cloud_arrival_monotonic_s" in req:
+        start = _finite_nonnegative(req["cloud_arrival_monotonic_s"], "cloud_arrival_monotonic_s")
+    elif "server_enqueue_monotonic" in req:
         start = _finite_nonnegative(req["server_enqueue_monotonic"], "server_enqueue_monotonic")
     elif "queue_wait_start_s" in req:
         start = _finite_nonnegative(req["queue_wait_start_s"], "queue_wait_start_s")

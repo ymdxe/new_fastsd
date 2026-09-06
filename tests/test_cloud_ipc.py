@@ -37,6 +37,20 @@ class CloudIPCPayloadTests(unittest.TestCase):
         self.assertIn('req.get("control_type") == "prefill_cancel"', engine_text)
         self.assertIn("pending_prefill_cancel", engine_text)
 
+    def test_arrival_protocol_records_before_token_upload(self):
+        repo = Path(__file__).resolve().parents[1]
+        cloud_text = (repo / "cloud" / "cloud_service.py").read_text(encoding="utf-8")
+        edge_text = (repo / "edge" / "edge.py").read_text(encoding="utf-8")
+        engine_text = (repo / "src" / "engine.py").read_text(encoding="utf-8")
+
+        self.assertIn('@app.post("/prefill/arrival")', cloud_text)
+        self.assertIn("class PrefillArrivalRequest", cloud_text)
+        self.assertIn("_prefill_arrivals", cloud_text)
+        self.assertIn("def prefill_arrival(", edge_text)
+        self.assertIn("_run_first_draft_after_arrival", edge_text)
+        self.assertIn('"arrival_monotonic_s"', cloud_text)
+        self.assertIn('req.get("arrival_monotonic_s")', engine_text)
+
 
 if __name__ == "__main__":
     unittest.main()
