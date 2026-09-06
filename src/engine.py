@@ -1326,10 +1326,21 @@ class Decoding(ABC):
             # WorkItem waiting time is measured on the cloud monotonic clock.
             now = time.monotonic()
             for ttype in ["verify", "prefill"]:
+                items_by_category = {cat: [] for cat in task_queues[ttype]}
                 for cat in task_queues[ttype]:
-                    items = []
                     while not task_queues[ttype][cat].empty():
-                        items.append(task_queues[ttype][cat].get())
+                        item = task_queues[ttype][cat].get()
+                        if ttype == "prefill" and not item.finished:
+                            # A chunked Prefill keeps its WorkItem, so its
+                            # remaining length can move it between buckets.
+                            item.category = _length_category(
+                                item.remaining_tokens,
+                                len_r1,
+                                len_r2,
+                            )
+                        items_by_category[item.category].append(item)
+
+                for cat, items in items_by_category.items():
                     items.sort(
                         key=lambda item: _compute_priority_score(
                             item.request if isinstance(item, WorkItem) else item,
