@@ -22,7 +22,7 @@ class SpecEdgeClientHostTests(unittest.TestCase):
         environment = os.environ.copy()
         environment.pop("PYTHONPATH", None)
         result = subprocess.run(
-            [sys.executable, str(CLIENT_HOST), "--help"],
+            [sys.executable, "-S", str(CLIENT_HOST), "--help"],
             cwd=Path(__file__).resolve().anchor,
             env=environment,
             capture_output=True,

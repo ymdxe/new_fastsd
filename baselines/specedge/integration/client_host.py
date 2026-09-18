@@ -10,8 +10,6 @@ import sys
 import time
 from pathlib import Path
 
-import yaml
-
 
 def _find_repo_root() -> Path:
     """Find the checkout root when this absolute script is run externally."""
@@ -88,6 +86,8 @@ def _client_environment(config: dict, client_idx: int, device: str, start_epoch:
 
 
 def main(config_file: str) -> int:
+    import yaml
+
     with Path(config_file).open("r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
 
