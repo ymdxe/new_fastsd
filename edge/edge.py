@@ -22,6 +22,19 @@ from src.engine import Decoding
 from src.kvcache import KVCacheModel
 from src.metrics import elapsed_ms, tpot_ms
 try:
+    from src.speculative_sampling import (
+        encode_sparse_block,
+        make_generator,
+        sparse_block_from_dense,
+    )
+except ImportError:  # lightweight entrypoint tests stub the src package
+    def _missing_sampling_dependency(*_args, **_kwargs):
+        raise RuntimeError("src.speculative_sampling is required for rejection mode")
+
+    encode_sparse_block = _missing_sampling_dependency
+    make_generator = _missing_sampling_dependency
+    sparse_block_from_dense = _missing_sampling_dependency
+try:
     from src.runtime import configure_torch_threads, resolve_dtype, synchronize
 except ImportError:  # lightweight entrypoint tests may stub old runtime helpers
     from src.runtime import configure_torch_threads, resolve_dtype
@@ -631,6 +644,9 @@ class EdgeClient:
         local_decode_per_token_s: float | None = None,
         last_pull_s: float | None = None,
         edge_send_time_ns: int | None = None,
+        verify_method: str = "rejection",
+        sampling_seed: int | None = None,
+        draft_prob_block: str | None = None,
     ) -> tuple[Dict[str, Any], float]:
         if edge_send_time_ns is None:
             edge_send_time_ns = time.time_ns()
@@ -652,6 +668,9 @@ class EdgeClient:
             "T_i_pull": last_pull_s,
             "edge_send_time_ns": int(edge_send_time_ns),
             "clock_offset_ns": int(self.clock_offset_ns),
+            "verify_method": str(verify_method),
+            "sampling_seed": int(sampling_seed or 0),
+            "draft_prob_block": draft_prob_block,
         }
         transport_start = time.monotonic()
         resp = self._post("/verify", payload)
@@ -912,9 +931,27 @@ class EdgeRunner(Decoding):
             )
             if response.get("status") != "prefill_ok":
                 raise RuntimeError(f"warmup prefill failed: {response}")
-            cache = KVCacheModel(draft_model, self.args.temp, self.args.top_k, self.args.top_p)
+            verify_method = str(getattr(self.args, "verify_method", "rejection")).lower()
+            draft_top_k = int(getattr(self.args, "draft_top_k", 64))
+            cache = KVCacheModel(
+                draft_model,
+                self.args.temp,
+                draft_top_k if verify_method == "rejection" else self.args.top_k,
+                0.0 if verify_method == "rejection" else self.args.top_p,
+                generator=make_generator(
+                    int(self.args.seed) + proc_id * count + warmup_idx,
+                    draft_model.device,
+                ),
+                exact_top_k=(verify_method == "rejection"),
+            )
             cache.vocab_size = self.args.vocab_size
-            draft = cache.generate(prefix, 1)
+            if verify_method == "rejection":
+                draft, draft_rows = cache.generate_with_probs(prefix, 1)
+                sparse_ids, sparse_probs = sparse_block_from_dense(draft_rows, draft_top_k)
+                draft_prob_block = encode_sparse_block(sparse_ids, sparse_probs)
+            else:
+                draft = cache.generate(prefix, 1)
+                draft_prob_block = None
             response, _ = client.verify(
                 session_id=session_id,
                 task_id=f"warmup-{proc_id}-{warmup_idx}-{task_id}",
@@ -925,6 +962,9 @@ class EdgeRunner(Decoding):
                 gamma=1,
                 tail_only=False,
                 has_bridge_token=False,
+                verify_method=verify_method,
+                sampling_seed=int(self.args.seed) + proc_id * count + warmup_idx,
+                draft_prob_block=draft_prob_block,
             )
             if "final_token" not in response or "accepted" not in response:
                 raise RuntimeError(f"warmup verify failed: {response}")
@@ -1050,6 +1090,7 @@ class EdgeRunner(Decoding):
         )
         total_accepted = sum(int(r.get("accepted_total", 0)) for r in records)
         total_drafted = sum(int(r.get("drafted_total", 0)) for r in records)
+        q_tail = [float(r["q_tail"]) for r in records if r.get("q_tail") is not None]
         actual_arrivals = [float(r["actual_arrival_s"]) for r in records if "actual_arrival_s" in r]
         scheduled_arrivals = [
             float(r["scheduled_arrival_s"]) for r in records if "scheduled_arrival_s" in r
@@ -1104,6 +1145,7 @@ class EdgeRunner(Decoding):
             "active_window_s": float(active_window_s),
             "active_window_tok_per_s": float(total_tokens / active_window_s) if active_window_s > 0 else 0.0,
             "accept_rate": float(total_accepted / total_drafted) if total_drafted > 0 else 0.0,
+            "q_tail_avg": float(statistics.mean(q_tail)) if q_tail else None,
             "task_e2e_ms_avg": float(statistics.mean(task_e2e)) if task_e2e else 0.0,
             "task_e2e_ms_p50": self._percentile(task_e2e, 0.50),
             "task_e2e_ms_p90": self._percentile(task_e2e, 0.90),
@@ -1339,8 +1381,19 @@ class EdgeRunner(Decoding):
             request_start = time.monotonic()
             transport_before = client.snapshot_transport_stats()
             session_id = client.init_session()
+            sampling_seed = int(self.args.seed) + int(global_idx)
+            verify_method = str(getattr(self.args, "verify_method", "rejection")).lower()
+            draft_top_k = int(getattr(self.args, "draft_top_k", 64))
+            draft_generator = make_generator(sampling_seed, draft_model.device)
+            draft_cache_top_k = draft_top_k if verify_method == "rejection" else self.args.top_k
+            draft_cache_top_p = 0.0 if verify_method == "rejection" else self.args.top_p
             approx_model_cache = KVCacheModel(
-                draft_model, self.args.temp, self.args.top_k, self.args.top_p
+                draft_model,
+                self.args.temp,
+                draft_cache_top_k,
+                draft_cache_top_p,
+                generator=draft_generator,
+                exact_top_k=(verify_method == "rejection"),
             )
             approx_model_cache.vocab_size = self.args.vocab_size
 
@@ -1358,6 +1411,7 @@ class EdgeRunner(Decoding):
             )
             final_token = None
             reused_pending_tokens: List[int] = []
+            reused_pending_prob_rows: List[torch.Tensor] = []
             current_gamma = int(self.args.gamma)
             verify_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             if executor_holder is not None:
@@ -1532,6 +1586,13 @@ class EdgeRunner(Decoding):
                             draft_elapsed / max(1, req_gamma),
                         )
                     )
+                    if verify_method == "rejection":
+                        start = max(0, prefix_len - 1)
+                        draft_rows = approx_model_cache._prob_history[
+                            0, start:start + req_gamma
+                        ].detach().float()
+                    else:
+                        draft_rows = None
                 elif reused_pending_tokens:
                     draft_started = time.monotonic()
                     reuse_count = min(len(reused_pending_tokens), req_gamma)
@@ -1542,15 +1603,56 @@ class EdgeRunner(Decoding):
                     )
                     x = torch.cat((prefix, reuse_tensor), dim=1)
                     if reuse_count < req_gamma:
-                        x = approx_model_cache.generate(x, req_gamma - reuse_count)
+                        if verify_method == "rejection":
+                            x, generated_rows = approx_model_cache.generate_with_probs(
+                                x, req_gamma - reuse_count
+                            )
+                            draft_rows = torch.cat(
+                                [
+                                    row.to(x.device).reshape(1, -1)
+                                    for row in reused_pending_prob_rows[:reuse_count]
+                                ]
+                                + [generated_rows],
+                                dim=0,
+                            )
+                        else:
+                            x = approx_model_cache.generate(x, req_gamma - reuse_count)
+                            draft_rows = None
+                    elif verify_method == "rejection":
+                        draft_rows = torch.cat(
+                            [
+                                row.to(x.device).reshape(1, -1)
+                                for row in reused_pending_prob_rows[:reuse_count]
+                            ],
+                            dim=0,
+                        )
+                    else:
+                        draft_rows = None
                     draft_elapsed = max(0.0, time.monotonic() - draft_started)
                     local_decode_per_token_s = draft_elapsed / max(1, req_gamma - reuse_count)
                 else:
                     draft_started = time.monotonic()
-                    x = approx_model_cache.generate(prefix, req_gamma)
+                    if verify_method == "rejection":
+                        x, draft_rows = approx_model_cache.generate_with_probs(
+                            prefix, req_gamma
+                        )
+                    else:
+                        x = approx_model_cache.generate(prefix, req_gamma)
+                        draft_rows = None
                     synchronize(getattr(draft_model, "device", "cpu"))
                     draft_elapsed = max(0.0, time.monotonic() - draft_started)
                     local_decode_per_token_s = draft_elapsed / max(1, req_gamma)
+
+                draft_prob_block = None
+                if verify_method == "rejection":
+                    if draft_rows is None or int(draft_rows.shape[0]) != req_gamma:
+                        raise RuntimeError(
+                            "draft probability rows do not match the requested gamma"
+                        )
+                    sparse_ids, sparse_probs = sparse_block_from_dense(
+                        draft_rows, draft_top_k
+                    )
+                    draft_prob_block = encode_sparse_block(sparse_ids, sparse_probs)
 
                 has_bridge_token = pipeline_enabled and (final_token is not None)
                 if pipeline_enabled:
@@ -1592,6 +1694,9 @@ class EdgeRunner(Decoding):
                     has_bridge_token=has_bridge_token,
                     local_decode_per_token_s=local_decode_per_token_s,
                     last_pull_s=last_pull_s,
+                    verify_method=verify_method,
+                    sampling_seed=sampling_seed,
+                    draft_prob_block=draft_prob_block,
                 )
                 if rounds > 0 or first_round_draft_ms <= 0:
                     draft_elapsed = max(0.0, time.monotonic() - round_start)
@@ -1606,6 +1711,7 @@ class EdgeRunner(Decoding):
 
                 # 验证等待期间持续 draft，最多缓存 gamma+1（bridge + gamma）个 token。
                 overlap_tokens: List[int] = []
+                overlap_prob_rows: List[torch.Tensor] = []
                 overlap_prefix = x
                 max_overlap_tokens = req_gamma + 1
                 wait_start = time.monotonic()
@@ -1618,7 +1724,13 @@ class EdgeRunner(Decoding):
                     )
                 if proactive_enabled:
                     while len(overlap_tokens) < max_overlap_tokens and not verify_future.done():
-                        overlap_prefix = approx_model_cache.generate(overlap_prefix, 1)
+                        if verify_method == "rejection":
+                            overlap_prefix, overlap_rows = approx_model_cache.generate_with_probs(
+                                overlap_prefix, 1
+                            )
+                            overlap_prob_rows.append(overlap_rows[0].detach().float())
+                        else:
+                            overlap_prefix = approx_model_cache.generate(overlap_prefix, 1)
                         overlap_tokens.append(int(overlap_prefix[0, -1].item()))
                         wait_draft_steps += 1
                         if getattr(self.args, "debug_verify_tokens", False) and (
@@ -1703,10 +1815,16 @@ class EdgeRunner(Decoding):
                     first_token_time = time.monotonic()
                 approx_model_cache.rollback(accepted)
                 reused_pending_tokens = []
+                reused_pending_prob_rows = []
 
                 if proactive_enabled and accepted_cnt == req_gamma and overlap_tokens:
                     if overlap_tokens[0] == final_token:
                         reused_pending_tokens = overlap_tokens[1 : 1 + req_gamma]
+                        if verify_method == "rejection":
+                            reused_pending_prob_rows = [
+                                row.detach().float()
+                                for row in overlap_prob_rows[1 : 1 + req_gamma]
+                            ]
                         reuse_hit_rounds += 1
                         if getattr(self.args, "debug_verify_tokens", False):
                             self.color_print(
@@ -1842,11 +1960,19 @@ class EdgeRunner(Decoding):
                 "proc_id": int(proc_id),
                 "profile": self.args.profile,
                 "server_sched_mode": self.args.server_sched_mode,
+                "verify_method": verify_method,
+                "draft_top_k": int(draft_top_k),
+                # q_k is the exact normalized top-k draft distribution, so its
+                # transmitted sparse support has zero omitted mass.  Keep the
+                # experiment-facing q_tail name alongside the detailed field.
+                "q_tail": 0.0 if verify_method == "rejection" else None,
+                "draft_support_tail_mass": 0.0 if verify_method == "rejection" else None,
                 "enable_pipeline": pipeline_enabled,
                 "enable_proactive_draft": proactive_enabled,
                 "enable_latency_priority": timing_protocol,
                 "generated_tokens": generated_tokens,
                 "global_sample_index": int(global_idx),
+                "sampling_seed": int(sampling_seed),
                 "scheduled_arrival_s": scheduled_arrival_s,
                 "actual_arrival_s": actual_arrival_s,
                 "arrival_lag_ms": arrival_lag_ms,

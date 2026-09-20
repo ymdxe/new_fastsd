@@ -154,6 +154,21 @@ def canonicalize_request(
         if any(field in out for field in _TIMING_SECONDS_FIELDS + ("prefill_first_token_s",)):
             _validate_timing_fields(out)
 
+        # Requests created before sparse rejection sampling did not carry a
+        # method field.  Preserve their strict-match behavior at this utility
+        # boundary; the current Edge/Cloud launchers always send the explicit
+        # ``rejection`` default and therefore receive the stricter wire check.
+        method = str(out.get("verify_method", "greedy")).lower()
+        if method not in {"greedy", "rejection"}:
+            raise ValueError("verify_method must be 'greedy' or 'rejection'")
+        out["verify_method"] = method
+        if "sampling_seed" in out and out["sampling_seed"] is not None:
+            out["sampling_seed"] = _integer(out["sampling_seed"], "sampling_seed")
+        if method == "rejection":
+            block = out.get("draft_prob_block")
+            if not isinstance(block, str) or not block:
+                raise ValueError("rejection verify requires draft_prob_block")
+
     out["task_type"] = task_type
     out["prefix_len"] = prefix_len
     out["gamma"] = gamma

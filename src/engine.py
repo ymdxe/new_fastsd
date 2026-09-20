@@ -19,6 +19,15 @@ from .kvcache4RC import KVCacheModel as KVCache2Model
 from .cache_offload_policy import should_offload_target_cache
 from .util import seed_everything, norm_logits, sample, max_fn
 from .runtime import resolve_dtype, synchronize
+from .speculative_sampling import (
+    decode_sparse_block,
+    greedy_accept_count,
+    make_generator,
+    rejection_sample,
+    slice_sparse_block,
+    sparse_block_from_dense,
+    validate_candidate_support,
+)
 from transformers.cache_utils import DynamicCache
 import queue
 from collections import defaultdict, deque
@@ -292,52 +301,69 @@ class Decoding(ABC):
         draft_device = self.draft_model.device
         target_device = self.target_model.device
         
-        approx_model_cache = KVCacheModel(self.draft_model, self.args.temp, self.args.top_k, self.args.top_p)
+        verify_method = str(getattr(self.args, "verify_method", "rejection")).lower()
+        draft_top_k = int(getattr(self.args, "draft_top_k", 64))
+        draft_generator = make_generator(self.seed, draft_device)
+        verify_generator = make_generator(self.seed + 1, target_device)
+        draft_cache_top_k = draft_top_k if verify_method == "rejection" else self.args.top_k
+        draft_cache_top_p = 0.0 if verify_method == "rejection" else self.args.top_p
+        approx_model_cache = KVCacheModel(
+            self.draft_model,
+            self.args.temp,
+            draft_cache_top_k,
+            draft_cache_top_p,
+            generator=draft_generator,
+            exact_top_k=(verify_method == "rejection"),
+        )
         approx_model_cache.vocab_size = self.vocab_size
         target_model_cache = KVCacheModel(self.target_model, self.args.temp, self.args.top_k, self.args.top_p)
         target_model_cache.vocab_size = self.vocab_size
 
         while prefix.shape[1] < max_tokens:
             prefix_len = prefix.shape[1]
-            x = approx_model_cache.generate(prefix.to(draft_device), self.args.gamma)
-            _ = target_model_cache.generate(x.to(target_device), 1)
+            if verify_method == "rejection":
+                x, draft_rows = approx_model_cache.generate_with_probs(
+                    prefix.to(draft_device), self.args.gamma
+                )
+            else:
+                x = approx_model_cache.generate(prefix.to(draft_device), self.args.gamma)
+                draft_rows = None
+            _ = target_model_cache.generate(x.to(target_device), 1, sample_next=False)
             if self.accelerator.is_main_process:
                 self.draft_forward_times += self.args.gamma
                 self.target_forward_times += 1
-            
-            n = prefix_len + self.args.gamma - 1
-            for i in range(self.args.gamma):
-                j = x[:, prefix_len + i]
-                # target 使用贪心策略得到当前步 token，与 draft token 不一致则在前一位置截断
-                target_logits = target_model_cache._prob_history[
-                    :, prefix_len + i - 1, :self.vocab_size
-                ].to(draft_device)
-                greedy_token = torch.argmax(target_logits, dim=-1)  # (1,)
-                if j.item() != greedy_token.item():
-                    n = prefix_len + i - 1
-                    break
+            target_history = target_model_cache._prob_history[:, :, :self.vocab_size]
+            target_start = prefix_len - 1
+            target_rows = target_history[:, target_start:target_start + self.args.gamma + 1, :]
+            draft_tokens = x[:, prefix_len:prefix_len + self.args.gamma]
 
-            self.num_acc_tokens.append(n - prefix_len + 1)
-
-            assert n >= prefix_len - 1, f"n {n}, prefix_len {prefix_len}"
-            prefix = x[:, :n + 1]
-            
-            approx_model_cache.rollback(n+1)
-
-            if n < prefix_len + self.args.gamma - 1:
-                # 存在拒绝：在位置 n 上，使用 target 模型的贪心 token 作为 new_token
-                target_logits_next = target_model_cache._prob_history[
-                    :, n, :self.vocab_size
-                ].to(draft_device)
-                t = torch.argmax(target_logits_next, dim=-1).unsqueeze(-1)
-                target_model_cache.rollback(n + 1)
+            if verify_method == "rejection":
+                sparse_ids, sparse_probs = sparse_block_from_dense(
+                    draft_rows, draft_top_k
+                )
+                accepted_cnt, t = rejection_sample(
+                    draft_tokens,
+                    target_rows[0],
+                    sparse_ids,
+                    sparse_probs,
+                    generator=verify_generator,
+                )
             else:
-                # 所有 draft token 被接受：在最后一步的位置上，使用 target 贪心 token 作为 new_token
-                target_logits_next = target_model_cache._prob_history[
-                    :, -1, :self.vocab_size
-                ].to(draft_device)
-                t = torch.argmax(target_logits_next, dim=-1).unsqueeze(-1)
-                target_model_cache.rollback(n + 2)
+                accepted_cnt = greedy_accept_count(draft_tokens, target_rows)
+                correction_row = target_rows[0, accepted_cnt]
+                t = torch.argmax(correction_row, dim=-1).reshape(1)
+
+            accepted_len = prefix_len + accepted_cnt
+            self.num_acc_tokens.append(accepted_cnt)
+            prefix = x[:, :accepted_len]
+
+            approx_model_cache.rollback(accepted_len)
+            t = t.to(draft_device).reshape(1, 1)
+            # The target cache contains one extra row only when all draft
+            # tokens were accepted and its next-token row is retained.
+            target_model_cache.rollback(
+                accepted_len + 1 if accepted_cnt == self.args.gamma else accepted_len
+            )
             prefix = torch.cat((prefix, t), dim=1)
             prefix = prefix[:, :max_tokens]
             if first_token_time is None:
@@ -492,6 +518,7 @@ class Decoding(ABC):
         energy_service = self._maybe_start_energy_service()
 
         target_model_caches = {}
+        sampling_generators = {}
         accept_stats = defaultdict(lambda: [0, 1])  # [accepted_sum, total_sum], avoid div0
 
         def move_dynamic_cache_to(cache, device):
@@ -549,7 +576,7 @@ class Decoding(ABC):
                 )
                 x_for_target = torch.cat((pad, x), dim=1)
 
-            _ = cache.generate(x_for_target, 1)
+            _ = cache.generate(x_for_target, 1, sample_next=False)
 
             if request["task_type"] == "prefill":
                 # prefill 仅用于初始化目标侧 cache，需要回滚到 prefix 长度
@@ -562,30 +589,50 @@ class Decoding(ABC):
                 print(f"Finished prefill for draft {proc_id}, prefix length {prefix_len}")
                 return
 
-            n = prefix_len + self.args.gamma - 1
-            for i in range(self.args.gamma):
-                if tail_only:
-                    tail_offset = 1 if has_bridge_token else 0
-                    j = x[:, tail_offset + i]
-                else:
-                    j = x[:, prefix_len + i]
-                # target 使用贪心策略，若与 draft token 不一致则在前一位置截断
-                target_logits = cache._prob_history[:, prefix_len + i - 1, :self.vocab_size]
-                greedy_token = torch.argmax(target_logits, dim=-1)
-                if j.item() != greedy_token.item():
-                    n = prefix_len + i - 1
-                    break
-
-            accepted_len = n + 1
-            accepted_cnt = accepted_len - prefix_len
-            if accepted_cnt < self.args.gamma:
-                # 存在拒绝：在位置 n 上使用 target 贪心 token 作为 new_token
-                target_logits_next = cache._prob_history[:, n, :self.vocab_size]
-                new_token = torch.argmax(target_logits_next, dim=-1).unsqueeze(-1)
+            req_gamma = max(1, int(request.get("gamma", self.args.gamma)))
+            verify_method = str(
+                request.get("verify_method", getattr(self.args, "verify_method", "rejection"))
+            ).lower()
+            if tail_only:
+                tail_offset = 1 if has_bridge_token else 0
+                draft_tokens = x[:, tail_offset:tail_offset + req_gamma]
             else:
-                # 所有 draft token 被接受：在最后一步位置上使用 target 贪心 token
-                target_logits_next = cache._prob_history[:, -1, :self.vocab_size]
-                new_token = torch.argmax(target_logits_next, dim=-1).unsqueeze(-1)
+                draft_tokens = x[:, prefix_len:prefix_len + req_gamma]
+            target_rows = torch.cat(
+                [
+                    cache._prob_history[:, prefix_len + i - 1, :self.vocab_size]
+                    for i in range(req_gamma)
+                ]
+                + [cache._prob_history[:, -1, :self.vocab_size]],
+                dim=0,
+            ).float()
+            if verify_method == "rejection":
+                sparse_ids, sparse_probs = decode_sparse_block(
+                    request.get("draft_prob_block"),
+                    device=target_model.device,
+                    vocab_size=self.vocab_size,
+                )
+                generator = sampling_generators.get(proc_id)
+                if generator is None:
+                    generator = make_generator(
+                        int(request.get("sampling_seed", getattr(self, "seed", 0))),
+                        target_model.device,
+                    )
+                    sampling_generators[proc_id] = generator
+                accepted_cnt, new_token = rejection_sample(
+                    draft_tokens,
+                    target_rows,
+                    sparse_ids,
+                    sparse_probs,
+                    generator=generator,
+                )
+            elif verify_method == "greedy":
+                accepted_cnt = greedy_accept_count(draft_tokens, target_rows[:-1])
+                new_token = torch.argmax(target_rows[accepted_cnt], dim=-1).reshape(1)
+            else:
+                raise ValueError(f"unknown verify_method: {verify_method!r}")
+            accepted_len = prefix_len + accepted_cnt
+            new_token = new_token.reshape(1, 1)
 
             # Keep only accepted prefix in target cache.
             # final_token will be consumed in the next verify call together with new draft tokens.
@@ -600,7 +647,7 @@ class Decoding(ABC):
 
             # Update accept statistics
             accept_stats[proc_id][0] += accepted_len - prefix_len
-            accept_stats[proc_id][1] += self.args.gamma
+            accept_stats[proc_id][1] += req_gamma
 
         def schedule_tasks(task_type):
             schedule = ["short"] * 3 + ["mid"] * 2 + ["long"]
@@ -723,6 +770,7 @@ class Decoding(ABC):
         pending_prefill_cancel = set()
         accept_stats = defaultdict(lambda: [0, 1])  # {proc_id: [accepted_sum, total_sum]}
         committed_prefix_tokens = {}  # {proc_id: List[int]} for debug context display
+        sampling_generators = {}  # session/proc id -> target-side rejection RNG
         verify_time_ema = {}
         edge_draft_per_token_ema = {}
         edge_rtt_ema = {}
@@ -758,6 +806,15 @@ class Decoding(ABC):
             if not math.isfinite(f) or abs(f) > 1e12:
                 return int(default)
             return int(f)
+
+        def _sampling_generator(pid, seed):
+            """Return one persistent target RNG per logical decode session."""
+
+            generator = sampling_generators.get(pid)
+            if generator is None:
+                generator = make_generator(int(seed), target_model.device)
+                sampling_generators[pid] = generator
+            return generator
 
         def _strict_duration(value, field: str) -> float:
             """Validate timing control values; never turn bad telemetry into RTT/2."""
@@ -987,6 +1044,7 @@ class Decoding(ABC):
                         proc_ids,
                         tokenizer.pad_token_id,
                         is_prefill=True,
+                        sample_next=False,
                     )
                 else:
                     # ---- original padded path (kept verbatim) ----
@@ -1019,6 +1077,7 @@ class Decoding(ABC):
                             pad_token_id=tokenizer.pad_token_id,
                             input_lens=input_lens,
                             reset_pids=[pid for pid, cont in zip(proc_ids, continuation) if not cont],
+                            sample_next=False,
                         )
                     else:
                         kv_cache_manager.generate(
@@ -1028,6 +1087,7 @@ class Decoding(ABC):
                             pad_token_id=tokenizer.pad_token_id,
                             is_prefill=True,
                             input_lens=input_lens,
+                            sample_next=False,
                         )
 
                 # prefill之后，将KV cache移到CPU节省显存
@@ -1083,6 +1143,7 @@ class Decoding(ABC):
                         proc_ids,
                         tokenizer.pad_token_id,
                         is_prefill=False,
+                        sample_next=False,
                     )
                 else:
                     # ---- original padded path (kept verbatim) ----
@@ -1130,6 +1191,7 @@ class Decoding(ABC):
                         pad_token_id=tokenizer.pad_token_id,
                         is_prefill=False,
                         input_lens=verify_input_lens,
+                        sample_next=False,
                     )
                 verify_elapsed = time.time() - verify_compute_start
 
@@ -1165,9 +1227,28 @@ class Decoding(ABC):
                         deliver(pid, {"status": "prefill_ok"})
                     continue
 
-                # 验证 γ 个 token：target 贪心 token 与 draft token 不一致则在前一位置截断
-                n = prefix_len + req_gamma - 1
+                # Verify either with the legacy strict-match rule or with the
+                # exact sparse rejection sampler.  ``target_rows`` contains
+                # one row per draft token plus the row used for an all-accept
+                # correction token.
+                verify_method = str(
+                    req.get("verify_method", getattr(self.args, "verify_method", "rejection"))
+                ).lower()
                 mismatch_pos = None
+                if tail_only:
+                    tail_offset = 1 if has_bridge_token else 0
+                    draft_tokens = x[:, tail_offset:tail_offset + req_gamma]
+                else:
+                    draft_tokens = x[:, prefix_len:prefix_len + req_gamma]
+                target_rows = torch.cat(
+                    [
+                        probs[:, verify_logit_position(prefix_len, i), :self.vocab_size]
+                        for i in range(req_gamma)
+                    ]
+                    + [probs[:, -1, :self.vocab_size]],
+                    dim=0,
+                ).float()
+
                 debug_enabled = getattr(self.args, "debug_verify_tokens", False)
                 debug_max_steps = max(0, int(getattr(self.args, "debug_max_print_steps", 8)))
                 if debug_enabled:
@@ -1183,22 +1264,41 @@ class Decoding(ABC):
                         f"prefix_len={prefix_len} ctx_ids={ctx_ids} ctx_text={ids_text_repr(ctx_ids)}",
                         3,
                     )
-                for i in range(req_gamma):
-                    if tail_only:
-                        tail_offset = 1 if has_bridge_token else 0
-                        j = x[:, tail_offset + i]
-                    else:
-                        j = x[:, prefix_len + i]
-                    # The bridge is the final logical prefix token.  Its
-                    # logits at prefix_len-1 predict draft token zero, so a
-                    # physical bridge append never shifts the logical index.
-                    target_pos = verify_logit_position(prefix_len, i)
-                    target_logits = probs[:, target_pos, :self.vocab_size]
-                    greedy_token = torch.argmax(target_logits, dim=-1)  # (1,)
-                    draft_token_id = int(j.item())
-                    target_token_id = int(greedy_token.item())
+                if verify_method == "rejection":
+                    sparse_ids, sparse_probs = decode_sparse_block(
+                        req.get("draft_prob_block"),
+                        device=target_model.device,
+                        vocab_size=self.vocab_size,
+                    )
+                    accepted_cnt, new_token = rejection_sample(
+                        draft_tokens,
+                        target_rows,
+                        sparse_ids,
+                        sparse_probs,
+                        generator=_sampling_generator(
+                            pid, req.get("sampling_seed", getattr(self, "seed", 0))
+                        ),
+                        sample_correction=not bool(req.get("_internal_chunk_nonfinal", False)),
+                    )
+                    if accepted_cnt < req_gamma:
+                        mismatch_pos = prefix_len + accepted_cnt
+                elif verify_method == "greedy":
+                    accepted_cnt = greedy_accept_count(draft_tokens, target_rows[:-1])
+                    new_token = (
+                        torch.argmax(target_rows[accepted_cnt], dim=-1).reshape(1)
+                        if accepted_cnt < req_gamma
+                        or not bool(req.get("_internal_chunk_nonfinal", False))
+                        else None
+                    )
+                    if accepted_cnt < req_gamma:
+                        mismatch_pos = prefix_len + accepted_cnt
+                else:
+                    raise ValueError(f"unknown verify_method: {verify_method!r}")
 
-                    if debug_enabled and i < debug_max_steps:
+                if debug_enabled:
+                    for i in range(min(req_gamma, debug_max_steps)):
+                        draft_token_id = int(draft_tokens[0, i].item())
+                        target_token_id = int(torch.argmax(target_rows[i]).item())
                         match_flag = "MATCH" if draft_token_id == target_token_id else "MISMATCH"
                         self.color_print(
                             f"[VERIFY][pid={pid}] step={i} pos={prefix_len + i} "
@@ -1207,22 +1307,9 @@ class Decoding(ABC):
                             6,
                         )
 
-                    if j.item() != greedy_token.item():
-                        n = prefix_len + i - 1
-                        mismatch_pos = prefix_len + i
-                        break
-
-                accepted_len = n + 1
-                accepted_cnt = accepted_len - prefix_len
-                if accepted_cnt < req_gamma:
-                    # 存在拒绝：在位置 n 上使用 target 贪心 token 作为 new_token
-                    correction_pos = n
-                    target_logits_next = probs[:, correction_pos, :self.vocab_size]
-                    new_token = torch.argmax(target_logits_next, dim=-1).unsqueeze(-1)
-                else:
-                    # 所有 draft token 被接受：在最后一步位置上使用 target 贪心 token
-                    target_logits_next = probs[:, -1, :self.vocab_size]
-                    new_token = torch.argmax(target_logits_next, dim=-1).unsqueeze(-1)
+                accepted_len = prefix_len + accepted_cnt
+                if new_token is not None:
+                    new_token = new_token.reshape(1, 1)
 
                 # Keep only accepted prefix in target cache.
                 # final_token will be consumed in the next verify call together with new draft tokens.
@@ -1237,9 +1324,11 @@ class Decoding(ABC):
                         draft_start_idx = 1 if has_bridge_token else 0
                         accepted_draft_tokens = req_tokens[draft_start_idx:draft_start_idx + accepted_cnt]
                         committed_prefix_tokens[pid].extend(accepted_draft_tokens)
+                    if new_token is not None:
                         committed_prefix_tokens[pid].append(int(new_token.item()))
-                    else:
-                        committed_prefix_tokens[pid] = x[0, :accepted_len].tolist()
+                else:
+                    committed_prefix_tokens[pid] = x[0, :accepted_len].tolist()
+                    if new_token is not None:
                         committed_prefix_tokens[pid].append(int(new_token.item()))
                 if debug_enabled:
                     accepted_cnt = accepted_len - prefix_len
@@ -1247,13 +1336,13 @@ class Decoding(ABC):
                     self.color_print(
                         f"[VERIFY][pid={pid}] prefix_len={prefix_len} accepted={accepted_cnt}/{req_gamma} "
                         f"accepted_len={accepted_len} mismatch_pos={mismatch_info} "
-                        f"new_token={token_repr(int(new_token.item()))}",
+                        f"new_token={token_repr(int(new_token.item())) if new_token is not None else '<deferred>'}",
                         2,
                     )
 
                 response_payload = {
                     "accepted": accepted_len,
-                    "final_token": int(new_token.item()),
+                    "final_token": int(new_token.item()) if new_token is not None else None,
                     "verify_ms": verify_elapsed * 1000.0,
                 }
                 if getattr(self.args, "enable_pipeline", True) and getattr(self.args, "pipeline_gamma_adapt", True):
@@ -1582,6 +1671,11 @@ class Decoding(ABC):
             else:
                 draft_base = item.base_prefix_len
             draft_tokens = source[:, draft_base + sl.offset:draft_base + sl.offset + req_gamma]
+            if str(req.get("verify_method", getattr(self.args, "verify_method", "rejection"))).lower() == "rejection":
+                block = req.get("draft_prob_block")
+                if not block:
+                    raise ValueError("rejection verify request is missing draft_prob_block")
+                req["draft_prob_block"] = slice_sparse_block(block, sl.offset, req_gamma)
             if bridge_token is None and original_bridge and sl.offset == 0:
                 # The first internal slice must carry the bridge supplied by
                 # Edge.  Subsequent slices use the correction token returned
@@ -1604,6 +1698,9 @@ class Decoding(ABC):
             req["gamma"] = req_gamma
             req["tail_only"] = True
             req["_chunked_internal"] = True
+            req["_internal_chunk_nonfinal"] = (
+                sl.offset + req_gamma < int(item.total_tokens)
+            )
             return req
 
         def build_plan(reserved_work_ids=()):
@@ -1743,13 +1840,37 @@ class Decoding(ABC):
             """Validate one queue message without allowing worker termination."""
             try:
                 req = tensorize_draft_output(req)
-                return canonicalize_request(
+                req = canonicalize_request(
                     req,
                     max_tokens=int(getattr(self.args, "max_tokens", 400) or 400),
                 )
+                if req.get("task_type") == "verify" and req.get("verify_method") == "rejection":
+                    sparse_ids, sparse_probs = decode_sparse_block(
+                        req.get("draft_prob_block"),
+                        device="cpu",
+                        vocab_size=self.vocab_size,
+                    )
+                    gamma = int(req["gamma"])
+                    if int(sparse_ids.shape[0]) != gamma:
+                        raise ValueError(
+                            "draft probability block row count must equal gamma"
+                        )
+                    draft_output = req["draft_output"]
+                    if req.get("tail_only", False):
+                        offset = 1 if req.get("has_bridge_token", False) else 0
+                        draft_tokens = draft_output[:, offset:offset + gamma]
+                    else:
+                        draft_tokens = draft_output[:, req["prefix_len"]:req["prefix_len"] + gamma]
+                    validate_candidate_support(draft_tokens, sparse_ids, sparse_probs)
+                return req
             except (TypeError, ValueError, KeyError) as exc:
                 response_key = req.get("response_key", req.get("proc_id")) if isinstance(req, dict) else None
-                response_queue = response_queues.get(response_key) if response_key is not None else None
+                response_queue = None
+                if response_key is not None:
+                    try:
+                        response_queue = response_queues[response_key]
+                    except (KeyError, TypeError, AttributeError):
+                        response_queue = None
                 if response_queue is not None:
                     response_queue.put({"error": str(exc)})
                 self.color_print(f"[REQUEST-REJECTED] {exc}", 2)

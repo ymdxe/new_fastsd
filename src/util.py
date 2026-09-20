@@ -121,6 +121,19 @@ def parse_arguments():
     parser.add_argument('--temp', type=float, default=0, help='temperature for generating new tokens.')
     parser.add_argument('--top_k', type=int, default=0, help='top_k for ungreedy sampling strategy.')
     parser.add_argument('--top_p', type=float, default=0.95, help='top_p for ungreedy sampling strategy.')
+    parser.add_argument(
+        '--verify_method',
+        type=str,
+        default='rejection',
+        choices=['greedy', 'rejection'],
+        help='speculative verification rule; rejection preserves target sampling distribution',
+    )
+    parser.add_argument(
+        '--draft_top_k',
+        type=int,
+        default=64,
+        help='complete sparse support used by the rejection-mode draft distribution',
+    )
     parser.add_argument('--gamma', type=int, default=6, help='guess time.')
     parser.add_argument('--draft_device', type=str, default='cuda:1')
     parser.add_argument('--target_device', type=str, default='cuda:0')
@@ -331,6 +344,8 @@ def parse_arguments():
         parser.error("--batch_size must be positive")
     if args.edge_threads <= 0:
         parser.error("--edge_threads must be positive")
+    if args.draft_top_k <= 0:
+        parser.error("--draft_top_k must be positive")
     if args.warmup_requests < 0:
         parser.error("--warmup_requests must be non-negative")
     if args.token_budget <= 0:
@@ -402,7 +417,13 @@ def top_k_top_p_filter(logits: torch.Tensor, top_k: int = 0, top_p: float = 0.0)
         logits[indices_to_remove] = float('-inf')
     return logits
 
-def norm_logits(logits : torch.Tensor, temperature : float, top_k : float, top_p : float) -> torch.Tensor:
+def norm_logits(
+    logits: torch.Tensor,
+    temperature: float,
+    top_k: float,
+    top_p: float,
+    exact_top_k: bool = False,
+) -> torch.Tensor:
     """
 
     Args:
@@ -421,12 +442,27 @@ def norm_logits(logits : torch.Tensor, temperature : float, top_k : float, top_p
         new_logits[:, idx] = 1
         return new_logits.float()
     logits = logits / temperature
-    logits = top_k_top_p_filter(logits, top_k=top_k, top_p=top_p)
+    if exact_top_k and top_k > 0:
+        k = min(int(top_k), logits.shape[-1])
+        values, indices = torch.topk(logits, k=k, dim=-1)
+        exact = torch.full_like(logits, float("-inf"))
+        exact.scatter_(1, indices, values)
+        logits = exact
+        # Rejection-mode draft distributions deliberately omit top-p.  The
+        # caller still controls target top-p through the legacy filter.
+        if top_p > 0.0:
+            logits = top_k_top_p_filter(logits, top_k=0, top_p=top_p)
+    else:
+        logits = top_k_top_p_filter(logits, top_k=top_k, top_p=top_p)
     probs = F.softmax(logits, dim=1)
     return probs
 
-def sample(probs : torch.Tensor, num_samples: int = 1):
-    idx_next = torch.multinomial(probs, num_samples=num_samples)
+def sample(
+    probs: torch.Tensor,
+    num_samples: int = 1,
+    generator: torch.Generator | None = None,
+):
+    idx_next = torch.multinomial(probs, num_samples=num_samples, generator=generator)
     return idx_next
 
 def max_fn(x):

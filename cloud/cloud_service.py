@@ -157,6 +157,9 @@ class VerifyRequest(BaseModel):
     T_i_pull: Optional[float] = None
     last_pull_s: Optional[float] = None
     pull_s: Optional[float] = None
+    verify_method: str = "rejection"
+    sampling_seed: int = 0
+    draft_prob_block: Optional[str] = None
     edge_send_time_ns: int = 0
     clock_offset_ns: int = 0
 
@@ -632,6 +635,9 @@ async def verify(req: VerifyRequest) -> dict:
         "T_i_pull": req.T_i_pull,
         "last_pull_s": req.last_pull_s,
         "pull_s": req.pull_s,
+        "verify_method": req.verify_method,
+        "sampling_seed": int(req.sampling_seed),
+        "draft_prob_block": req.draft_prob_block,
         "edge_send_time_ns": int(req.edge_send_time_ns or 0),
         "clock_offset_ns": int(req.clock_offset_ns or 0),
     }

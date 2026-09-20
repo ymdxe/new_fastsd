@@ -747,6 +747,8 @@ def print_plan(
         f"--target_model {models['target']} --max_tokens {generation['max_new_tokens']} "
         f"--temp {generation['temperature']} --top_k {generation['top_k']} "
         f"--top_p {generation['top_p']} --gamma {generation['gamma']} --seed {generation['seed']} "
+        f"--verify_method {generation.get('verify_method', 'rejection')} "
+        f"--draft_top_k {generation.get('draft_top_k', 64)} "
         f"--stop_policy {generation.get('stop_policy', 'eos')} "
         f"--warmup_requests {warmup_requests} --max_tasks_per_draft 0"
     )

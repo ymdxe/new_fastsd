@@ -98,6 +98,28 @@ class RequestValidationTests(unittest.TestCase):
                 }
             )
 
+    def test_rejection_verify_requires_sparse_probability_block(self):
+        with self.assertRaisesRegex(ValueError, "draft_prob_block"):
+            canonicalize_request(
+                {
+                    "task_type": "verify",
+                    "prefix_len": 3,
+                    "draft_output": [11, 12, 13, 14],
+                    "gamma": 1,
+                    "verify_method": "rejection",
+                }
+            )
+        request = canonicalize_request(
+            {
+                "task_type": "verify",
+                "prefix_len": 3,
+                "draft_output": [11, 12, 13, 14],
+                "gamma": 1,
+                "verify_method": "greedy",
+            }
+        )
+        self.assertEqual(request["verify_method"], "greedy")
+
 
 if __name__ == "__main__":
     unittest.main()

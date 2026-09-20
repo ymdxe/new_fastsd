@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import math
+import random
 from typing import Any, Iterable, Mapping, MutableMapping, Sequence
 
 
@@ -606,3 +607,90 @@ def predict_next_verify_proc_ids(
             if len(predicted) >= batch_size:
                 return predicted
     return predicted
+
+
+def accept_count(
+    draft_tokens,
+    target_top1,
+    target_probs=None,
+    draft_probs=None,
+    *,
+    mode="greedy",
+    threshold=0.0,
+    uniforms=None,
+):
+    """Compatibility helper for testing the legacy and scalar-ratio rules.
+
+    Runtime verification uses :func:`src.speculative_sampling.rejection_sample`
+    so it can sample the complete residual distribution.  This small list-based
+    helper remains useful for protocol tests that only need the prefix length.
+    ``threshold`` is intentionally a test-only gate and is not used by the
+    production verifier.
+    """
+
+    draft = list(draft_tokens)
+    target = list(target_top1)
+    if len(draft) != len(target):
+        raise ValueError("draft and target token vectors must have equal length")
+    mode = str(mode).lower()
+    if mode == "greedy":
+        for index, token in enumerate(draft):
+            if int(token) != int(target[index]):
+                return index
+        return len(draft)
+    if mode != "prob":
+        raise ValueError("mode must be 'greedy' or 'prob'")
+    if target_probs is None or draft_probs is None:
+        raise ValueError("prob mode requires target_probs and draft_probs")
+    if len(target_probs) != len(draft) or len(draft_probs) != len(draft):
+        raise ValueError("probability vectors must match draft length")
+    try:
+        threshold = float(threshold)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("threshold must be finite and non-negative") from exc
+    if not math.isfinite(threshold) or threshold < 0.0:
+        raise ValueError("threshold must be finite and non-negative")
+    random_values = iter(uniforms) if uniforms is not None else None
+    for index, (p_value, q_value) in enumerate(zip(target_probs, draft_probs)):
+        try:
+            p_value = float(p_value)
+            q_value = float(q_value)
+        except (TypeError, ValueError, OverflowError):
+            return index
+        if not math.isfinite(p_value) or not math.isfinite(q_value) or p_value <= 0.0 or q_value <= 0.0:
+            return index
+        ratio = min(1.0, p_value / q_value)
+        if ratio < threshold:
+            return index
+        if random_values is None:
+            draw = random.random()
+        else:
+            try:
+                draw = float(next(random_values))
+            except StopIteration as exc:
+                raise ValueError("uniforms must contain one value per draft token") from exc
+        if not math.isfinite(draw) or draw < 0.0 or draw > 1.0:
+            raise ValueError("uniform values must lie in [0, 1]")
+        if draw > ratio:
+            return index
+    return len(draft)
+
+
+def plan_draft_prob_sources(
+    prefix_len: int,
+    gamma: int,
+    history_rows: int,
+    reused_prob_count: int = 0,
+):
+    """Report how many draft probability rows come from history and reuse."""
+
+    prefix_len = int(prefix_len)
+    gamma = int(gamma)
+    history_rows = int(history_rows)
+    reused_prob_count = max(0, int(reused_prob_count))
+    if gamma <= 0:
+        return 0, 0
+    history_available = max(0, history_rows - prefix_len + 1)
+    history_count = min(gamma, history_available)
+    reused_count = min(gamma - history_count, reused_prob_count)
+    return history_count, reused_count

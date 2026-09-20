@@ -62,6 +62,7 @@ def varlen_generate(
     pad_token_id,   # signature parity with KVCacheModel_batching.generate; unused
     is_prefill: bool = False,
     input_lens=None,  # signature parity; unused (no padding in this path)
+    sample_next: bool = True,
 ):
     """Padding-free forward for one mixed batch.
 
@@ -174,7 +175,9 @@ def varlen_generate(
         new_kv_per_layer.append(new_kv_layer)
 
     hidden_states = model.model.norm(hidden_states)
-    logits = model.lm_head(hidden_states)[:, :vocab_size]  # (total, V)
+    # Normalize and retain probabilities in FP32 even when the model runs in
+    # BF16/FP16; this is the representation used by rejection residual math.
+    logits = model.lm_head(hidden_states)[:, :vocab_size].float()  # (total, V)
 
     # ---- 3. write back per-proc prob history / KV cache --------------------
     new_x = []
@@ -215,7 +218,11 @@ def varlen_generate(
             ]
             kv_manager._past_key_values[pid] = DynamicCache.from_legacy_cache(new_legacy)
 
-        sampled = sample(logits_i[0, -1:, :])
+        sampled = (
+            sample(logits_i[0, -1:, :])
+            if sample_next
+            else torch.argmax(logits_i[0, -1:, :], dim=-1, keepdim=True)
+        )
         next_tokens_1d = sampled.reshape(-1)
         new_x.append(torch.cat([flat_parts[i], next_tokens_1d], dim=0))
 

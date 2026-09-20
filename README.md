@@ -28,4 +28,10 @@ Quick pointers:
 - Run the complete local test suite (including the pinned SpecEdge baseline checks): `python scripts/run_tests.py`
 - Prepare the four-method comparison workload: `python scripts/eval_suite.py prepare --config configs/evaluation/qwen3_8b_0.6b_humaneval.json`
 
+The `ft_sd` branch supports exact sparse speculative rejection sampling for the
+single-device and Cloud/Edge FastSD paths.  Use `--verify_method rejection`
+(the default), a nonzero `--temp`, and `--draft_top_k 64`/`128`/`256` for
+sampling experiments; `--verify_method greedy` retains the legacy strict-match
+verification rule.
+
 The repository currently has local uncommitted changes copied from the remote development server. Check `git status --short` before assuming a clean baseline.

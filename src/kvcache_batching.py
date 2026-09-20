@@ -27,6 +27,7 @@ class KVCacheModel_batching():
         pad_token_id,
         is_prefill,
         input_lens=None,
+        sample_next: bool = True,
     ) -> torch.Tensor:
         """
         input_ids: (B, T)
@@ -40,7 +41,12 @@ class KVCacheModel_batching():
         #     x = torch.cat((x, next_tok), dim=1)
 
         next_tokens, valid_lens = self._forward_with_kvcache(
-            x, proc_ids, pad_token_id, is_prefill, input_lens=input_lens
+            x,
+            proc_ids,
+            pad_token_id,
+            is_prefill,
+            input_lens=input_lens,
+            sample_next=sample_next,
         )
         new_x = []
         for i in range(len(proc_ids)):
@@ -80,6 +86,7 @@ class KVCacheModel_batching():
         pad_token_id,
         input_lens=None,
         reset_pids=None,
+        sample_next: bool = True,
     ):
         """Append uncached suffixes for persistent WorkItems.
 
@@ -96,6 +103,7 @@ class KVCacheModel_batching():
                 pad_token_id=pad_token_id,
                 is_prefill=True,
                 input_lens=[input_lens[i] for i in fresh_indices] if input_lens is not None else None,
+                sample_next=sample_next,
             )
         cont_indices = [i for i, pid in enumerate(proc_ids) if pid not in reset]
         if not cont_indices:
@@ -106,6 +114,7 @@ class KVCacheModel_batching():
             pad_token_id,
             is_prefill=False,
             input_lens=[input_lens[i] for i in cont_indices] if input_lens is not None else None,
+            sample_next=sample_next,
         )
 
     def _forward_with_kvcache(
@@ -115,6 +124,7 @@ class KVCacheModel_batching():
         pad_token_id,
         is_prefill: bool = False,
         input_lens=None,
+        sample_next: bool = True,
     ) -> torch.Tensor:
         """
         Batch forward with per-proc_id KV cache
@@ -137,7 +147,7 @@ class KVCacheModel_batching():
                 for i, valid_len in enumerate(input_lens):
                     attention_mask[i, :valid_len] = 1
             out = self._model(input_batch, attention_mask=attention_mask)
-            logits = out.logits[:, :, :self.vocab_size]  # shape: (B, T, V)
+            logits = out.logits[:, :, :self.vocab_size].float()  # shape: (B, T, V)
             past_key_values = out.past_key_values  # List of (key, value), each: (B, H, T, D)
 
             logits_list = []
@@ -170,7 +180,11 @@ class KVCacheModel_batching():
                                                               self._top_p)
                 self._past_key_values[pid] = DynamicCache.from_legacy_cache(past_key_values_list[idx])
                 last_q_idx = self._prob_history[pid][:, -1, :]
-                sampled_token = sample(last_q_idx)  # (1,)
+                sampled_token = (
+                    sample(last_q_idx)
+                    if sample_next
+                    else torch.argmax(last_q_idx, dim=-1, keepdim=True)
+                )  # (1,)
                 next_tokens.append(sampled_token)
         ###############################################################################################################
         else:
@@ -272,7 +286,7 @@ class KVCacheModel_batching():
                 past_key_values=batched_cache,
                 use_cache=True,
             )
-            not_cached_q = outputs.logits[:, :, :self.vocab_size]  # (B, T, V)
+            not_cached_q = outputs.logits[:, :, :self.vocab_size].float()  # (B, T, V)
             past_key_values = outputs.past_key_values  # List of (key, value), each: (B, H, T, D)
 
             if not_cached_q.dim() == 2:
@@ -324,7 +338,11 @@ class KVCacheModel_batching():
                 self._prob_history[pid] = torch.cat([self._prob_history[pid], logits_list[i]], dim=1)
                 self._past_key_values[pid] = DynamicCache.from_legacy_cache(past_key_values_list[i])
                 last_q_i = not_cached_q[i, -1, :].unsqueeze(0)
-                sampled_token = sample(last_q_i)
+                sampled_token = (
+                    sample(last_q_i)
+                    if sample_next
+                    else torch.argmax(last_q_i, dim=-1, keepdim=True)
+                )
                 next_tokens.append(sampled_token)
             ###############################################################################################################
 
